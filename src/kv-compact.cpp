@@ -89,12 +89,9 @@ int main(int argc, char ** argv) {
     bool  do_writeback  = true;
     bool  do_eviction   = true;
 
-    // Parse standard params
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
-        return 1;
-    }
-
-    // Parse custom args
+    // Parse custom args first and build a filtered argv for llama.cpp
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--compact-ratio") == 0 && i + 1 < argc) {
             compact_ratio = std::stof(argv[++i]);
@@ -104,7 +101,15 @@ int main(int argc, char ** argv) {
             do_writeback = false;
         } else if (strcmp(argv[i], "--no-eviction") == 0) {
             do_eviction = false;
+        } else {
+            filtered_argv.push_back(argv[i]);
         }
+    }
+
+    // Parse standard params (with custom args stripped)
+    int filtered_argc = (int) filtered_argv.size();
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
+        return 1;
     }
 
     if (compact_ratio <= 0.0f || compact_ratio >= 1.0f) {

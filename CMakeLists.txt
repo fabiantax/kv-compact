@@ -27,6 +27,7 @@ if(KV_COMPACT_BUILD_TOOL)
         add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
     else()
         # Fetch from GitHub
+        set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
         include(FetchContent)
         FetchContent_Declare(
             llama_cpp
