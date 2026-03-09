@@ -8,3 +8,4 @@ CMakeUserPresets.json
 *.lib
 *.dll
 *.pdb
+.arxiv-papers/
