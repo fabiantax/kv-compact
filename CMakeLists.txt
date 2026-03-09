@@ -23,6 +23,7 @@ if(KV_COMPACT_BUILD_TOOL)
     if(LLAMA_CPP_DIR)
         # Use a local llama.cpp checkout
         message(STATUS "Using local llama.cpp: ${LLAMA_CPP_DIR}")
+        set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
         add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
     else()
         # Fetch from GitHub
@@ -39,6 +40,15 @@ if(KV_COMPACT_BUILD_TOOL)
 
     add_executable(llama-kv-compact src/kv-compact.cpp)
     target_link_libraries(llama-kv-compact PRIVATE
+        kv-compact-math
+        llama
+        common
+        ggml
+    )
+
+    # E2E test (also needs llama.cpp)
+    add_executable(test-kv-compact-e2e tests/test-kv-compact-e2e.cpp)
+    target_link_libraries(test-kv-compact-e2e PRIVATE
         kv-compact-math
         llama
         common

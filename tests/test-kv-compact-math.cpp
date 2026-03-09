@@ -537,6 +537,175 @@ static void test_compact_cosine_similarity() {
 }
 
 // ============================================================================
+// compact_layer_all_heads tests
+// ============================================================================
+
+static void test_compact_layer_shared_selection() {
+    printf("  test_compact_layer_shared_selection...");
+    // Multiple heads should share the same selected indices
+    const int T = 16, n_q = 8, n_head_kv = 2, d_k = 4, d_v = 4, t = 4;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa), Q(n_q * n_embd_k_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k_gqa; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, t);
+
+    // Check shared selection
+    assert((int)result.selected_indices.size() == t);
+    for (int i = 0; i < t; i++) {
+        assert(result.selected_indices[i] >= 0);
+        assert(result.selected_indices[i] < T);
+    }
+    // Sorted
+    for (int i = 1; i < t; i++) {
+        assert(result.selected_indices[i] > result.selected_indices[i - 1]);
+    }
+
+    // Check per-head outputs exist with correct sizes
+    assert((int)result.beta.size() == n_head_kv);
+    assert((int)result.C_v.size() == n_head_kv);
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.beta[h].size() == t);
+        assert((int)result.C_v[h].size() == t * d_v);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_compact_layer_no_compression() {
+    printf("  test_compact_layer_no_compression...");
+    const int T = 4, n_q = 2, n_head_kv = 2, d_k = 3, d_v = 3;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa), Q(n_q * n_embd_k_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = (float)(i % 7) * 0.1f;
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = (float)(i % 5) * 0.2f;
+    for (int i = 0; i < n_q * n_embd_k_gqa; i++) Q[i] = (float)(i % 3) * 0.3f;
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, T);
+
+    // t >= T → no compaction, all indices selected
+    assert((int)result.selected_indices.size() == T);
+    for (int i = 0; i < T; i++) assert(result.selected_indices[i] == i);
+
+    // Beta should be all zeros
+    for (int h = 0; h < n_head_kv; h++) {
+        for (int i = 0; i < T; i++) {
+            assert(approx_eq(result.beta[h][i], 0.0f));
+        }
+    }
+
+    printf(" OK\n");
+}
+
+static void test_compact_layer_quality_per_head() {
+    printf("  test_compact_layer_quality_per_head...");
+    // Verify each head's output quality improves with refitting
+    const int T = 32, n_q = 16, n_head_kv = 3, d_k = 6, d_v = 6, t = 8;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa), Q(n_q * n_embd_k_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = sinf((float)(i * 3 + 1) * 0.4f);
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = cosf((float)(i * 2 + 3) * 0.3f);
+    for (int i = 0; i < n_q * n_embd_k_gqa; i++) Q[i] = sinf((float)(i * 5 + 2) * 0.7f);
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, t);
+
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        // Test query: first Q for this head
+        const float * q_test = Q.data() + h * d_k;
+
+        // Original output
+        std::vector<float> orig_scores(T);
+        for (int j = 0; j < T; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++) {
+                dot += q_test[d] * K[j * n_embd_k_gqa + h * d_k + d];
+            }
+            orig_scores[j] = dot * inv_sqrt_dk;
+        }
+        softmax_rows(orig_scores.data(), 1, T);
+
+        std::vector<float> orig_out(d_v, 0.0f);
+        for (int j = 0; j < T; j++) {
+            for (int d = 0; d < d_v; d++) {
+                orig_out[d] += orig_scores[j] * V[j * n_embd_v_gqa + h * d_v + d];
+            }
+        }
+
+        // Compacted output with beta + C_v
+        std::vector<float> comp_scores(t);
+        for (int j = 0; j < t; j++) {
+            float dot = 0.0f;
+            int idx = result.selected_indices[j];
+            for (int d = 0; d < d_k; d++) {
+                dot += q_test[d] * K[idx * n_embd_k_gqa + h * d_k + d];
+            }
+            comp_scores[j] = dot * inv_sqrt_dk + result.beta[h][j];
+        }
+        softmax_rows(comp_scores.data(), 1, t);
+
+        std::vector<float> comp_out(d_v, 0.0f);
+        for (int j = 0; j < t; j++) {
+            for (int d = 0; d < d_v; d++) {
+                comp_out[d] += comp_scores[j] * result.C_v[h][j * d_v + d];
+            }
+        }
+
+        // Cosine similarity should be decent (> 0.8 at 4x compression)
+        float dot_p = 0.0f, n_o = 0.0f, n_c = 0.0f;
+        for (int d = 0; d < d_v; d++) {
+            dot_p += orig_out[d] * comp_out[d];
+            n_o += orig_out[d] * orig_out[d];
+            n_c += comp_out[d] * comp_out[d];
+        }
+        float cos_sim = dot_p / (sqrtf(n_o * n_c) + 1e-8f);
+
+        printf("\n    Head %d: cos_sim=%.6f", h, cos_sim);
+        assert(cos_sim > 0.8f);
+    }
+
+    printf("\n  OK\n");
+}
+
+static void test_compact_layer_finite_values() {
+    printf("  test_compact_layer_finite_values...");
+    const int T = 16, n_q = 8, n_head_kv = 4, d_k = 4, d_v = 4, t = 4;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa), Q(n_q * n_embd_k_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = sinf((float)i * 0.1f);
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = cosf((float)i * 0.15f);
+    for (int i = 0; i < n_q * n_embd_k_gqa; i++) Q[i] = sinf((float)i * 0.25f);
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, t);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        for (int j = 0; j < t; j++) {
+            assert(std::isfinite(result.beta[h][j]));
+        }
+        for (int j = 0; j < t * d_v; j++) {
+            assert(std::isfinite(result.C_v[h][j]));
+        }
+    }
+
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -576,6 +745,12 @@ int main() {
     test_compact_quality_improves_with_refitting();
     test_compact_beta_values_are_finite();
     test_compact_cosine_similarity();
+
+    printf("\n=== Layer-level compaction ===\n");
+    test_compact_layer_shared_selection();
+    test_compact_layer_no_compression();
+    test_compact_layer_quality_per_head();
+    test_compact_layer_finite_values();
 
     printf("\nAll tests passed!\n");
     return 0;

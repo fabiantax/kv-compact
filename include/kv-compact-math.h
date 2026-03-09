@@ -250,6 +250,19 @@ struct compacted_head {
     std::vector<float> C_v;               // refit values [t * d_v]
 };
 
+// Result of compacting all heads within a single layer
+struct compacted_layer {
+    std::vector<int>   selected_indices;  // [t] shared token selection across all heads
+    int                n_head_kv;         // number of KV heads
+    int                t;                 // compacted size
+    int                d_k;               // key dimension per head
+    int                d_v;               // value dimension per head
+
+    // Per-head results: beta[h] is [t], C_v[h] is [t * d_v]
+    std::vector<std::vector<float>> beta;  // [n_head_kv][t]
+    std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+};
+
 // Compact a single KV head using the Highest Attention Keys method
 //
 //   K:       [T, d_k] original keys for this head
@@ -373,6 +386,178 @@ static compacted_head compact_head_highest_attn(
 
     // Solve: X * C_v = Y  =>  C_v = (X^T X)^{-1} X^T Y
     least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
+
+    return result;
+}
+
+// Compact all KV heads within a single layer using shared key selection
+//
+//   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
+//   V_all:     [T, n_embd_v_gqa] all heads concatenated, row-major
+//   Q_ref_all: [n_q, n_embd_k_gqa] reference queries (all heads concatenated)
+//   T:         number of tokens (cache positions)
+//   n_q:       number of reference queries
+//   n_head_kv: number of KV heads
+//   d_k:       key dimension per head
+//   d_v:       value dimension per head
+//   t:         target compacted size
+//
+// Algorithm:
+//   1. For each head, compute attention scores and per-key importance
+//   2. Global key selection: max importance across heads for each position
+//   3. Per-head NNLS (beta) and least-squares (C_v) on shared selection
+//
+static compacted_layer compact_layer_all_heads(
+        const float * K_all, const float * V_all, const float * Q_ref_all,
+        int T, int n_q, int n_head_kv, int d_k, int d_v, int t) {
+
+    compacted_layer result;
+    result.n_head_kv = n_head_kv;
+    result.t = t;
+    result.d_k = d_k;
+    result.d_v = d_v;
+    result.beta.resize(n_head_kv);
+    result.C_v.resize(n_head_kv);
+
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    if (t >= T) {
+        // No compaction needed
+        result.selected_indices.resize(T);
+        for (int i = 0; i < T; i++) result.selected_indices[i] = i;
+        for (int h = 0; h < n_head_kv; h++) {
+            result.beta[h].assign(T, 0.0f);
+            result.C_v[h].resize(T * d_v);
+            for (int i = 0; i < T; i++) {
+                memcpy(result.C_v[h].data() + i * d_v,
+                       V_all + i * n_embd_v_gqa + h * d_v,
+                       d_v * sizeof(float));
+            }
+        }
+        return result;
+    }
+
+    // ---- Step 1: Global key selection via max importance across heads ----
+
+    // Compute per-head key importance scores, then take max across heads
+    std::vector<float> global_scores(T, 0.0f);
+
+    // Per-head temporary data for reuse in steps 2-3
+    struct head_data {
+        std::vector<float> scores;      // [n_q, T] scaled attention logits
+        std::vector<float> exp_scores;  // [n_q, T] exp with max-shift
+        std::vector<float> row_sums;    // [n_q] sum of exp per query
+        std::vector<float> attn_weights;// [n_q, T] softmax attention
+    };
+    std::vector<head_data> hdata(n_head_kv);
+
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        auto & hd = hdata[h];
+        hd.scores.resize(n_q * T);
+        hd.exp_scores.resize(n_q * T);
+        hd.row_sums.resize(n_q);
+        hd.attn_weights.resize(n_q * T);
+
+        // Extract per-head K and Q_ref slices
+        // K_head[i] = K_all[i * n_embd_k_gqa + h * d_k ... + (h+1)*d_k]
+        // Instead of extracting, compute Q_ref_h @ K_h^T directly
+
+        // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
+        for (int qi = 0; qi < n_q; qi++) {
+            const float * q_row = Q_ref_all + qi * n_embd_k_gqa + h * d_k;
+            for (int ki = 0; ki < T; ki++) {
+                const float * k_row = K_all + ki * n_embd_k_gqa + h * d_k;
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    dot += q_row[d] * k_row[d];
+                }
+                hd.scores[qi * T + ki] = dot * inv_sqrt_dk;
+            }
+        }
+
+        // Compute exp(scores) for mass computation
+        memcpy(hd.exp_scores.data(), hd.scores.data(), n_q * T * sizeof(float));
+        exp_rows_stable(hd.exp_scores.data(), hd.row_sums.data(), n_q, T);
+
+        // Compute softmax for key scoring
+        memcpy(hd.attn_weights.data(), hd.scores.data(), n_q * T * sizeof(float));
+        softmax_rows(hd.attn_weights.data(), n_q, T);
+
+        // Per-key max attention weight across queries
+        for (int j = 0; j < T; j++) {
+            float max_w = 0.0f;
+            for (int qi = 0; qi < n_q; qi++) {
+                float w = hd.attn_weights[qi * T + j];
+                if (w > max_w) max_w = w;
+            }
+            // Global score = max across heads
+            if (max_w > global_scores[j]) {
+                global_scores[j] = max_w;
+            }
+        }
+    }
+
+    // Select top-t positions globally
+    std::vector<int> indices(T);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                      [&](int a, int b) { return global_scores[a] > global_scores[b]; });
+
+    std::vector<int> selected(indices.begin(), indices.begin() + t);
+    std::sort(selected.begin(), selected.end());
+    result.selected_indices = selected;
+
+    // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
+
+    for (int h = 0; h < n_head_kv; h++) {
+        const auto & hd = hdata[h];
+
+        result.beta[h].resize(t);
+        result.C_v[h].resize(t * d_v);
+
+        // Step 2: NNLS for beta
+        // M_ij = exp(q_i * K_{selected[j]} / sqrt(d)) (from precomputed exp_scores)
+        std::vector<float> M(n_q * t);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < t; j++) {
+                M[qi * t + j] = hd.exp_scores[qi * T + selected[j]];
+            }
+        }
+
+        std::vector<float> w(t);
+        nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+
+        for (int j = 0; j < t; j++) {
+            result.beta[h][j] = logf(std::max(1e-12f, w[j]));
+        }
+
+        // Step 3: Least squares for C_v
+        // X_ij = softmax(score[qi, selected[j]] + beta[j])
+        std::vector<float> X(n_q * t);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < t; j++) {
+                X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
+            }
+        }
+        softmax_rows(X.data(), n_q, t);
+
+        // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
+        std::vector<float> Y(n_q * d_v, 0.0f);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int ki = 0; ki < T; ki++) {
+                float w_ij = hd.attn_weights[qi * T + ki];
+                const float * v_row = V_all + ki * n_embd_v_gqa + h * d_v;
+                for (int d = 0; d < d_v; d++) {
+                    Y[qi * d_v + d] += w_ij * v_row[d];
+                }
+            }
+        }
+
+        least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
+    }
 
     return result;
 }
