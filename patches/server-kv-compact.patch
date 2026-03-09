@@ -1,0 +1,66 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,6 +1,8 @@
+ #include "server-context.h"
+ #include "server-common.h"
+
++#include "kv-compact-api.h"
++
+ #include "common.h"
+ #include "llama.h"
+ #include "log.h"
+@@ -1245,12 +1247,54 @@
+
+         // if context shifting is disabled, make sure that we don't run out of context
+-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+-            slot.truncated      = true;
+-            slot.stop           = STOP_TYPE_LIMIT;
+-            slot.has_next_token = false;
+-
+-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
++        // if context shifting is disabled, try KV compaction before giving up
++        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
++            kv_compact_params compact_params = kv_compact_params_default();
++            compact_params.compact_ratio = 0.5f;
++            compact_params.n_keep        = std::min(4, slot.n_ctx / 8);
++
++            int new_size = kv_compact_sequence(ctx, slot.id, compact_params);
++
++            if (new_size > 0 && new_size < slot.prompt.n_tokens()) {
++                // Rebuild token bookkeeping after compaction
++                GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
++                llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
++                int n_keep_tokens = compact_params.n_keep;
++                llama_tokens new_tokens;
++                new_tokens.reserve(new_size);
++                for (int i = 0; i < n_keep_tokens && i < (int)old_tokens.size(); i++)
++                    new_tokens.push_back(old_tokens[i]);
++                int n_recent = new_size - (int)new_tokens.size();
++                int start = std::max((int)old_tokens.size() - n_recent, n_keep_tokens);
++                for (int i = start; i < (int)old_tokens.size() && (int)new_tokens.size() < new_size; i++)
++                    new_tokens.push_back(old_tokens[i]);
++                while ((int)new_tokens.size() < new_size)
++                    new_tokens.push_back(old_tokens.back());
++                slot.prompt.tokens.clear();
++                slot.prompt.tokens.insert(new_tokens);
++                slot.truncated = true;
++            } else {
++                slot.truncated      = true;
++                slot.stop           = STOP_TYPE_LIMIT;
++                slot.has_next_token = false;
++            }
+         }
+
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -24,6 +24,11 @@
+ target_link_libraries(${TARGET} PUBLIC common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
++# KV compaction integration
++if(TARGET kv-compact-lib)
++    target_link_libraries(${TARGET} PUBLIC kv-compact-lib)
++endif()
++
+
+ # llama-server executable
