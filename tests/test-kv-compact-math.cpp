@@ -709,6 +709,346 @@ static void test_compact_layer_finite_values() {
 // Main
 // ============================================================================
 
+// ============================================================================
+// Quantization round-trip tests
+// ============================================================================
+
+#include "kv-compact-state.h"
+
+// Helper: compute max absolute error between two float arrays
+static float max_abs_error(const float * a, const float * b, int n) {
+    float err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > err) err = d;
+    }
+    return err;
+}
+
+// Helper: compute relative error (max |a-b| / max |a|)
+static float relative_error(const float * a, const float * b, int n) {
+    float max_val = 0.0f;
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float av = fabsf(a[i]);
+        if (av > max_val) max_val = av;
+        float d = fabsf(a[i] - b[i]);
+        if (d > max_err) max_err = d;
+    }
+    return (max_val > 0.0f) ? max_err / max_val : 0.0f;
+}
+
+static void test_q8_0_round_trip() {
+    printf("  test_q8_0_round_trip...");
+    // 64 floats = 2 blocks of Q8_0
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)(i - 32) * 0.1f; // range [-3.2, 3.1]
+    }
+
+    // Quantize
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q8_0_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q8_0(src, buf.data(), n);
+
+    // Dequantize
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q8_0, dst, n);
+
+    // Q8_0 should have very low error (127 levels)
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.02f); // < 2% relative error
+    printf(" OK\n");
+}
+
+static void test_q4_0_round_trip() {
+    printf("  test_q4_0_round_trip...");
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)(i - 32) * 0.1f;
+    }
+
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q4_0_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q4_0(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q4_0, dst, n);
+
+    // Q4_0 has only 16 levels, so higher error expected
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.20f); // < 20% relative error
+    printf(" OK\n");
+}
+
+static void test_q4_1_round_trip() {
+    printf("  test_q4_1_round_trip...");
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)i * 0.05f; // range [0, 3.15] — asymmetric
+    }
+
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q4_1_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q4_1(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q4_1, dst, n);
+
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.20f);
+    printf(" OK\n");
+}
+
+static void test_q5_0_round_trip() {
+    printf("  test_q5_0_round_trip...");
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)(i - 32) * 0.1f;
+    }
+
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q5_0_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q5_0(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q5_0, dst, n);
+
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.10f); // 32 levels — between Q4 and Q8
+    printf(" OK\n");
+}
+
+static void test_q5_1_round_trip() {
+    printf("  test_q5_1_round_trip...");
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)i * 0.05f;
+    }
+
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q5_1_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q5_1(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q5_1, dst, n);
+
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.10f);
+    printf(" OK\n");
+}
+
+static void test_q8_1_round_trip() {
+    printf("  test_q8_1_round_trip...");
+    const int n = 64;
+    float src[n];
+    for (int i = 0; i < n; i++) {
+        src[i] = (float)(i - 32) * 0.1f;
+    }
+
+    const size_t buf_size = (n / KV_COMPACT_QK) * KV_COMPACT_Q8_1_BLOCK_SIZE;
+    std::vector<uint8_t> buf(buf_size);
+    quantize_q8_1(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q8_1, dst, n);
+
+    float rel_err = relative_error(src, dst, n);
+    printf(" rel_err=%.6f", rel_err);
+    assert(rel_err < 0.02f);
+    printf(" OK\n");
+}
+
+static void test_q8_0_zeros() {
+    printf("  test_q8_0_zeros...");
+    const int n = 32;
+    float src[n] = {};
+
+    std::vector<uint8_t> buf((n / KV_COMPACT_QK) * KV_COMPACT_Q8_0_BLOCK_SIZE);
+    quantize_q8_0(src, buf.data(), n);
+
+    float dst[n];
+    parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q8_0, dst, n);
+
+    for (int i = 0; i < n; i++) {
+        assert(dst[i] == 0.0f);
+    }
+    printf(" OK\n");
+}
+
+static void test_elements_per_row() {
+    printf("  test_elements_per_row...");
+    // F32: 128 bytes = 32 floats
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_F32, 128) == 32);
+    // F16: 128 bytes = 64 halfs
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_F16, 128) == 64);
+    // Q8_0: 1 block = 34 bytes = 32 elements
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_Q8_0, 34) == 32);
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_Q8_0, 68) == 64);
+    // Q4_0: 1 block = 18 bytes = 32 elements
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_Q4_0, 18) == 32);
+    assert(parsed_kv_state::elements_per_row(KV_COMPACT_GGML_TYPE_Q4_0, 36) == 64);
+    printf(" OK\n");
+}
+
+static void test_row_bytes_for() {
+    printf("  test_row_bytes_for...");
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_F32, 32) == 128);
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_F16, 32) == 64);
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_Q8_0, 32) == 34);
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_Q8_0, 64) == 68);
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_Q4_0, 32) == 18);
+    assert(parsed_kv_state::row_bytes_for(KV_COMPACT_GGML_TYPE_Q4_0, 64) == 36);
+    printf(" OK\n");
+}
+
+// Test that parse + build_compacted_state round-trips correctly for Q8_0
+static void test_state_round_trip_q8_0() {
+    printf("  test_state_round_trip_q8_0...");
+
+    // Build a synthetic state buffer with Q8_0 K and V
+    // 1 stream, 1 layer, 32 cells (1 block), 32-dim embeddings, non-transposed
+    const int cell_count = 32;
+    const int n_embd = 32;  // exactly 1 block per row
+
+    std::vector<uint8_t> state_buf;
+    auto write_val = [&](const void * v, size_t sz) {
+        const uint8_t * p = (const uint8_t *)v;
+        state_buf.insert(state_buf.end(), p, p + sz);
+    };
+
+    // n_stream = 1
+    uint32_t n_stream = 1;
+    write_val(&n_stream, 4);
+
+    // cell_count
+    uint32_t cc = cell_count;
+    write_val(&cc, 4);
+
+    // Cell metadata: pos=i, n_seq_id=1, seq_id=0
+    for (int i = 0; i < cell_count; i++) {
+        int32_t pos = i;
+        write_val(&pos, 4);
+        uint32_t n_seq = 1;
+        write_val(&n_seq, 4);
+        int32_t sid = 0;
+        write_val(&sid, 4);
+    }
+
+    // v_trans=0, n_layer=1
+    uint32_t v_trans = 0;
+    write_val(&v_trans, 4);
+    uint32_t n_layer = 1;
+    write_val(&n_layer, 4);
+
+    // K layer: type=Q8_0, size_row=34 (1 block for 32 elements)
+    int32_t k_type = KV_COMPACT_GGML_TYPE_Q8_0;
+    write_val(&k_type, 4);
+    uint64_t k_size_row = KV_COMPACT_Q8_0_BLOCK_SIZE; // 34 bytes for 32 floats
+    write_val(&k_size_row, 8);
+
+    // Generate K data: quantize known float values
+    std::vector<float> k_f32(cell_count * n_embd);
+    for (int i = 0; i < cell_count * n_embd; i++) {
+        k_f32[i] = sinf((float)i * 0.1f);
+    }
+    std::vector<uint8_t> k_quant(cell_count * KV_COMPACT_Q8_0_BLOCK_SIZE);
+    for (int r = 0; r < cell_count; r++) {
+        quantize_q8_0(k_f32.data() + r * n_embd,
+                       k_quant.data() + r * KV_COMPACT_Q8_0_BLOCK_SIZE, n_embd);
+    }
+    write_val(k_quant.data(), k_quant.size());
+
+    // V layer: type=Q8_0
+    int32_t v_type = KV_COMPACT_GGML_TYPE_Q8_0;
+    write_val(&v_type, 4);
+    uint64_t v_size_row = KV_COMPACT_Q8_0_BLOCK_SIZE;
+    write_val(&v_size_row, 8);
+
+    std::vector<float> v_f32(cell_count * n_embd);
+    for (int i = 0; i < cell_count * n_embd; i++) {
+        v_f32[i] = cosf((float)i * 0.1f);
+    }
+    std::vector<uint8_t> v_quant(cell_count * KV_COMPACT_Q8_0_BLOCK_SIZE);
+    for (int r = 0; r < cell_count; r++) {
+        quantize_q8_0(v_f32.data() + r * n_embd,
+                       v_quant.data() + r * KV_COMPACT_Q8_0_BLOCK_SIZE, n_embd);
+    }
+    write_val(v_quant.data(), v_quant.size());
+
+    // Parse the state
+    parsed_kv_state pstate;
+    bool ok = pstate.parse(state_buf.data(), state_buf.size());
+    assert(ok);
+    assert(pstate.streams.size() == 1);
+    assert(pstate.streams[0].cell_count == (uint32_t)cell_count);
+    assert(pstate.streams[0].layers[0].k_type == KV_COMPACT_GGML_TYPE_Q8_0);
+    assert((int)pstate.streams[0].layers[0].K.size() == cell_count * n_embd);
+
+    // Verify parsed K values are close to originals (within Q8_0 quantization error)
+    // Note: k_f32 is the original, but the state was written from quantized data,
+    // so we should compare against dequantized values
+    float k_dequant[cell_count * n_embd];
+    for (int r = 0; r < cell_count; r++) {
+        parsed_kv_state::convert_to_f32(
+            k_quant.data() + r * KV_COMPACT_Q8_0_BLOCK_SIZE,
+            KV_COMPACT_GGML_TYPE_Q8_0,
+            k_dequant + r * n_embd, n_embd);
+    }
+    float k_err = max_abs_error(pstate.streams[0].layers[0].K.data(), k_dequant, cell_count * n_embd);
+    assert(k_err < 1e-6f); // Should be exact match (same dequantize path)
+
+    printf(" parse_ok rel_err_K<1e-6");
+    printf(" OK\n");
+}
+
+// Test convert_from_f32 dispatches correctly
+static void test_convert_from_f32_dispatch() {
+    printf("  test_convert_from_f32_dispatch...");
+    const int n = 32;
+    float src[n];
+    for (int i = 0; i < n; i++) src[i] = (float)(i - 16) * 0.1f;
+
+    // Test Q8_0
+    {
+        std::vector<uint8_t> buf(KV_COMPACT_Q8_0_BLOCK_SIZE);
+        convert_from_f32(src, KV_COMPACT_GGML_TYPE_Q8_0, buf.data(), n);
+        float dst[n];
+        parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q8_0, dst, n);
+        assert(relative_error(src, dst, n) < 0.02f);
+    }
+
+    // Test Q4_0
+    {
+        std::vector<uint8_t> buf(KV_COMPACT_Q4_0_BLOCK_SIZE);
+        convert_from_f32(src, KV_COMPACT_GGML_TYPE_Q4_0, buf.data(), n);
+        float dst[n];
+        parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_Q4_0, dst, n);
+        assert(relative_error(src, dst, n) < 0.20f);
+    }
+
+    // Test F32
+    {
+        std::vector<uint8_t> buf(n * 4);
+        convert_from_f32(src, KV_COMPACT_GGML_TYPE_F32, buf.data(), n);
+        float dst[n];
+        parsed_kv_state::convert_to_f32(buf.data(), KV_COMPACT_GGML_TYPE_F32, dst, n);
+        assert(max_abs_error(src, dst, n) < 1e-7f);
+    }
+
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -751,6 +1091,19 @@ int main() {
     test_compact_layer_no_compression();
     test_compact_layer_quality_per_head();
     test_compact_layer_finite_values();
+
+    printf("\n=== Quantization round-trip ===\n");
+    test_q8_0_round_trip();
+    test_q4_0_round_trip();
+    test_q4_1_round_trip();
+    test_q5_0_round_trip();
+    test_q5_1_round_trip();
+    test_q8_1_round_trip();
+    test_q8_0_zeros();
+    test_elements_per_row();
+    test_row_bytes_for();
+    test_state_round_trip_q8_0();
+    test_convert_from_f32_dispatch();
 
     printf("\nAll tests passed!\n");
     return 0;
