@@ -1049,6 +1049,152 @@ static void test_convert_from_f32_dispatch() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// Beta averaging and injection tests
+// ============================================================================
+
+static void test_beta_averaging_across_heads() {
+    printf("  test_beta_averaging_across_heads...");
+
+    // Use compact_layer_all_heads to get per-head betas, then verify averaging
+    const int T = 16, n_q = 8, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 3;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    // Create concatenated K, V, Q data
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (size_t i = 0; i < K.size(); i++) K[i] = sinf((float)i * 0.3f);
+    for (size_t i = 0; i < V.size(); i++) V[i] = cosf((float)i * 0.2f);
+    for (size_t i = 0; i < Q.size(); i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, t);
+
+    // Verify per-head beta is available
+    assert((int)result.beta.size() == n_head_kv);
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.beta[h].size() == t);
+    }
+
+    // Compute averaged beta (same logic as CLI)
+    std::vector<float> beta_avg(t, 0.0f);
+    for (int h = 0; h < n_head_kv; h++) {
+        for (int j = 0; j < t; j++) {
+            beta_avg[j] += result.beta[h][j];
+        }
+    }
+    for (int j = 0; j < t; j++) {
+        beta_avg[j] /= n_head_kv;
+    }
+
+    // Verify averaged beta is finite and reasonable
+    for (int j = 0; j < t; j++) {
+        assert(std::isfinite(beta_avg[j]));
+    }
+
+    // Verify averaged beta is between min and max of per-head betas
+    for (int j = 0; j < t; j++) {
+        float b_min = result.beta[0][j], b_max = result.beta[0][j];
+        for (int h = 1; h < n_head_kv; h++) {
+            if (result.beta[h][j] < b_min) b_min = result.beta[h][j];
+            if (result.beta[h][j] > b_max) b_max = result.beta[h][j];
+        }
+        assert(beta_avg[j] >= b_min - EPS && beta_avg[j] <= b_max + EPS);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_beta_improves_attention_output() {
+    printf("  test_beta_improves_attention_output...");
+
+    // Test that applying beta to compacted attention logits improves output
+    // compared to not using beta (beta=0)
+    const int T = 24, n_q = 12, d_k = 6, d_v = 6, t = 8;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.4f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.25f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.6f);
+
+    auto result = compact_head_highest_attn(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t);
+
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    // Test with a new query
+    std::vector<float> q_test(d_k);
+    for (int d = 0; d < d_k; d++) q_test[d] = sinf((float)d * 1.7f);
+
+    // Original output (full cache)
+    std::vector<float> orig_scores(T);
+    for (int j = 0; j < T; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) dot += q_test[d] * K[j * d_k + d];
+        orig_scores[j] = dot * inv_sqrt_dk;
+    }
+    softmax_rows(orig_scores.data(), 1, T);
+    std::vector<float> orig_out(d_v, 0.0f);
+    for (int j = 0; j < T; j++) {
+        for (int d = 0; d < d_v; d++) {
+            orig_out[d] += orig_scores[j] * V[j * d_v + d];
+        }
+    }
+
+    // Compacted output WITH beta
+    std::vector<float> scores_beta(t);
+    for (int j = 0; j < t; j++) {
+        float dot = 0.0f;
+        const float * k_row = K.data() + result.selected_indices[j] * d_k;
+        for (int d = 0; d < d_k; d++) dot += q_test[d] * k_row[d];
+        scores_beta[j] = dot * inv_sqrt_dk + result.beta[j]; // WITH beta
+    }
+    softmax_rows(scores_beta.data(), 1, t);
+    std::vector<float> out_beta(d_v, 0.0f);
+    for (int j = 0; j < t; j++) {
+        for (int d = 0; d < d_v; d++) {
+            out_beta[d] += scores_beta[j] * result.C_v[j * d_v + d];
+        }
+    }
+
+    // Compacted output WITHOUT beta
+    std::vector<float> scores_nobeta(t);
+    for (int j = 0; j < t; j++) {
+        float dot = 0.0f;
+        const float * k_row = K.data() + result.selected_indices[j] * d_k;
+        for (int d = 0; d < d_k; d++) dot += q_test[d] * k_row[d];
+        scores_nobeta[j] = dot * inv_sqrt_dk; // NO beta
+    }
+    softmax_rows(scores_nobeta.data(), 1, t);
+    std::vector<float> out_nobeta(d_v, 0.0f);
+    for (int j = 0; j < t; j++) {
+        for (int d = 0; d < d_v; d++) {
+            out_nobeta[d] += scores_nobeta[j] * result.C_v[j * d_v + d];
+        }
+    }
+
+    // Compute MSE vs original for both
+    float mse_beta = 0.0f, mse_nobeta = 0.0f;
+    for (int d = 0; d < d_v; d++) {
+        float diff_b = orig_out[d] - out_beta[d];
+        float diff_n = orig_out[d] - out_nobeta[d];
+        mse_beta += diff_b * diff_b;
+        mse_nobeta += diff_n * diff_n;
+    }
+    mse_beta /= d_v;
+    mse_nobeta /= d_v;
+
+    printf("\n    MSE with beta:    %.8f\n", mse_beta);
+    printf("    MSE without beta: %.8f\n", mse_nobeta);
+    printf("    Improvement:      %.2fx\n", mse_nobeta / (mse_beta + 1e-12f));
+
+    // Beta should improve or at least not worsen the output
+    // (with refitted C_v, beta should help)
+    assert(mse_beta <= mse_nobeta * 1.1f); // allow 10% tolerance
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1104,6 +1250,10 @@ int main() {
     test_row_bytes_for();
     test_state_round_trip_q8_0();
     test_convert_from_f32_dispatch();
+
+    printf("\n=== Beta averaging and injection ===\n");
+    test_beta_averaging_across_heads();
+    test_beta_improves_attention_output();
 
     printf("\nAll tests passed!\n");
     return 0;

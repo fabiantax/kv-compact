@@ -32,7 +32,6 @@ if(KV_COMPACT_BUILD_TOOL)
             llama_cpp
             GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
             GIT_TAG        6c770d16ca6870a9a419e37431f84f8b820df0c5
-            GIT_SHALLOW    TRUE
             PATCH_COMMAND  bash ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh <SOURCE_DIR>
         )
         message(STATUS "Fetching llama.cpp from GitHub (this may take a while)...")
