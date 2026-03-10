@@ -250,6 +250,117 @@ static void least_squares_solve(const float * A, const float * b, float * x,
 // Compaction algorithm types and implementation
 // ============================================================================
 
+// Result of refitting a single head's values given pre-selected key indices
+struct refit_head_result {
+    std::vector<float> beta;  // [t] attention mass biases (NNLS)
+    std::vector<float> C_v;   // [t * d_v] refitted values
+};
+
+// Refit a single head's values for a given set of selected key positions.
+//
+// Given global key selection (shared across heads), computes:
+//   1. NNLS beta: attention mass biases to approximate full softmax partition
+//   2. C_v: least-squares value refitting to minimize attention output error
+//
+// Parameters:
+//   K_all:          [T, n_embd_k_gqa] keys for all heads concatenated
+//   V_all:          [T, n_embd_v_gqa] values for all heads concatenated
+//   T:              total number of KV positions
+//   n_embd_k_gqa:   total K embedding size across all heads
+//   n_embd_v_gqa:   total V embedding size across all heads
+//   h:              head index
+//   d_k, d_v:       per-head key/value dimensions
+//   n_ref:          number of reference queries
+//   ref_start:      starting index of reference queries in K
+//   selected:       [t] selected position indices (sorted)
+//   use_beta_for_cv: if false (default), compute C_v using un-biased softmax
+//                    so values are correct at inference time (betas are not
+//                    stored in the state). If true, include beta in the C_v
+//                    fitting (only useful for in-memory evaluation).
+//
+KV_COMPACT_UNUSED static refit_head_result refit_head_values(
+        const float * K_all, const float * V_all,
+        int T, int n_embd_k_gqa, int n_embd_v_gqa,
+        int h, int d_k, int d_v,
+        int n_ref, int ref_start,
+        const std::vector<int> & selected,
+        bool use_beta_for_cv = false) {
+
+    const int t = (int)selected.size();
+    const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    refit_head_result result;
+    result.beta.resize(t);
+    result.C_v.resize(t * d_v);
+
+    // Compute attention scores: Q_ref_h @ K_h^T / sqrt(d_k)
+    std::vector<float> scores(n_ref * T);
+    for (int qi = 0; qi < n_ref; qi++) {
+        const float * q_row = K_all + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+        for (int ki = 0; ki < T; ki++) {
+            const float * k_row = K_all + ki * n_embd_k_gqa + h * d_k;
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++) {
+                dot += q_row[d] * k_row[d];
+            }
+            scores[qi * T + ki] = dot * inv_sqrt_dk;
+        }
+    }
+
+    // Compute exp(scores) for NNLS mass matching
+    std::vector<float> exp_scores(scores);
+    std::vector<float> row_sums(n_ref);
+    exp_rows_stable(exp_scores.data(), row_sums.data(), n_ref, T);
+
+    // Softmax attention weights for value refitting target
+    std::vector<float> attn_weights(scores);
+    softmax_rows(attn_weights.data(), n_ref, T);
+
+    // Step 1: NNLS for beta (attention mass matching)
+    std::vector<float> M(n_ref * t);
+    for (int qi = 0; qi < n_ref; qi++) {
+        for (int j = 0; j < t; j++) {
+            M[qi * t + j] = exp_scores[qi * T + selected[j]];
+        }
+    }
+
+    std::vector<float> w(t);
+    nnls_solve(M.data(), row_sums.data(), w.data(), n_ref, t);
+
+    for (int j = 0; j < t; j++) {
+        result.beta[j] = logf(std::max(1e-12f, w[j]));
+    }
+
+    // Step 2: Least-squares for C_v (value refitting)
+    // X_ij = softmax over selected positions, with or without beta adjustment
+    std::vector<float> X(n_ref * t);
+    for (int qi = 0; qi < n_ref; qi++) {
+        for (int j = 0; j < t; j++) {
+            X[qi * t + j] = scores[qi * T + selected[j]];
+            if (use_beta_for_cv) {
+                X[qi * t + j] += result.beta[j];
+            }
+        }
+    }
+    softmax_rows(X.data(), n_ref, t);
+
+    // Y = original attention output: attn_weights @ V_head  [n_ref, d_v]
+    std::vector<float> Y(n_ref * d_v, 0.0f);
+    for (int qi = 0; qi < n_ref; qi++) {
+        for (int ki = 0; ki < T; ki++) {
+            float w_ij = attn_weights[qi * T + ki];
+            const float * v_row = V_all + ki * n_embd_v_gqa + h * d_v;
+            for (int d = 0; d < d_v; d++) {
+                Y[qi * d_v + d] += w_ij * v_row[d];
+            }
+        }
+    }
+
+    least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_ref, t, d_v);
+
+    return result;
+}
+
 struct compacted_head {
     std::vector<int>   selected_indices;  // which original tokens were selected
     std::vector<float> beta;              // attention mass biases [t]

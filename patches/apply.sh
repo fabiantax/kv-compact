@@ -119,25 +119,33 @@ new = '''        // if context shifting is disabled: try KV compaction if enable
             compact_params.compact_ratio = params_base.kv_compact_ratio;
             compact_params.n_keep        = std::min(4, slot.n_ctx / 8);
 
+            // Allocate buffer for kept positions so we can accurately rebuild tokens
+            int max_kept = (int)(slot.n_ctx * params_base.kv_compact_ratio) + 1;
+            std::vector<int32_t> kept_pos(max_kept);
+            compact_params.kept_positions     = kept_pos.data();
+            compact_params.kept_positions_cap = max_kept;
+
             int new_size = kv_compact_sequence(ctx, slot.id, compact_params);
 
             if (new_size > 0 && new_size < slot.prompt.n_tokens()) {
                 SLT_WRN(slot, "KV compaction succeeded: %d -> %d tokens\\n",
                         slot.prompt.n_tokens(), new_size);
 
+                // Rebuild token bookkeeping using the actual kept positions.
+                // After compaction, positions are renumbered to [0..new_size-1].
+                // kept_pos[i] contains the original position that maps to new position i.
                 GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
                 llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
-                int n_keep_tokens = compact_params.n_keep;
                 llama_tokens new_tokens;
                 new_tokens.reserve(new_size);
-                for (int i = 0; i < n_keep_tokens && i < (int)old_tokens.size(); i++)
-                    new_tokens.push_back(old_tokens[i]);
-                int n_recent = new_size - (int)new_tokens.size();
-                int start = std::max((int)old_tokens.size() - n_recent, n_keep_tokens);
-                for (int i = start; i < (int)old_tokens.size() && (int)new_tokens.size() < new_size; i++)
-                    new_tokens.push_back(old_tokens[i]);
-                while ((int)new_tokens.size() < new_size)
-                    new_tokens.push_back(old_tokens.back());
+                for (int i = 0; i < new_size; i++) {
+                    int orig_pos = kept_pos[i];
+                    if (orig_pos >= 0 && orig_pos < (int)old_tokens.size()) {
+                        new_tokens.push_back(old_tokens[orig_pos]);
+                    } else {
+                        new_tokens.push_back(old_tokens.back());
+                    }
+                }
                 slot.prompt.tokens.clear();
                 slot.prompt.tokens.insert(new_tokens);
                 slot.truncated = true;

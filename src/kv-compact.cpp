@@ -299,43 +299,29 @@ int main(int argc, char ** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // Compact each layer independently, but with shared key selection per layer
-    std::vector<int> shared_selected;  // will be set by first layer, may differ per layer
+    std::vector<int> shared_selected;
     std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
+    std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
 
     // For the state writer, we need a single shared selection across ALL layers
     // (because cell positions must be consistent across layers in the state format)
-    // Strategy: compute importance per layer, aggregate, then select globally
+    // Strategy: compute importance per layer (streaming), aggregate, then select globally
 
     LOG_INF("Computing global key importance across %u layers × %d heads...\n",
             sd.n_layer, n_head_kv);
 
     // Global importance: max across all layers and heads
-    std::vector<float> global_importance(sd.cell_count, 0.0f);
-
-    // Store per-layer precomputed data for reuse in NNLS/LSQ steps
-    struct layer_head_cache {
-        std::vector<float> scores;       // [n_q, T]
-        std::vector<float> exp_scores;   // [n_q, T]
-        std::vector<float> row_sums;     // [n_q]
-        std::vector<float> attn_weights; // [n_q, T]
-    };
-    std::vector<std::vector<layer_head_cache>> lh_cache(sd.n_layer);
-
-    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
     const int T = (int) sd.cell_count;
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    std::vector<float> global_importance(T, 0.0f);
 
+    // Streaming importance scoring — process one layer at a time, discard after scoring
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
-        lh_cache[l].resize(n_head_kv);
 
         for (int h = 0; h < n_head_kv; h++) {
-            auto & hc = lh_cache[l][h];
-            hc.scores.resize(n_ref_queries * T);
-            hc.exp_scores.resize(n_ref_queries * T);
-            hc.row_sums.resize(n_ref_queries);
-            hc.attn_weights.resize(n_ref_queries * T);
-
-            // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
+            // Compute softmax attention weights for this head
+            std::vector<float> attn_weights(n_ref_queries * T);
             for (int qi = 0; qi < n_ref_queries; qi++) {
                 const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
                 for (int ki = 0; ki < T; ki++) {
@@ -344,22 +330,16 @@ int main(int argc, char ** argv) {
                     for (int d = 0; d < d_k; d++) {
                         dot += q_row[d] * k_row[d];
                     }
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    attn_weights[qi * T + ki] = dot * inv_sqrt_dk;
                 }
             }
-
-            // exp and softmax
-            memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
-
-            memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+            softmax_rows(attn_weights.data(), n_ref_queries, T);
 
             // Per-key max attention across queries → global importance
             for (int j = 0; j < T; j++) {
                 float max_w = 0.0f;
                 for (int qi = 0; qi < n_ref_queries; qi++) {
-                    float w = hc.attn_weights[qi * T + j];
+                    float w = attn_weights[qi * T + j];
                     if (w > max_w) max_w = w;
                 }
                 if (max_w > global_importance[j]) {
@@ -387,58 +367,24 @@ int main(int argc, char ** argv) {
     LOG_INF("Selected %d / %d positions globally\n", t, T);
 
     // Per-layer, per-head NNLS (beta) and least-squares (C_v)
-    std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
-
+    // C_v is fitted with un-biased softmax so it works at inference time
+    // (betas are not stored in the state format)
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
         cv_all[l].resize(n_head_kv);
         beta_all[l].resize(n_head_kv);
 
         for (int h = 0; h < n_head_kv; h++) {
-            const auto & hc = lh_cache[l][h];
+            auto rr = refit_head_values(
+                ld.K.data(), ld.V.data(),
+                T, n_embd_k_gqa, n_embd_v_gqa,
+                h, d_k, d_v,
+                n_ref_queries, ref_start,
+                shared_selected,
+                false /* use_beta_for_cv: false since betas aren't stored */);
 
-            auto & beta = beta_all[l][h];
-            auto & cv   = cv_all[l][h];
-            beta.resize(t);
-            cv.resize(t * d_v);
-
-            // Step 2: NNLS for beta
-            std::vector<float> M(n_ref_queries * t);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t; j++) {
-                    M[qi * t + j] = hc.exp_scores[qi * T + shared_selected[j]];
-                }
-            }
-
-            std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t);
-
-            for (int j = 0; j < t; j++) {
-                beta[j] = logf(std::max(1e-12f, w[j]));
-            }
-
-            // Step 3: Least squares for C_v
-            std::vector<float> X(n_ref_queries * t);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t; j++) {
-                    X[qi * t + j] = hc.scores[qi * T + shared_selected[j]] + beta[j];
-                }
-            }
-            softmax_rows(X.data(), n_ref_queries, t);
-
-            // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
-            std::vector<float> Y(n_ref_queries * d_v, 0.0f);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int ki = 0; ki < T; ki++) {
-                    float w_ij = hc.attn_weights[qi * T + ki];
-                    const float * v_row = ld.V.data() + ki * n_embd_v_gqa + h * d_v;
-                    for (int d = 0; d < d_v; d++) {
-                        Y[qi * d_v + d] += w_ij * v_row[d];
-                    }
-                }
-            }
-
-            least_squares_solve(X.data(), Y.data(), cv.data(), n_ref_queries, t, d_v);
+            beta_all[l][h] = std::move(rr.beta);
+            cv_all[l][h]   = std::move(rr.C_v);
         }
 
         if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
@@ -455,14 +401,14 @@ int main(int argc, char ** argv) {
     // ============================================================
     LOG_INF("\n--- Phase 5: Quality metrics ---\n");
 
-    // Evaluate on 3 representative layers
+    // Evaluate on 3 representative layers — shows quality WITHOUT beta
+    // (which is what inference will see after state round-trip)
     int eval_layers[] = { 0, (int)sd.n_layer / 2, (int)sd.n_layer - 1 };
     for (int li = 0; li < 3; li++) {
         int l = eval_layers[li];
         if (l < 0 || l >= (int)sd.n_layer) continue;
 
         const auto & ld = sd.layers[l];
-        const auto & hc = lh_cache[l][0]; // head 0
 
         // Test query: last K vector, head 0
         const float * q_test = ld.K.data() + (T - 1) * n_embd_k_gqa;
@@ -485,13 +431,13 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // Compacted output (with C_v + beta)
+        // Compacted output (C_v without beta — matches inference behavior)
         std::vector<float> comp_scores(t);
         for (int j = 0; j < t; j++) {
             float dot = 0.0f;
             const float * k_row = ld.K.data() + shared_selected[j] * n_embd_k_gqa;
             for (int d = 0; d < d_k; d++) dot += q_test[d] * k_row[d];
-            comp_scores[j] = dot * inv_sqrt_dk + beta_all[l][0][j];
+            comp_scores[j] = dot * inv_sqrt_dk;
         }
         softmax_rows(comp_scores.data(), 1, t);
 
