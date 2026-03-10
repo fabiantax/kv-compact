@@ -406,14 +406,15 @@ static void test_compact_quality_improves_with_refitting() {
         }
     }
 
-    // Compacted scores with beta
+    // Compacted scores WITHOUT beta — matches inference behavior
+    // (betas are not stored in llama.cpp state format)
     std::vector<float> comp_scores(t);
     for (int j = 0; j < t; j++) {
         float dot = 0.0f;
         for (int d = 0; d < d_k; d++) {
             dot += test_q[d] * K[result.selected_indices[j] * d_k + d];
         }
-        comp_scores[j] = dot * inv_sqrt_dk + result.beta[j];
+        comp_scores[j] = dot * inv_sqrt_dk;
     }
     softmax_rows(comp_scores.data(), 1, t);
 
@@ -506,14 +507,14 @@ static void test_compact_cosine_similarity() {
         for (int d = 0; d < d_v; d++) orig_out[d] += orig_scores[j] * V[j * d_v + d];
     }
 
-    // Compacted output
+    // Compacted output (without beta — matches inference behavior)
     std::vector<float> comp_scores(t);
     for (int j = 0; j < t; j++) {
         float dot = 0.0f;
         for (int d = 0; d < d_k; d++) {
             dot += test_q[d] * K[result.selected_indices[j] * d_k + d];
         }
-        comp_scores[j] = dot * inv_sqrt_dk + result.beta[j];
+        comp_scores[j] = dot * inv_sqrt_dk;
     }
     softmax_rows(comp_scores.data(), 1, t);
     std::vector<float> comp_out(d_v, 0.0f);
@@ -644,7 +645,7 @@ static void test_compact_layer_quality_per_head() {
             }
         }
 
-        // Compacted output with beta + C_v
+        // Compacted output with C_v (no beta — matches inference behavior)
         std::vector<float> comp_scores(t);
         for (int j = 0; j < t; j++) {
             float dot = 0.0f;
@@ -652,7 +653,7 @@ static void test_compact_layer_quality_per_head() {
             for (int d = 0; d < d_k; d++) {
                 dot += q_test[d] * K[idx * n_embd_k_gqa + h * d_k + d];
             }
-            comp_scores[j] = dot * inv_sqrt_dk + result.beta[h][j];
+            comp_scores[j] = dot * inv_sqrt_dk;
         }
         softmax_rows(comp_scores.data(), 1, t);
 
@@ -706,6 +707,162 @@ static void test_compact_layer_finite_values() {
 }
 
 // ============================================================================
+// refit_head_values tests
+// ============================================================================
+
+static void test_refit_head_values_basic() {
+    printf("  test_refit_head_values_basic...");
+    // Multi-head layout: 2 heads, d_k=4, d_v=4
+    const int T = 16, n_head_kv = 2, d_k = 4, d_v = 4;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+    const int n_ref = 8, t = 4;
+    const int ref_start = T - n_ref;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = cosf((float)i * 0.2f);
+
+    // Pre-select some indices
+    std::vector<int> selected = {0, 3, 7, 12};
+
+    for (int h = 0; h < n_head_kv; h++) {
+        auto rr = refit_head_values(
+            K.data(), V.data(), T, n_embd_k_gqa, n_embd_v_gqa,
+            h, d_k, d_v, n_ref, ref_start, selected, false);
+
+        // Check sizes
+        assert((int)rr.beta.size() == t);
+        assert((int)rr.C_v.size() == t * d_v);
+
+        // Check finiteness
+        for (int j = 0; j < t; j++) {
+            assert(std::isfinite(rr.beta[j]));
+        }
+        for (int j = 0; j < t * d_v; j++) {
+            assert(std::isfinite(rr.C_v[j]));
+        }
+    }
+    printf(" OK\n");
+}
+
+static void test_refit_head_values_quality() {
+    printf("  test_refit_head_values_quality...");
+    // Verify that refitted C_v improves attention output quality
+    const int T = 32, n_head_kv = 1, d_k = 8, d_v = 8;
+    const int n_embd_k_gqa = d_k, n_embd_v_gqa = d_v;
+    const int n_ref = 16, t = 8;
+    const int ref_start = T - n_ref;
+
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa);
+    for (int i = 0; i < T * n_embd_k_gqa; i++) K[i] = sinf((float)(i * 3 + 1) * 0.5f);
+    for (int i = 0; i < T * n_embd_v_gqa; i++) V[i] = cosf((float)(i * 2 + 3) * 0.3f);
+
+    // Select top-t by simplified importance
+    std::vector<int> selected = {0, 4, 8, 12, 16, 20, 24, 28};
+
+    auto rr = refit_head_values(
+        K.data(), V.data(), T, n_embd_k_gqa, n_embd_v_gqa,
+        0, d_k, d_v, n_ref, ref_start, selected, false);
+
+    // Evaluate: compute attention output for a test query
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+    const float * q_test = K.data(); // use first key as test query
+
+    // Original output
+    std::vector<float> orig_scores(T);
+    for (int j = 0; j < T; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) dot += q_test[d] * K[j * d_k + d];
+        orig_scores[j] = dot * inv_sqrt_dk;
+    }
+    softmax_rows(orig_scores.data(), 1, T);
+    std::vector<float> orig_out(d_v, 0.0f);
+    for (int j = 0; j < T; j++)
+        for (int d = 0; d < d_v; d++)
+            orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+    // Refitted output (no beta)
+    std::vector<float> refit_scores(t);
+    for (int j = 0; j < t; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) dot += q_test[d] * K[selected[j] * d_k + d];
+        refit_scores[j] = dot * inv_sqrt_dk;
+    }
+    softmax_rows(refit_scores.data(), 1, t);
+    std::vector<float> refit_out(d_v, 0.0f);
+    for (int j = 0; j < t; j++)
+        for (int d = 0; d < d_v; d++)
+            refit_out[d] += refit_scores[j] * rr.C_v[j * d_v + d];
+
+    // Eviction output (original V, no refitting)
+    std::vector<float> evict_out(d_v, 0.0f);
+    for (int j = 0; j < t; j++)
+        for (int d = 0; d < d_v; d++)
+            evict_out[d] += refit_scores[j] * V[selected[j] * d_v + d];
+
+    // MSE
+    float mse_refit = 0.0f, mse_evict = 0.0f;
+    for (int d = 0; d < d_v; d++) {
+        float dr = refit_out[d] - orig_out[d];
+        float de = evict_out[d] - orig_out[d];
+        mse_refit += dr * dr;
+        mse_evict += de * de;
+    }
+    mse_refit /= d_v;
+    mse_evict /= d_v;
+
+    printf("\n    refit_head_values MSE: %.8f vs eviction MSE: %.8f (%.1fx better)\n",
+           mse_refit, mse_evict, mse_evict / (mse_refit + 1e-12f));
+
+    // Refitting should be better than or equal to simple eviction
+    assert(mse_refit <= mse_evict * 1.1f);
+    printf("  OK\n");
+}
+
+static void test_refit_head_values_beta_vs_unbias() {
+    printf("  test_refit_head_values_beta_vs_unbias...");
+    // Both beta-biased and un-biased should produce finite, reasonable results
+    const int T = 24, d_k = 6, d_v = 6;
+    const int n_ref = 12, t = 6;
+    const int ref_start = T - n_ref;
+
+    std::vector<float> K(T * d_k), V(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.4f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.25f);
+
+    std::vector<int> selected = {1, 5, 9, 13, 17, 21};
+
+    auto rr_unbias = refit_head_values(K.data(), V.data(), T, d_k, d_v,
+                                       0, d_k, d_v, n_ref, ref_start, selected, false);
+    auto rr_bias   = refit_head_values(K.data(), V.data(), T, d_k, d_v,
+                                       0, d_k, d_v, n_ref, ref_start, selected, true);
+
+    // Both should produce finite values
+    for (int j = 0; j < t * d_v; j++) {
+        assert(std::isfinite(rr_unbias.C_v[j]));
+        assert(std::isfinite(rr_bias.C_v[j]));
+    }
+
+    // Betas should be the same (computed before C_v)
+    for (int j = 0; j < t; j++) {
+        assert(approx_eq(rr_unbias.beta[j], rr_bias.beta[j]));
+    }
+
+    // C_v values should differ (different fitting objectives)
+    bool differ = false;
+    for (int j = 0; j < t * d_v; j++) {
+        if (fabsf(rr_unbias.C_v[j] - rr_bias.C_v[j]) > 1e-6f) {
+            differ = true;
+            break;
+        }
+    }
+    assert(differ && "Un-biased and biased C_v should differ");
+
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -751,6 +908,11 @@ int main() {
     test_compact_layer_no_compression();
     test_compact_layer_quality_per_head();
     test_compact_layer_finite_values();
+
+    printf("\n=== refit_head_values ===\n");
+    test_refit_head_values_basic();
+    test_refit_head_values_quality();
+    test_refit_head_values_beta_vs_unbias();
 
     printf("\nAll tests passed!\n");
     return 0;

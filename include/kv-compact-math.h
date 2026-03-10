@@ -389,7 +389,9 @@ struct compacted_layer {
 //   d_k:     key dimension
 //   d_v:     value dimension
 //
-// Returns compacted_head with selected indices, beta, and C_v
+// Returns compacted_head with selected indices, beta, and C_v.
+// C_v is fitted with un-biased softmax (no beta) to match inference behavior,
+// since betas cannot be stored in the llama.cpp state format.
 KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
         const float * K, const float * V, const float * Q_ref,
         int T, int n_q, int d_k, int d_v, int t) {
@@ -408,7 +410,6 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
     }
 
     // Step 1: Compute attention scores Q_ref @ K^T / sqrt(d_k)
-    //   scores: [n_q, T]
     const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
     std::vector<float> scores(n_q * T);
     mat_mul_ABt(Q_ref, K, scores.data(), n_q, T, d_k);
@@ -416,12 +417,7 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
         scores[i] *= inv_sqrt_dk;
     }
 
-    // Compute exp(scores) with max-shift for mass computation
-    std::vector<float> exp_scores(scores); // copy
-    std::vector<float> row_sums(n_q);
-    exp_rows_stable(exp_scores.data(), row_sums.data(), n_q, T);
-
-    // Compute softmax attention weights for key scoring
+    // Softmax attention weights for key scoring and value target
     std::vector<float> attn_weights(scores);
     softmax_rows(attn_weights.data(), n_q, T);
 
@@ -442,17 +438,14 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
     std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
                       [&](int a, int b) { return key_scores[a] > key_scores[b]; });
 
-    // Sort selected indices for cache locality
     std::vector<int> selected(indices.begin(), indices.begin() + t);
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
 
-    // Step 2: Solve NNLS for beta (mass matching)
-    //   We want: sum_j exp(q_i * C_k_j / sqrt(d)) * w_j ≈ sum_j exp(q_i * K_j / sqrt(d))
-    //   where C_k are the selected keys and w_j = exp(beta_j)
-    //
-    //   Design matrix M: M_ij = exp(q_i * K_{selected[j]} / sqrt(d))
-    //   Target: m_i = sum_j exp(q_i * K_j / sqrt(d)) = row_sums[i] (already computed)
+    // Step 2: NNLS for beta (attention mass matching)
+    std::vector<float> exp_scores(scores);
+    std::vector<float> row_sums(n_q);
+    exp_rows_stable(exp_scores.data(), row_sums.data(), n_q, T);
 
     std::vector<float> M(n_q * t);
     for (int i = 0; i < n_q; i++) {
@@ -461,33 +454,24 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Target mass: already computed as row_sums
     std::vector<float> w(t);
     nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
 
-    // beta = log(w)
     for (int j = 0; j < t; j++) {
         result.beta[j] = logf(std::max(1e-12f, w[j]));
     }
 
-    // Step 3: Solve least squares for C_v (value fitting)
-    //   We want: softmax(q * C_k^T + beta) * C_v ≈ softmax(q * K^T) * V
-    //
-    //   X_ij = softmax(q_i * C_k_j + beta_j) (compacted attention weights)
-    //   Y_i  = softmax(q_i * K^T) * V         (original attention output)
-    //   Solve: X * C_v = Y
-
-    // Compute X: attention weights with compacted keys + bias
-    // scores[i*T + j] is already scaled by inv_sqrt_dk from Step 1
+    // Step 3: Least squares for C_v (un-biased: no beta in softmax)
+    // At inference, model computes softmax(q·K_selected/√d) · C_v without beta,
+    // so C_v must be fitted against the un-biased distribution.
     std::vector<float> X(n_q * t);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < t; j++) {
-            X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
+            X[i * t + j] = scores[i * T + selected[j]];
         }
     }
     softmax_rows(X.data(), n_q, t);
 
-    // Compute Y: original attention output = attn_weights @ V  [n_q, d_v]
     std::vector<float> Y(n_q * d_v, 0.0f);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < T; j++) {
@@ -498,7 +482,6 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Solve: X * C_v = Y  =>  C_v = (X^T X)^{-1} X^T Y
     least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
 
     return result;
@@ -625,6 +608,8 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
     result.selected_indices = selected;
 
     // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
+    // Q_ref_all is passed separately here, but refit_head_values expects
+    // queries to be a slice of K_all. Use the precomputed head data instead.
 
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hd = hdata[h];
@@ -632,8 +617,7 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
         result.beta[h].resize(t);
         result.C_v[h].resize(t * d_v);
 
-        // Step 2: NNLS for beta
-        // M_ij = exp(q_i * K_{selected[j]} / sqrt(d)) (from precomputed exp_scores)
+        // NNLS for beta
         std::vector<float> M(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
@@ -648,17 +632,15 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
             result.beta[h][j] = logf(std::max(1e-12f, w[j]));
         }
 
-        // Step 3: Least squares for C_v
-        // X_ij = softmax(score[qi, selected[j]] + beta[j])
+        // Least squares for C_v (un-biased: no beta in softmax)
         std::vector<float> X(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
-                X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
+                X[qi * t + j] = hd.scores[qi * T + selected[j]];
             }
         }
         softmax_rows(X.data(), n_q, t);
 
-        // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
         std::vector<float> Y(n_q * d_v, 0.0f);
         for (int qi = 0; qi < n_q; qi++) {
             for (int ki = 0; ki < T; ki++) {
