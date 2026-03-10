@@ -25,8 +25,95 @@
 #include <string>
 #include <vector>
 
+#ifdef __linux__
+#include <fstream>
+#endif
+
 #include "kv-compact-math.h"
 #include "kv-compact-state.h"
+
+// ============================================================================
+// Profiling helpers
+// ============================================================================
+
+struct phase_timer {
+    using clock = std::chrono::high_resolution_clock;
+
+    struct entry {
+        std::string name;
+        double      ms;
+        size_t      mem_bytes;  // estimated peak memory for this phase
+    };
+
+    std::vector<entry>  entries;
+    clock::time_point   phase_start;
+    std::string         current_name;
+
+    void begin(const std::string & name) {
+        current_name = name;
+        phase_start  = clock::now();
+    }
+
+    void end(size_t mem_bytes = 0) {
+        double ms = std::chrono::duration<double, std::milli>(clock::now() - phase_start).count();
+        entries.push_back({current_name, ms, mem_bytes});
+    }
+
+    void print_summary() const {
+        double total_ms = 0.0;
+        for (const auto & e : entries) total_ms += e.ms;
+
+        LOG_INF("\n┌─────────────────────────────────┬───────────┬─────────┬────────────┐\n");
+        LOG_INF("│ Phase                           │  Time(ms) │     %%   │  Mem (MB)  │\n");
+        LOG_INF("├─────────────────────────────────┼───────────┼─────────┼────────────┤\n");
+        for (const auto & e : entries) {
+            double pct = total_ms > 0 ? (e.ms / total_ms * 100.0) : 0.0;
+            if (e.mem_bytes > 0) {
+                LOG_INF("│ %-31s │ %9.1f │ %5.1f%%  │ %8.2f   │\n",
+                        e.name.c_str(), e.ms, pct, e.mem_bytes / (1024.0 * 1024.0));
+            } else {
+                LOG_INF("│ %-31s │ %9.1f │ %5.1f%%  │        -   │\n",
+                        e.name.c_str(), e.ms, pct);
+            }
+        }
+        LOG_INF("├─────────────────────────────────┼───────────┼─────────┼────────────┤\n");
+        LOG_INF("│ TOTAL                           │ %9.1f │ 100.0%%  │            │\n", total_ms);
+        LOG_INF("└─────────────────────────────────┴───────────┴─────────┴────────────┘\n");
+    }
+};
+
+// Read peak RSS from /proc/self/status (Linux only)
+static size_t get_peak_rss_bytes() {
+#ifdef __linux__
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.compare(0, 6, "VmHWM:") == 0) {
+            // Format: "VmHWM:    12345 kB"
+            size_t kb = 0;
+            sscanf(line.c_str(), "VmHWM: %zu", &kb);
+            return kb * 1024;
+        }
+    }
+#endif
+    return 0;
+}
+
+// Read current RSS
+static size_t get_current_rss_bytes() {
+#ifdef __linux__
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.compare(0, 5, "VmRSS") == 0) {
+            size_t kb = 0;
+            sscanf(line.c_str(), "VmRSS: %zu", &kb);
+            return kb * 1024;
+        }
+    }
+#endif
+    return 0;
+}
 
 // ============================================================================
 // Helpers
@@ -168,10 +255,16 @@ int main(int argc, char ** argv) {
     n_ref_queries = std::min(n_ref_queries, n_tokens);
     LOG_INF("Reference queries: %d (from last quarter of context)\n", n_ref_queries);
 
+    // Profiling
+    phase_timer prof;
+    size_t rss_baseline = get_current_rss_bytes();
+    LOG_INF("Baseline RSS: %.2f MB\n", rss_baseline / (1024.0 * 1024.0));
+
     // ============================================================
     // Phase 1: Prefill
     // ============================================================
     LOG_INF("\n--- Phase 1: Prefill ---\n");
+    prof.begin("Prefill + state save");
 
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
@@ -195,17 +288,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
     LOG_INF("State saved: %.2f MB\n", saved / (1024.0 * 1024.0));
+    prof.end(saved);
 
     // ============================================================
     // Phase 2: Generate with full cache (reference output)
     // ============================================================
     LOG_INF("\n--- Phase 2: Full cache generation (reference) ---\n");
+    prof.begin("Reference generation");
 
     const int n_gen = std::min(params.n_predict > 0 ? params.n_predict : 128, n_ctx - n_tokens);
     std::string full_output = generate_tokens(ctx, model, vocab, params, n_tokens, n_gen);
     LOG_INF("Full output:\n%s\n", full_output.c_str());
 
     llama_memory_t mem = llama_get_memory(ctx);
+    prof.end();
 
     // ============================================================
     // Phase 3: Token eviction baseline
@@ -213,6 +309,7 @@ int main(int argc, char ** argv) {
     std::string evict_output;
     if (do_eviction) {
         LOG_INF("\n--- Phase 3: Token eviction baseline ---\n");
+        prof.begin("Eviction baseline");
 
         // Restore original state
         llama_memory_seq_rm(mem, 0, -1, -1);
@@ -249,6 +346,7 @@ int main(int argc, char ** argv) {
         llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
         evict_output = generate_tokens(ctx, model, vocab, params, pos_max + 1, n_gen);
         LOG_INF("Eviction output:\n%s\n", evict_output.c_str());
+        prof.end();
     }
 
     // ============================================================
@@ -257,12 +355,14 @@ int main(int argc, char ** argv) {
     LOG_INF("\n--- Phase 4: Attention Matching compaction ---\n");
 
     // Parse the saved state
+    prof.begin("State parse");
     parsed_kv_state kv_state;
     if (!kv_state.parse(full_state.data(), saved, n_pos_per_embd)) {
         LOG_ERR("Failed to parse state buffer\n");
         llama_batch_free(batch);
         return 1;
     }
+    prof.end(saved);  // parsed state holds ~same bytes as raw
 
     LOG_INF("Parsed state: %u streams\n", kv_state.n_stream);
 
@@ -291,7 +391,7 @@ int main(int argc, char ** argv) {
     // Q_ref_all: [n_ref_queries, n_embd_k_gqa]
     // We use K vectors as proxy queries (Q and K share similar structure)
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    prof.begin("Attention scoring");
 
     // Compact each layer independently, but with shared key selection per layer
     std::vector<int> shared_selected;  // will be set by first layer, may differ per layer
@@ -381,7 +481,15 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Selected %d / %d positions globally\n", t, T);
 
+    // Estimate memory for lh_cache: n_layer * n_head_kv * (4 arrays of n_q*T floats + n_q floats)
+    {
+        size_t cache_bytes = (size_t)sd.n_layer * n_head_kv *
+            ((size_t)n_ref_queries * T * 4 + n_ref_queries) * sizeof(float);
+        prof.end(cache_bytes);
+    }
+
     // Per-layer, per-head NNLS (beta) and least-squares (C_v)
+    prof.begin("NNLS + least-squares");
     std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
 
     for (uint32_t l = 0; l < sd.n_layer; l++) {
@@ -441,7 +549,14 @@ int main(int argc, char ** argv) {
         }
     }
 
+    {
+        size_t nnls_mem = (size_t)sd.n_layer * n_head_kv *
+            ((size_t)t + (size_t)t * d_v) * sizeof(float);
+        prof.end(nnls_mem);  // beta_all + cv_all
+    }
+
     // Compute beta directions for K-modification (per layer, per head)
+    prof.begin("Beta direction computation");
     // Direction v satisfies: Q_ref_h @ v ≈ 1, so that
     // q @ (k + beta * sqrt(d_k) * v) / sqrt(d_k) ≈ q @ k / sqrt(d_k) + beta
     std::vector<std::vector<std::vector<float>>> beta_dirs(sd.n_layer);
@@ -462,15 +577,16 @@ int main(int argc, char ** argv) {
         }
     }
     LOG_INF("Computed beta directions for %u layers × %d heads\n", sd.n_layer, n_head_kv);
-
-    auto t_end = std::chrono::high_resolution_clock::now();
-    double compact_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    LOG_INF("Compaction took %.1f ms (%.1f ms/layer)\n", compact_ms, compact_ms / sd.n_layer);
+    {
+        size_t dir_mem = (size_t)sd.n_layer * n_head_kv * d_k * sizeof(float);
+        prof.end(dir_mem);
+    }
 
     // ============================================================
     // Phase 5: Quality metrics (sample layers/heads)
     // ============================================================
     LOG_INF("\n--- Phase 5: Quality metrics ---\n");
+    prof.begin("Quality metrics");
 
     // Evaluate on 3 representative layers
     int eval_layers[] = { 0, (int)sd.n_layer / 2, (int)sd.n_layer - 1 };
@@ -531,6 +647,7 @@ int main(int argc, char ** argv) {
 
         LOG_INF("  Layer %2d head 0: cos_sim=%.6f rel_err=%.6f\n", l, cos_sim, rel_err);
     }
+    prof.end();
 
     // ============================================================
     // Phase 6: Write back compacted state and generate
@@ -539,6 +656,7 @@ int main(int argc, char ** argv) {
         LOG_INF("\n--- Phase 6: Write-back and generation ---\n");
 
         // Build compacted state buffer (with beta folded into K vectors)
+        prof.begin("State build + load");
         auto compacted_buf = build_compacted_state(
             kv_state, shared_selected, cv_all, n_head_kv, d_k, d_v, n_pos_per_embd,
             beta_all, beta_dirs);
@@ -554,10 +672,13 @@ int main(int argc, char ** argv) {
         if (loaded == 0) {
             LOG_ERR("Failed to load compacted state!\n");
             LOG_ERR("State buffer size: %zu bytes\n", compacted_buf.size());
+            prof.end(compacted_buf.size());
         } else {
             LOG_INF("Loaded compacted state: %zu bytes\n", loaded);
+            prof.end(compacted_buf.size());
 
             // Generate with compacted cache
+            prof.begin("Compacted generation");
             // Position after the max position in selected cells
             llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
             LOG_INF("Generating from pos %d...\n", (int)pos_max + 1);
@@ -574,10 +695,27 @@ int main(int argc, char ** argv) {
                 LOG_INF("\nToken eviction output (first 200 chars):\n  %.200s\n", evict_output.c_str());
             }
             LOG_INF("\nAttention Matching output (first 200 chars):\n  %.200s\n", am_output.c_str());
+            prof.end();
+        } else {
+            prof.end(compacted_buf.size());
         }
     } else {
         LOG_INF("\n--- Skipping write-back (--no-writeback) ---\n");
         LOG_INF("To enable: remove --no-writeback flag\n");
+    }
+
+    // ============================================================
+    // Profiling summary
+    // ============================================================
+    prof.print_summary();
+
+    size_t peak_rss = get_peak_rss_bytes();
+    size_t curr_rss = get_current_rss_bytes();
+    if (peak_rss > 0) {
+        LOG_INF("\nMemory: current RSS=%.2f MB, peak RSS=%.2f MB (delta=%.2f MB over baseline)\n",
+                curr_rss / (1024.0 * 1024.0),
+                peak_rss / (1024.0 * 1024.0),
+                (peak_rss - rss_baseline) / (1024.0 * 1024.0));
     }
 
     // ---- Cleanup ----
