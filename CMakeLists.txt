@@ -33,6 +33,7 @@ if(KV_COMPACT_BUILD_TOOL)
     # Find llama.cpp - either via LLAMA_CPP_DIR or FetchContent
     if(LLAMA_CPP_DIR)
         message(STATUS "Using local llama.cpp: ${LLAMA_CPP_DIR}")
+        set(_LLAMA_SRC_DIR "${LLAMA_CPP_DIR}")
         add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
     else()
         include(FetchContent)
@@ -44,6 +45,20 @@ if(KV_COMPACT_BUILD_TOOL)
         )
         message(STATUS "Fetching llama.cpp from GitHub (this may take a while)...")
         FetchContent_MakeAvailable(llama_cpp)
+        set(_LLAMA_SRC_DIR "${llama_cpp_SOURCE_DIR}")
+    endif()
+
+    # Auto-apply KV compaction patches to llama.cpp source
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh" AND EXISTS "${_LLAMA_SRC_DIR}/tools/server")
+        message(STATUS "Applying KV compaction patches to llama.cpp...")
+        execute_process(
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh" "${_LLAMA_SRC_DIR}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            RESULT_VARIABLE _PATCH_RESULT
+        )
+        if(_PATCH_RESULT)
+            message(WARNING "Patch application returned ${_PATCH_RESULT} (may already be applied)")
+        endif()
     endif()
 
     # Now that llama/common targets exist, link them into kv-compact-lib

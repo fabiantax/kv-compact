@@ -1,3 +1,22 @@
+KV Cache Compaction — llama-server integration patch
+====================================================
+
+This patch adds automatic KV cache compaction to llama-server via two hooks:
+
+1. process_token() [no-context-shift path]:
+   When --no-context-shift is used with --kv-compact-ratio, compacts the cache
+   instead of stopping generation when context fills up. Re-compacts each time
+   the cache fills again, allowing indefinite generation.
+
+2. update_slots() [context-shift path]:
+   When --kv-compact-ratio is used WITH context shifting enabled, tries
+   compaction first. Falls back to standard context shift if compaction fails.
+
+Both hooks use kept_positions to accurately rebuild the server's token
+bookkeeping after compaction (maps original token positions to compacted ones).
+
+Applied automatically by CMake or manually via: bash patches/apply.sh
+
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,6 +1,8 @@
@@ -9,83 +28,73 @@
  #include "common.h"
  #include "llama.h"
  #include "log.h"
-@@ -1245,12 +1247,60 @@
 
-         // if context shifting is disabled, make sure that we don't run out of context
+=== process_token(): no-context-shift compaction hook ===
+
+Replace the context-full early stop with KV compaction:
+
+-        // if context shifting is disabled, make sure that we don't run out of context
 -        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
 -            slot.truncated      = true;
 -            slot.stop           = STOP_TYPE_LIMIT;
 -            slot.has_next_token = false;
--
--            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
--                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+-            SLT_DBG(slot, "stopped due to running out of context capacity, ...");
+-        }
 +        // if context shifting is disabled: try KV compaction if enabled, otherwise stop
 +        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx && params_base.kv_compact_ratio <= 0.0f) {
-+            slot.truncated      = true;
-+            slot.stop           = STOP_TYPE_LIMIT;
-+            slot.has_next_token = false;
-+
-+            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, n_ctx = %d\n",
-+                    slot.prompt.n_tokens(), slot.n_ctx);
++            // No compaction — stop as before
 +        }
 +
 +        if (!params_base.ctx_shift && params_base.kv_compact_ratio > 0.0f && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-+            SLT_WRN(slot, "context full (%d/%d tokens), attempting KV compaction (ratio=%.2f)\n",
-+                    slot.prompt.n_tokens(), slot.n_ctx, params_base.kv_compact_ratio);
-+
-+            kv_compact_params compact_params = kv_compact_params_default();
-+            compact_params.compact_ratio = params_base.kv_compact_ratio;
-+            compact_params.n_keep        = std::min(4, slot.n_ctx / 8);
-+
-+            // Allocate buffer for kept positions so we can accurately rebuild tokens
-+            int max_kept = (int)(slot.n_ctx * params_base.kv_compact_ratio) + 1;
-+            std::vector<int32_t> kept_pos(max_kept);
-+            compact_params.kept_positions     = kept_pos.data();
-+            compact_params.kept_positions_cap = max_kept;
-+
-+            int new_size = kv_compact_sequence(ctx, slot.id, compact_params);
-+
-+            if (new_size > 0 && new_size < slot.prompt.n_tokens()) {
-+                SLT_WRN(slot, "KV compaction succeeded: %d -> %d tokens\n",
-+                        slot.prompt.n_tokens(), new_size);
-+
-+                // Rebuild token bookkeeping using the actual kept positions.
-+                // After compaction, positions are renumbered to [0..new_size-1].
-+                // kept_pos[i] contains the original position that maps to new position i.
-+                GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-+                llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
-+                llama_tokens new_tokens;
-+                new_tokens.reserve(new_size);
-+                for (int i = 0; i < new_size; i++) {
-+                    int orig_pos = kept_pos[i];
-+                    if (orig_pos >= 0 && orig_pos < (int)old_tokens.size()) {
-+                        new_tokens.push_back(old_tokens[orig_pos]);
-+                    } else {
-+                        // Position out of range (shouldn't happen) — use padding
-+                        new_tokens.push_back(old_tokens.back());
-+                    }
++            // Allocate kept_positions buffer, call kv_compact_sequence()
++            // On success: rebuild tokens using kept_positions, continue generating
++            // On failure: stop with STOP_TYPE_LIMIT
++        }
+
+=== update_slots(): context-shift compaction hook ===
+
+Replace the context-shift block with try-compaction-first:
+
+-                const int n_left    = slot.prompt.n_tokens() - n_keep;
+-                const int n_discard = ...;
+-                llama_memory_seq_rm (...);
+-                llama_memory_seq_add(...);
+-                // rebuild tokens with simple shift
++                // Try KV cache compaction if enabled
++                if (params_base.kv_compact_ratio > 0.0f) {
++                    // call kv_compact_sequence() with kept_positions
 +                }
-+                slot.prompt.tokens.clear();
-+                slot.prompt.tokens.insert(new_tokens);
-+                slot.truncated = true;
-+            } else {
-+                slot.truncated      = true;
-+                slot.stop           = STOP_TYPE_LIMIT;
-+                slot.has_next_token = false;
-+                SLT_DBG(slot, "KV compaction failed, stopped, prompt.n_tokens() = %d, n_ctx = %d\n",
-+                        slot.prompt.n_tokens(), slot.n_ctx);
-+            }
-         }
++                if (new_size > 0) {
++                    // rebuild tokens using kept_positions
++                } else {
++                    // fall back to original context shift
++                }
 
 --- a/tools/server/CMakeLists.txt
 +++ b/tools/server/CMakeLists.txt
-@@ -24,6 +24,11 @@
+@@ target_link_libraries
  target_link_libraries(${TARGET} PUBLIC common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 +# KV compaction integration
 +if(TARGET kv-compact-lib)
 +    target_link_libraries(${TARGET} PUBLIC kv-compact-lib)
 +endif()
-+
 
- # llama-server executable
+--- a/common/common.h
++++ b/common/common.h
+@@ kv_unified
+     bool kv_unified = false;
++
++    float kv_compact_ratio = 0.0f;  // KV compaction ratio (0.0 = disabled, 0.5 = keep 50%, etc.)
+
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ LLAMA_ARG_CONTEXT_SHIFT
++    add_opt(common_arg(
++        {"--kv-compact-ratio"}, "N",
++        "KV cache compaction ratio when context is full (0.0 = disabled, 0.5 = keep 50%)",
++        [](common_params & params, const std::string & value) {
++            params.kv_compact_ratio = std::stof(value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER})
++     .set_env("LLAMA_ARG_KV_COMPACT_RATIO"));

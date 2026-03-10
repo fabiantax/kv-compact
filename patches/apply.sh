@@ -81,13 +81,15 @@ with open(arg_cpp, 'w') as f:
     f.write(content)
 print("Patched: added --kv-compact-ratio CLI argument")
 PYEOF
-    echo "Warning: inline Python patch for arg.cpp may have failed. Check manually."
 fi
 
-# --- 5. Patch server-context.cpp: add compaction hooks ---
+# --- 5. Patch server-context.cpp: add compaction hook in process_token() ---
+#     (no-context-shift path: compact instead of stopping)
 if ! grep -q "kv_compact_sequence" "$SERVER_CTX"; then
-    python3 << 'PYEOF'
-with open("'"$SERVER_CTX"'", 'r') as f:
+    python3 - "$SERVER_CTX" << 'PYEOF'
+import sys
+
+with open(sys.argv[1], 'r') as f:
     content = f.read()
 
 # Replace the no-context-shift early stop with compaction
@@ -120,7 +122,7 @@ new = '''        // if context shifting is disabled: try KV compaction if enable
             compact_params.n_keep        = std::min(4, slot.n_ctx / 8);
 
             // Allocate buffer for kept positions so we can accurately rebuild tokens
-            int max_kept = (int)(slot.n_ctx * params_base.kv_compact_ratio) + 1;
+            int max_kept = (int)(slot.n_ctx * params_base.kv_compact_ratio) + 16;
             std::vector<int32_t> kept_pos(max_kept);
             compact_params.kept_positions     = kept_pos.data();
             compact_params.kept_positions_cap = max_kept;
@@ -132,7 +134,6 @@ new = '''        // if context shifting is disabled: try KV compaction if enable
                         slot.prompt.n_tokens(), new_size);
 
                 // Rebuild token bookkeeping using the actual kept positions.
-                // After compaction, positions are renumbered to [0..new_size-1].
                 // kept_pos[i] contains the original position that maps to new position i.
                 GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
                 llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
@@ -160,7 +161,7 @@ new = '''        // if context shifting is disabled: try KV compaction if enable
 
 if old in content:
     content = content.replace(old, new)
-    with open("'"$SERVER_CTX"'", 'w') as f:
+    with open(sys.argv[1], 'w') as f:
         f.write(content)
     print("Patched: replaced context-full handler with KV compaction (process_token)")
 else:
@@ -168,7 +169,134 @@ else:
 PYEOF
 fi
 
+# --- 6. Patch server-context.cpp: add compaction hook in update_slots() ---
+#     (context-shift path: try compaction first, fall back to context shift)
+if ! grep -q "KV cache compaction.*attention matching" "$SERVER_CTX"; then
+    python3 - "$SERVER_CTX" << 'PYEOF'
+import sys
+
+with open(sys.argv[1], 'r') as f:
+    content = f.read()
+
+# Find the context-shift comment block in update_slots and wrap it with compaction
+old = '''        // apply context-shift if needed'''
+
+# We need a bigger anchor. Find the context-shift for loop.
+# The original llama.cpp code looks like:
+#   for (server_slot & slot : slots) {
+#       if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+#           ...original context shift...
+#       }
+#   }
+# We replace the body of the context-shift block to try compaction first.
+
+# Find the n_discard calculation and the seq_rm/seq_add block
+old_shift = '''                const int n_left    = slot.prompt.n_tokens() - n_keep;
+                const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+
+                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                {
+                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+
+                    llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens();
+                    for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+                        new_tokens[i - n_discard] = new_tokens[i];
+                    }
+
+                    new_tokens.resize(slot.prompt.tokens.size() - n_discard);
+
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(new_tokens);
+                }'''
+
+new_shift = '''                // Try KV cache compaction if enabled, otherwise fall back to context shift
+                int new_size = 0;
+
+                // Allocate buffer for kept positions so we can accurately rebuild token list
+                std::vector<int32_t> kept_pos;
+
+                if (params_base.kv_compact_ratio > 0.0f) {
+                    kv_compact_params compact_params = kv_compact_params_default();
+                    compact_params.compact_ratio = params_base.kv_compact_ratio;
+                    compact_params.n_keep        = n_keep; // preserve sink tokens
+
+                    int max_kept = (int)(slot.n_ctx * params_base.kv_compact_ratio) + 16;
+                    kept_pos.resize(max_kept);
+                    compact_params.kept_positions     = kept_pos.data();
+                    compact_params.kept_positions_cap = max_kept;
+
+                    SLT_WRN(slot, "slot KV compaction, n_tokens = %d, n_keep = %d, ratio = %.2f\\n",
+                            slot.prompt.n_tokens(), n_keep, compact_params.compact_ratio);
+
+                    new_size = kv_compact_sequence(ctx, slot.id, compact_params);
+                }
+
+                if (new_size > 0) {
+                    const int n_discard = slot.prompt.n_tokens() - new_size;
+
+                    SLT_WRN(slot, "KV compaction done: %d -> %d tokens (discarded %d)\\n",
+                            slot.prompt.n_tokens(), new_size, n_discard);
+
+                    // Rebuild token bookkeeping using the actual kept positions.
+                    // kept_pos[i] contains the original position that maps to new position i.
+                    {
+                        GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                        llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
+                        llama_tokens new_tokens;
+                        new_tokens.reserve(new_size);
+                        for (int i = 0; i < new_size; i++) {
+                            int orig_pos = kept_pos[i];
+                            if (orig_pos >= 0 && orig_pos < (int)old_tokens.size()) {
+                                new_tokens.push_back(old_tokens[orig_pos]);
+                            } else {
+                                new_tokens.push_back(old_tokens.back());
+                            }
+                        }
+
+                        slot.prompt.tokens.clear();
+                        slot.prompt.tokens.insert(new_tokens);
+                    }
+                } else {
+                    // Compaction failed or disabled - fall back to original context shift
+                    if (params_base.kv_compact_ratio > 0.0f) {
+                        SLT_WRN(slot, "%s", "KV compaction failed, falling back to context shift\\n");
+                    }
+
+                    const int n_left    = slot.prompt.n_tokens() - n_keep;
+                    const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                    {
+                        GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+
+                        llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens();
+                        for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+                            new_tokens[i - n_discard] = new_tokens[i];
+                        }
+
+                        new_tokens.resize(slot.prompt.tokens.size() - n_discard);
+
+                        slot.prompt.tokens.clear();
+                        slot.prompt.tokens.insert(new_tokens);
+                    }
+                }'''
+
+if old_shift in content:
+    content = content.replace(old_shift, new_shift)
+    with open(sys.argv[1], 'w') as f:
+        f.write(content)
+    print("Patched: added KV compaction to update_slots context-shift path")
+else:
+    print("Warning: could not find context-shift block in update_slots (may already be patched)")
+PYEOF
+fi
+
 echo ""
 echo "Done. Rebuild with: cmake --build . --target llama-server"
 echo ""
 echo "Usage: llama-server --kv-compact-ratio 0.5 --no-context-shift ..."
+echo "  or:  llama-server --kv-compact-ratio 0.5  (with context shift as fallback)"
