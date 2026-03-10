@@ -320,6 +320,128 @@ int kv_compact(
     return 0;
 }
 
+int kv_compact_multi_round(
+    const float * K_all,
+    const float * V_all,
+    const float * Q_ref_all,
+    int T, int n_q, int n_head_kv, int d_k, int d_v,
+    const kv_compact_params * params,
+    int n_rounds,
+    kv_compact_result * result,
+    kv_compact_stats * per_round_stats) {
+
+    if (!K_all || !V_all || !Q_ref_all || !result) return -1;
+    if (T <= 0 || n_q <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
+    if (n_rounds < 1) return -3;
+
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // Track original indices through rounds
+    std::vector<int> original_indices(T);
+    std::iota(original_indices.begin(), original_indices.end(), 0);
+
+    // Current KV data (starts as copy, modified each round)
+    std::vector<float> cur_K(K_all, K_all + (size_t)T * n_embd_k);
+    std::vector<float> cur_V(V_all, V_all + (size_t)T * n_embd_v);
+    int cur_T = T;
+
+    // Q_ref stays the same (from original context)
+    // But we need to limit n_q to current T
+    int cur_n_q = n_q;
+
+    for (int round = 0; round < n_rounds; round++) {
+        // Use original Q_ref for all rounds
+        // This avoids using beta-distorted K as proxy queries
+        int n_q_round = n_q < cur_T ? n_q : cur_T;
+
+        kv_compact_result round_result = {};
+        int rc = kv_compact(cur_K.data(), cur_V.data(), Q_ref_all,
+                           cur_T, n_q_round, n_head_kv, d_k, d_v,
+                           params, &round_result);
+        if (rc != 0) {
+            kv_compact_result_free(&round_result);
+            return rc;
+        }
+
+        if (per_round_stats) {
+            per_round_stats[round] = round_result.stats;
+        }
+
+        int new_T = round_result.t;
+
+        // Map selected indices back to original positions
+        std::vector<int> new_original_indices(new_T);
+        for (int j = 0; j < new_T; j++) {
+            new_original_indices[j] = original_indices[round_result.selected_indices[j]];
+        }
+
+        // Build new K (original, without beta) and new V (C_v) for next round.
+        // We do NOT fold beta into K between rounds — the compaction math
+        // already accounts for beta during NNLS/LS. Folding it in would
+        // distort the K vectors for subsequent rounds.
+        std::vector<float> new_K(new_T * n_embd_k);
+        std::vector<float> new_V(new_T * n_embd_v);
+
+        for (int j = 0; j < new_T; j++) {
+            int src_idx = round_result.selected_indices[j];
+            // Keep original K (no beta modification)
+            memcpy(new_K.data() + j * n_embd_k,
+                   cur_K.data() + src_idx * n_embd_k,
+                   n_embd_k * sizeof(float));
+            // V from C_v (per head)
+            for (int h = 0; h < n_head_kv; h++) {
+                memcpy(new_V.data() + j * n_embd_v + h * d_v,
+                       round_result.C_v[h] + j * d_v,
+                       d_v * sizeof(float));
+            }
+        }
+
+        // If this is the last round, populate the final result
+        if (round == n_rounds - 1) {
+            result->t = new_T;
+            result->n_head_kv = n_head_kv;
+
+            result->selected_indices = (int *) malloc(new_T * sizeof(int));
+            memcpy(result->selected_indices, new_original_indices.data(),
+                   new_T * sizeof(int));
+
+            result->beta = (float **) malloc(n_head_kv * sizeof(float *));
+            result->C_v  = (float **) malloc(n_head_kv * sizeof(float *));
+
+            for (int h = 0; h < n_head_kv; h++) {
+                // Store the last round's beta (to be applied to original K)
+                result->beta[h] = (float *) malloc(new_T * sizeof(float));
+                memcpy(result->beta[h], round_result.beta[h],
+                       new_T * sizeof(float));
+
+                result->C_v[h] = (float *) malloc(new_T * d_v * sizeof(float));
+                memcpy(result->C_v[h], round_result.C_v[h],
+                       new_T * d_v * sizeof(float));
+            }
+
+            result->stats = round_result.stats;
+        }
+
+        kv_compact_result_free(&round_result);
+
+        // Update for next round
+        cur_K = std::move(new_K);
+        cur_V = std::move(new_V);
+        original_indices = std::move(new_original_indices);
+        cur_T = new_T;
+    }
+
+    // Compute final quality metrics against the ORIGINAL data
+    // result->beta from last round + result->C_v vs original K_all/V_all
+    // Use the original indices to find the right K rows
+    compute_quality_metrics(K_all, V_all, Q_ref_all,
+                           T, n_q, n_head_kv, d_k, d_v, result,
+                           &result->stats);
+
+    return 0;
+}
+
 void kv_compact_result_free(kv_compact_result * result) {
     if (!result) return;
 

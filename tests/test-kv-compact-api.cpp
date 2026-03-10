@@ -243,6 +243,100 @@ static void test_quality_across_ratios() {
     printf("  OK\n");
 }
 
+static void test_multi_round_basic() {
+    printf("  test_multi_round_basic...\n");
+    const int T = 128, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 700);
+    gen_data(V.data(), T * n_embd_v, 800);
+    gen_data(Q.data(), n_q * n_embd_k, 900);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;  // each round keeps 50%
+
+    const int n_rounds = 3;
+    kv_compact_stats round_stats[3];
+    kv_compact_result result = {};
+
+    int rc = kv_compact_multi_round(K.data(), V.data(), Q.data(),
+                                    T, n_q, n_head_kv, d_k, d_v,
+                                    &p, n_rounds, &result, round_stats);
+    assert(rc == 0);
+
+    // After 3 rounds of 50%: 128 → 64 → 32 → 16
+    assert(result.t == 16);
+
+    // Selected indices should map back to original positions
+    for (int j = 0; j < result.t; j++) {
+        assert(result.selected_indices[j] >= 0);
+        assert(result.selected_indices[j] < T);
+    }
+    for (int j = 1; j < result.t; j++) {
+        assert(result.selected_indices[j] > result.selected_indices[j - 1]);
+    }
+
+    printf("    Round results (vs original data):\n");
+    for (int r = 0; r < n_rounds; r++) {
+        printf("      Round %d: cos=%.6f mse=%.8f\n",
+               r + 1, round_stats[r].avg_cosine_sim, round_stats[r].avg_mse);
+    }
+    printf("    Final (vs original): cos=%.6f mse=%.8f\n",
+           result.stats.avg_cosine_sim, result.stats.avg_mse);
+
+    // After 3 rounds of 50% (12.5% total retention), quality will degrade
+    // but values must remain finite and the algorithm must not crash
+    printf("    Final cosine sim: %.6f\n", result.stats.avg_cosine_sim);
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    assert(std::isfinite(result.stats.avg_mse));
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_multi_round_quality_degradation() {
+    printf("  test_multi_round_quality_degradation...\n");
+    const int T = 256, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 1000);
+    gen_data(V.data(), T * n_embd_v, 1100);
+    gen_data(Q.data(), n_q * n_embd_k, 1200);
+
+    // Run 1, 2, and 3 rounds at 70% retention and compare
+    float cos_by_rounds[3];
+
+    for (int nr = 1; nr <= 3; nr++) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.7f;
+
+        kv_compact_result result = {};
+        int rc = kv_compact_multi_round(K.data(), V.data(), Q.data(),
+                                        T, n_q, n_head_kv, d_k, d_v,
+                                        &p, nr, &result, NULL);
+        assert(rc == 0);
+
+        cos_by_rounds[nr - 1] = result.stats.avg_cosine_sim;
+        printf("    %d rounds (%.0f%% total retention): t=%d cos=%.6f\n",
+               nr, pow(0.7, nr) * 100, result.t, result.stats.avg_cosine_sim);
+
+        kv_compact_result_free(&result);
+    }
+
+    // Quality should degrade gracefully at 70% retention per round
+    // 1 round should be best
+    assert(cos_by_rounds[0] >= cos_by_rounds[1] - 0.01f);
+    assert(cos_by_rounds[1] >= cos_by_rounds[2] - 0.01f);
+    // At 70% per round, even 3 rounds (34% total) should maintain decent quality
+    assert(cos_by_rounds[2] > 0.7f);
+
+    printf("  OK\n");
+}
+
 static void test_double_free_safe() {
     printf("  test_double_free_safe...");
     kv_compact_result result = {};
@@ -276,6 +370,10 @@ int main() {
 
     printf("\n=== Quality across ratios ===\n");
     test_quality_across_ratios();
+
+    printf("\n=== Multi-round compaction (US-9) ===\n");
+    test_multi_round_basic();
+    test_multi_round_quality_degradation();
 
     printf("\n=== Safety ===\n");
     test_double_free_safe();

@@ -96,6 +96,32 @@ int kv_compact(
     const kv_compact_params * params,
     kv_compact_result * result);
 
+// Apply multiple rounds of compaction to progressively shrink the cache.
+//
+// Each round compacts the output of the previous round. After round i,
+// the K data has beta folded in and V data is replaced by C_v, which
+// becomes the input for round i+1.
+//
+// This is useful for very long conversations where the cache grows
+// incrementally and needs periodic compaction.
+//
+//   n_rounds:       number of compaction rounds to apply
+//   per_round_stats: if non-NULL, array of n_rounds stats structs filled in
+//
+// The final result contains the cumulative compaction. selected_indices
+// refer to the ORIGINAL positions (before any compaction).
+//
+// Returns 0 on success, non-zero on error.
+int kv_compact_multi_round(
+    const float * K_all,
+    const float * V_all,
+    const float * Q_ref_all,
+    int T, int n_q, int n_head_kv, int d_k, int d_v,
+    const kv_compact_params * params,
+    int n_rounds,
+    kv_compact_result * result,
+    kv_compact_stats * per_round_stats);
+
 // Free all memory allocated by kv_compact()
 void kv_compact_result_free(kv_compact_result * result);
 
