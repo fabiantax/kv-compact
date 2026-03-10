@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "kv-compact-math.h"
+#include "kv-compact-state.h"
 
 static const float EPS = 1e-5f;
 
@@ -948,6 +949,96 @@ static void test_compact_layer_finite_values() {
 }
 
 // ============================================================================
+// Quantized KV round-trip tests
+// ============================================================================
+
+static void test_q8_0_round_trip() {
+    printf("  test_q8_0_round_trip...");
+    // Create float data, quantize to Q8_0, dequantize, check error
+    const int n = 64;  // 2 blocks of 32
+    std::vector<float> original(n);
+    for (int i = 0; i < n; i++) {
+        original[i] = sinf((float)i * 0.3f) * 2.0f;
+    }
+
+    // Quantize
+    int block_bytes = 2 + 32;  // Q8_0: 34 bytes per block
+    int n_blocks = n / 32;
+    std::vector<uint8_t> quantized(n_blocks * block_bytes);
+    convert_from_f32(original.data(), KV_COMPACT_GGML_TYPE_Q8_0,
+                     quantized.data(), n);
+
+    // Dequantize
+    std::vector<float> recovered(n);
+    parsed_kv_state dummy;  // just to access static methods via convert_to_f32
+    // Use the convert_to_f32 from parsed_kv_state (it's a static method)
+    // Actually we can't access private. Let's dequant manually.
+    for (int b = 0; b < n_blocks; b++) {
+        parsed_kv_state::dequant_q8_0_block(
+            quantized.data() + b * block_bytes,
+            recovered.data() + b * 32);
+    }
+
+    // Check round-trip error
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(original[i] - recovered[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf("\n    Q8_0 max round-trip error: %.6f (range: [-2, 2])\n", max_err);
+    // Q8_0 should have very low error for this range
+    assert(max_err < 0.05f);
+    printf("  OK\n");
+}
+
+static void test_q4_0_round_trip() {
+    printf("  test_q4_0_round_trip...");
+    const int n = 64;
+    std::vector<float> original(n);
+    for (int i = 0; i < n; i++) {
+        original[i] = sinf((float)i * 0.3f) * 2.0f;
+    }
+
+    // Quantize
+    int block_bytes = 2 + 16;  // Q4_0: 18 bytes per block
+    int n_blocks = n / 32;
+    std::vector<uint8_t> quantized(n_blocks * block_bytes);
+    convert_from_f32(original.data(), KV_COMPACT_GGML_TYPE_Q4_0,
+                     quantized.data(), n);
+
+    // Dequantize
+    std::vector<float> recovered(n);
+    for (int b = 0; b < n_blocks; b++) {
+        parsed_kv_state::dequant_q4_0_block(
+            quantized.data() + b * block_bytes,
+            recovered.data() + b * 32);
+    }
+
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(original[i] - recovered[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf("\n    Q4_0 max round-trip error: %.6f (range: [-2, 2])\n", max_err);
+    // Q4_0 has lower precision, allow more error
+    assert(max_err < 1.0f);
+    printf("  OK\n");
+}
+
+static void test_n_elements_per_row() {
+    printf("  test_n_elements_per_row...");
+    // F32: 128 elements = 512 bytes
+    assert(parsed_kv_state::n_elements_per_row(KV_COMPACT_GGML_TYPE_F32, 512) == 128);
+    // F16: 128 elements = 256 bytes
+    assert(parsed_kv_state::n_elements_per_row(KV_COMPACT_GGML_TYPE_F16, 256) == 128);
+    // Q8_0: 128 elements = 4 blocks * 34 bytes = 136 bytes
+    assert(parsed_kv_state::n_elements_per_row(KV_COMPACT_GGML_TYPE_Q8_0, 136) == 128);
+    // Q4_0: 128 elements = 4 blocks * 18 bytes = 72 bytes
+    assert(parsed_kv_state::n_elements_per_row(KV_COMPACT_GGML_TYPE_Q4_0, 72) == 128);
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1005,6 +1096,11 @@ int main() {
     test_compact_layer_no_compression();
     test_compact_layer_quality_per_head();
     test_compact_layer_finite_values();
+
+    printf("\n=== Quantized KV round-trip ===\n");
+    test_q8_0_round_trip();
+    test_q4_0_round_trip();
+    test_n_elements_per_row();
 
     printf("\nAll tests passed!\n");
     return 0;

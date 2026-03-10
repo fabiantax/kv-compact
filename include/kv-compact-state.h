@@ -23,12 +23,21 @@
 
 // Forward declare ggml types we need (avoid full ggml.h dependency in header)
 #ifndef GGML_TYPE_F32
-#define KV_COMPACT_GGML_TYPE_F32  0
-#define KV_COMPACT_GGML_TYPE_F16  1
+#define KV_COMPACT_GGML_TYPE_F32   0
+#define KV_COMPACT_GGML_TYPE_F16   1
+#define KV_COMPACT_GGML_TYPE_Q4_0  2
+#define KV_COMPACT_GGML_TYPE_Q4_1  3
+#define KV_COMPACT_GGML_TYPE_Q8_0  8
 #else
-#define KV_COMPACT_GGML_TYPE_F32  GGML_TYPE_F32
-#define KV_COMPACT_GGML_TYPE_F16  GGML_TYPE_F16
+#define KV_COMPACT_GGML_TYPE_F32   GGML_TYPE_F32
+#define KV_COMPACT_GGML_TYPE_F16   GGML_TYPE_F16
+#define KV_COMPACT_GGML_TYPE_Q4_0  GGML_TYPE_Q4_0
+#define KV_COMPACT_GGML_TYPE_Q4_1  GGML_TYPE_Q4_1
+#define KV_COMPACT_GGML_TYPE_Q8_0  GGML_TYPE_Q8_0
 #endif
+
+// Quantization block size (elements per block)
+static constexpr int KV_COMPACT_QK = 32;
 
 // ============================================================================
 // Cell metadata
@@ -143,9 +152,17 @@ struct parsed_kv_state {
                 if (ptr + k_data_size > end) return false;
 
                 // Convert to float32
-                const int n_floats_per_row = (int)(ld.k_size_row / type_size(ld.k_type));
+                const int n_floats_per_row = n_elements_per_row(ld.k_type, ld.k_size_row);
                 ld.K.resize((size_t)sd.cell_count * n_floats_per_row);
-                convert_to_f32(ptr, ld.k_type, ld.K.data(), sd.cell_count * n_floats_per_row);
+                if (is_quantized(ld.k_type)) {
+                    // Dequantize row by row (each row is k_size_row bytes)
+                    for (uint32_t c = 0; c < sd.cell_count; c++) {
+                        convert_to_f32(ptr + c * ld.k_size_row, ld.k_type,
+                                       ld.K.data() + c * n_floats_per_row, n_floats_per_row);
+                    }
+                } else {
+                    convert_to_f32(ptr, ld.k_type, ld.K.data(), sd.cell_count * n_floats_per_row);
+                }
 
                 ptr += k_data_size;
             }
@@ -161,9 +178,16 @@ struct parsed_kv_state {
                     const size_t v_data_size = sd.cell_count * ld.v_size_row;
                     if (ptr + v_data_size > end) return false;
 
-                    const int n_floats_per_row = (int)(ld.v_size_row / type_size(ld.v_type));
+                    const int n_floats_per_row = n_elements_per_row(ld.v_type, ld.v_size_row);
                     ld.V.resize((size_t)sd.cell_count * n_floats_per_row);
-                    convert_to_f32(ptr, ld.v_type, ld.V.data(), sd.cell_count * n_floats_per_row);
+                    if (is_quantized(ld.v_type)) {
+                        for (uint32_t c = 0; c < sd.cell_count; c++) {
+                            convert_to_f32(ptr + c * ld.v_size_row, ld.v_type,
+                                           ld.V.data() + c * n_floats_per_row, n_floats_per_row);
+                        }
+                    } else {
+                        convert_to_f32(ptr, ld.v_type, ld.V.data(), sd.cell_count * n_floats_per_row);
+                    }
 
                     ptr += v_data_size;
                 }
@@ -225,7 +249,8 @@ struct parsed_kv_state {
         }
     }
 
-private:
+    // ---- Internal helpers ----
+
     template<typename T>
     static bool read_val(const uint8_t *& ptr, const uint8_t * end, T & val) {
         if (ptr + sizeof(T) > end) return false;
@@ -234,29 +259,108 @@ private:
         return true;
     }
 
+    // ---- Type utilities and (de)quantization (public for testing) ----
+
+    // Bytes per element (for non-block types) or bytes per block (for block types)
     static int type_size(int32_t type) {
-        if (type == KV_COMPACT_GGML_TYPE_F32) return 4;
-        if (type == KV_COMPACT_GGML_TYPE_F16) return 2;
+        if (type == KV_COMPACT_GGML_TYPE_F32)  return 4;
+        if (type == KV_COMPACT_GGML_TYPE_F16)  return 2;
+        if (type == KV_COMPACT_GGML_TYPE_Q8_0) return 2 + KV_COMPACT_QK;  // 34 bytes
+        if (type == KV_COMPACT_GGML_TYPE_Q4_0) return 2 + KV_COMPACT_QK/2; // 18 bytes
+        if (type == KV_COMPACT_GGML_TYPE_Q4_1) return 4 + KV_COMPACT_QK/2; // 20 bytes
         return 4; // fallback
     }
 
-    // Convert raw data to float32 (supports F32 and F16)
+    // Is this a block-quantized type?
+    static bool is_quantized(int32_t type) {
+        return type == KV_COMPACT_GGML_TYPE_Q8_0 ||
+               type == KV_COMPACT_GGML_TYPE_Q4_0 ||
+               type == KV_COMPACT_GGML_TYPE_Q4_1;
+    }
+
+    // Number of float elements per row given type and row byte size
+    static int n_elements_per_row(int32_t type, uint64_t row_bytes) {
+        if (type == KV_COMPACT_GGML_TYPE_F32)  return (int)(row_bytes / 4);
+        if (type == KV_COMPACT_GGML_TYPE_F16)  return (int)(row_bytes / 2);
+        if (is_quantized(type)) {
+            int block_bytes = type_size(type);
+            int n_blocks = (int)(row_bytes / block_bytes);
+            return n_blocks * KV_COMPACT_QK;
+        }
+        return (int)(row_bytes / 4); // fallback
+    }
+
+    // Dequantize a Q8_0 block (34 bytes → 32 floats)
+    static void dequant_q8_0_block(const uint8_t * src, float * dst) {
+        uint16_t d_f16;
+        memcpy(&d_f16, src, 2);
+        float d = f16_to_f32(d_f16);
+        const int8_t * qs = (const int8_t *)(src + 2);
+        for (int i = 0; i < KV_COMPACT_QK; i++) {
+            dst[i] = d * (float)qs[i];
+        }
+    }
+
+    // Dequantize a Q4_0 block (18 bytes → 32 floats)
+    static void dequant_q4_0_block(const uint8_t * src, float * dst) {
+        uint16_t d_f16;
+        memcpy(&d_f16, src, 2);
+        float d = f16_to_f32(d_f16);
+        const uint8_t * qs = src + 2;
+        for (int i = 0; i < KV_COMPACT_QK / 2; i++) {
+            dst[2*i + 0] = d * ((float)(qs[i] & 0xF) - 8.0f);
+            dst[2*i + 1] = d * ((float)(qs[i] >> 4)  - 8.0f);
+        }
+    }
+
+    // Dequantize a Q4_1 block (20 bytes → 32 floats)
+    static void dequant_q4_1_block(const uint8_t * src, float * dst) {
+        uint16_t d_f16, m_f16;
+        memcpy(&d_f16, src, 2);
+        memcpy(&m_f16, src + 2, 2);
+        float d = f16_to_f32(d_f16);
+        float m = f16_to_f32(m_f16);
+        const uint8_t * qs = src + 4;
+        for (int i = 0; i < KV_COMPACT_QK / 2; i++) {
+            dst[2*i + 0] = d * (float)(qs[i] & 0xF) + m;
+            dst[2*i + 1] = d * (float)(qs[i] >> 4)  + m;
+        }
+    }
+
+    // Convert raw data to float32 (supports F32, F16, Q8_0, Q4_0, Q4_1)
     static void convert_to_f32(const uint8_t * src, int32_t type, float * dst, size_t n) {
         if (type == KV_COMPACT_GGML_TYPE_F32) {
             memcpy(dst, src, n * sizeof(float));
         } else if (type == KV_COMPACT_GGML_TYPE_F16) {
             const uint16_t * f16 = (const uint16_t *) src;
             for (size_t i = 0; i < n; i++) {
-                // IEEE 754 half-precision to single-precision
                 dst[i] = f16_to_f32(f16[i]);
             }
+        } else if (type == KV_COMPACT_GGML_TYPE_Q8_0) {
+            int block_bytes = type_size(type);
+            size_t n_blocks = n / KV_COMPACT_QK;
+            for (size_t b = 0; b < n_blocks; b++) {
+                dequant_q8_0_block(src + b * block_bytes, dst + b * KV_COMPACT_QK);
+            }
+        } else if (type == KV_COMPACT_GGML_TYPE_Q4_0) {
+            int block_bytes = type_size(type);
+            size_t n_blocks = n / KV_COMPACT_QK;
+            for (size_t b = 0; b < n_blocks; b++) {
+                dequant_q4_0_block(src + b * block_bytes, dst + b * KV_COMPACT_QK);
+            }
+        } else if (type == KV_COMPACT_GGML_TYPE_Q4_1) {
+            int block_bytes = type_size(type);
+            size_t n_blocks = n / KV_COMPACT_QK;
+            for (size_t b = 0; b < n_blocks; b++) {
+                dequant_q4_1_block(src + b * block_bytes, dst + b * KV_COMPACT_QK);
+            }
         } else {
-            // Unsupported type — fill with zeros
             memset(dst, 0, n * sizeof(float));
         }
     }
 
     // Transpose V from [embd][cell] to [cell][embd] and convert to F32
+    // For quantized types, each column of embd is stored as contiguous blocks
     static void transpose_v_to_f32(const uint8_t * src, int32_t type, float * dst,
                                    uint32_t cell_count, uint32_t n_embd) {
         if (type == KV_COMPACT_GGML_TYPE_F32) {
@@ -271,6 +375,24 @@ private:
             for (uint32_t d = 0; d < n_embd; d++) {
                 for (uint32_t c = 0; c < cell_count; c++) {
                     dst[c * n_embd + d] = f16_to_f32(f16[d * cell_count + c]);
+                }
+            }
+        } else if (is_quantized(type)) {
+            // Transposed quantized: each embedding dimension d has cell_count values
+            // stored as contiguous quantized blocks of size v_size_el * cell_count
+            // Dequantize each column, then scatter to row-major
+            int el_bytes = type_size(type) / KV_COMPACT_QK;
+            // Actually for transposed V, v_size_el gives element size, not block size
+            // The data layout is [n_embd][cell_count] elements in quantized format
+            // Each contiguous run of cell_count elements is quantized in blocks of QK
+            size_t col_bytes = (size_t)cell_count * type_size(type) / KV_COMPACT_QK;
+            // Simpler: dequantize all, then transpose
+            std::vector<float> tmp(n_embd * cell_count);
+            convert_to_f32(src, type, tmp.data(), n_embd * cell_count);
+            // tmp is now [n_embd][cell_count] in row-major, transpose to [cell_count][n_embd]
+            for (uint32_t d = 0; d < n_embd; d++) {
+                for (uint32_t c = 0; c < cell_count; c++) {
+                    dst[c * n_embd + d] = tmp[d * cell_count + c];
                 }
             }
         } else {
@@ -339,6 +461,78 @@ static uint16_t f32_to_f16(float val) {
     }
 
     return (uint16_t)(sign | (exp << 10) | mant);
+}
+
+// Quantize a block of 32 floats to Q8_0 format (34 bytes)
+static void quant_q8_0_block(const float * src, uint8_t * dst) {
+    // Find max absolute value
+    float amax = 0.0f;
+    for (int i = 0; i < KV_COMPACT_QK; i++) {
+        float a = fabsf(src[i]);
+        if (a > amax) amax = a;
+    }
+    float d = amax / 127.0f;
+    uint16_t d_f16 = f32_to_f16(d);
+    memcpy(dst, &d_f16, 2);
+
+    float id = (d != 0.0f) ? 127.0f / amax : 0.0f;
+    int8_t * qs = (int8_t *)(dst + 2);
+    for (int i = 0; i < KV_COMPACT_QK; i++) {
+        float v = src[i] * id;
+        qs[i] = (int8_t)roundf(std::max(-128.0f, std::min(127.0f, v)));
+    }
+}
+
+// Quantize a block of 32 floats to Q4_0 format (18 bytes)
+static void quant_q4_0_block(const float * src, uint8_t * dst) {
+    float amax = 0.0f;
+    for (int i = 0; i < KV_COMPACT_QK; i++) {
+        float a = fabsf(src[i]);
+        if (a > amax) amax = a;
+    }
+    float d = amax / 7.0f;
+    uint16_t d_f16 = f32_to_f16(d);
+    memcpy(dst, &d_f16, 2);
+
+    float id = (d != 0.0f) ? 7.0f / amax : 0.0f;
+    uint8_t * qs = dst + 2;
+    for (int i = 0; i < KV_COMPACT_QK / 2; i++) {
+        float v0 = src[2*i + 0] * id + 8.0f;
+        float v1 = src[2*i + 1] * id + 8.0f;
+        uint8_t q0 = (uint8_t)std::max(0.0f, std::min(15.0f, roundf(v0)));
+        uint8_t q1 = (uint8_t)std::max(0.0f, std::min(15.0f, roundf(v1)));
+        qs[i] = q0 | (q1 << 4);
+    }
+}
+
+// Convert a row of floats to the target type, writing to dst
+// Returns number of bytes written
+static size_t convert_from_f32(const float * src, int32_t type, uint8_t * dst, int n_elements) {
+    if (type == KV_COMPACT_GGML_TYPE_F32) {
+        memcpy(dst, src, n_elements * sizeof(float));
+        return n_elements * sizeof(float);
+    } else if (type == KV_COMPACT_GGML_TYPE_F16) {
+        uint16_t * f16 = (uint16_t *)dst;
+        for (int i = 0; i < n_elements; i++) {
+            f16[i] = f32_to_f16(src[i]);
+        }
+        return n_elements * sizeof(uint16_t);
+    } else if (type == KV_COMPACT_GGML_TYPE_Q8_0) {
+        int n_blocks = n_elements / KV_COMPACT_QK;
+        int block_bytes = 2 + KV_COMPACT_QK;  // 34
+        for (int b = 0; b < n_blocks; b++) {
+            quant_q8_0_block(src + b * KV_COMPACT_QK, dst + b * block_bytes);
+        }
+        return n_blocks * block_bytes;
+    } else if (type == KV_COMPACT_GGML_TYPE_Q4_0) {
+        int n_blocks = n_elements / KV_COMPACT_QK;
+        int block_bytes = 2 + KV_COMPACT_QK / 2;  // 18
+        for (int b = 0; b < n_blocks; b++) {
+            quant_q4_0_block(src + b * KV_COMPACT_QK, dst + b * block_bytes);
+        }
+        return n_blocks * block_bytes;
+    }
+    return 0;
 }
 
 // Build a compacted state buffer from original parsed state + compaction results
@@ -424,44 +618,26 @@ static std::vector<uint8_t> build_compacted_state(
             const int n_embd_k = ld.n_embd_k_gqa();
 
             // Write selected K rows, optionally with beta folded in
+            std::vector<uint8_t> row_buf(ld.k_size_row);
             for (int j = 0; j < t; j++) {
                 int orig_idx = selected_indices[j];
+                std::vector<float> k_row(ld.K.data() + orig_idx * n_embd_k,
+                                         ld.K.data() + (orig_idx + 1) * n_embd_k);
 
                 if (has_beta && l < (uint32_t)beta_all.size()) {
-                    // Copy K row and apply beta modification per head
-                    std::vector<float> k_mod(ld.K.data() + orig_idx * n_embd_k,
-                                             ld.K.data() + (orig_idx + 1) * n_embd_k);
                     const float scale = sqrtf((float) d_k);
                     for (int h = 0; h < n_head_kv; h++) {
                         const float b_scaled = beta_all[l][h][j] * scale;
                         const float * dir = beta_dirs[l][h].data();
                         for (int d = 0; d < d_k; d++) {
-                            k_mod[h * d_k + d] += b_scaled * dir[d];
+                            k_row[h * d_k + d] += b_scaled * dir[d];
                         }
-                    }
-
-                    if (ld.k_type == KV_COMPACT_GGML_TYPE_F32) {
-                        write(k_mod.data(), n_embd_k * sizeof(float));
-                    } else if (ld.k_type == KV_COMPACT_GGML_TYPE_F16) {
-                        std::vector<uint16_t> tmp(n_embd_k);
-                        for (int d = 0; d < n_embd_k; d++) {
-                            tmp[d] = f32_to_f16(k_mod[d]);
-                        }
-                        write(tmp.data(), n_embd_k * sizeof(uint16_t));
-                    }
-                } else {
-                    const float * k_row = ld.K.data() + orig_idx * n_embd_k;
-
-                    if (ld.k_type == KV_COMPACT_GGML_TYPE_F32) {
-                        write(k_row, n_embd_k * sizeof(float));
-                    } else if (ld.k_type == KV_COMPACT_GGML_TYPE_F16) {
-                        std::vector<uint16_t> tmp(n_embd_k);
-                        for (int d = 0; d < n_embd_k; d++) {
-                            tmp[d] = f32_to_f16(k_row[d]);
-                        }
-                        write(tmp.data(), n_embd_k * sizeof(uint16_t));
                     }
                 }
+
+                size_t bytes = convert_from_f32(k_row.data(), ld.k_type,
+                                                row_buf.data(), n_embd_k);
+                write(row_buf.data(), bytes);
             }
         }
 
@@ -475,7 +651,8 @@ static std::vector<uint8_t> build_compacted_state(
 
                 const int n_embd_v = ld.n_embd_v_gqa_computed();
 
-                // Build full V rows from per-head C_v
+                // Build full V rows from per-head C_v and requantize
+                std::vector<uint8_t> v_row_buf(ld.v_size_row);
                 for (int j = 0; j < t; j++) {
                     std::vector<float> v_row(n_embd_v);
                     for (int h = 0; h < n_head_kv; h++) {
@@ -483,15 +660,9 @@ static std::vector<uint8_t> build_compacted_state(
                         memcpy(v_row.data() + h * d_v, cv, d_v * sizeof(float));
                     }
 
-                    if (ld.v_type == KV_COMPACT_GGML_TYPE_F32) {
-                        write(v_row.data(), n_embd_v * sizeof(float));
-                    } else if (ld.v_type == KV_COMPACT_GGML_TYPE_F16) {
-                        std::vector<uint16_t> tmp(n_embd_v);
-                        for (int d = 0; d < n_embd_v; d++) {
-                            tmp[d] = f32_to_f16(v_row[d]);
-                        }
-                        write(tmp.data(), n_embd_v * sizeof(uint16_t));
-                    }
+                    size_t bytes = convert_from_f32(v_row.data(), ld.v_type,
+                                                    v_row_buf.data(), n_embd_v);
+                    write(v_row_buf.data(), bytes);
                 }
             }
         } else {
@@ -505,16 +676,31 @@ static std::vector<uint8_t> build_compacted_state(
                 write(&n_embd_v, sizeof(n_embd_v));
 
                 // For each embedding dimension d, write t values (transposed)
+                // Collect t values per embedding dim, then convert
+                std::vector<float> col_vals(t);
                 for (uint32_t d = 0; d < n_embd_v; d++) {
                     int h = d / d_v;
                     int di = d % d_v;
                     for (int j = 0; j < t; j++) {
-                        float val = cv_all[l][h][j * d_v + di];
-                        if (ld.v_type == KV_COMPACT_GGML_TYPE_F32) {
-                            write(&val, sizeof(float));
-                        } else if (ld.v_type == KV_COMPACT_GGML_TYPE_F16) {
-                            uint16_t f16 = f32_to_f16(val);
-                            write(&f16, sizeof(uint16_t));
+                        col_vals[j] = cv_all[l][h][j * d_v + di];
+                    }
+                    // For transposed, each "column" is t elements
+                    // Use per-element writing for non-block types,
+                    // or block writing for quantized types
+                    if (parsed_kv_state::is_quantized(ld.v_type)) {
+                        // Quantized transposed: write t values as blocks
+                        std::vector<uint8_t> buf(t * 4); // generous
+                        size_t bytes = convert_from_f32(col_vals.data(), ld.v_type,
+                                                        buf.data(), t);
+                        write(buf.data(), bytes);
+                    } else {
+                        for (int j = 0; j < t; j++) {
+                            if (ld.v_type == KV_COMPACT_GGML_TYPE_F32) {
+                                write(&col_vals[j], sizeof(float));
+                            } else if (ld.v_type == KV_COMPACT_GGML_TYPE_F16) {
+                                uint16_t f16 = f32_to_f16(col_vals[j]);
+                                write(&f16, sizeof(uint16_t));
+                            }
                         }
                     }
                 }
