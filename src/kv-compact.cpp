@@ -689,15 +689,12 @@ int main(int argc, char ** argv) {
             // Summary comparison
             LOG_INF("\n=== Summary ===\n");
             LOG_INF("Compression: %d → %d tokens (%.1fx)\n", n_tokens, t, (float)n_tokens / t);
-            LOG_INF("Compaction time: %.1f ms\n", compact_ms);
             LOG_INF("\nFull cache output (first 200 chars):\n  %.200s\n", full_output.c_str());
             if (do_eviction) {
                 LOG_INF("\nToken eviction output (first 200 chars):\n  %.200s\n", evict_output.c_str());
             }
             LOG_INF("\nAttention Matching output (first 200 chars):\n  %.200s\n", am_output.c_str());
             prof.end();
-        } else {
-            prof.end(compacted_buf.size());
         }
     } else {
         LOG_INF("\n--- Skipping write-back (--no-writeback) ---\n");
