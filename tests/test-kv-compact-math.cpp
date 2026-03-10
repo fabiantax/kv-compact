@@ -289,6 +289,89 @@ static void test_least_squares_with_ridge() {
 }
 
 // ============================================================================
+// Per-head sensitivity and budget allocation tests
+// ============================================================================
+
+static void test_sensitivity_uniform_attention() {
+    printf("  test_sensitivity_uniform_attention...");
+    // Uniform attention → sensitivity should be close to 1.0
+    const int n_q = 4, T = 8;
+    std::vector<float> attn(n_q * T);
+    for (int i = 0; i < n_q * T; i++) attn[i] = 1.0f / T;
+
+    float sens = compute_head_sensitivity(attn.data(), n_q, T);
+    // max_importance = 1/T, mean_importance = 1/T, ratio = 1.0
+    assert(approx_eq(sens, 1.0f, 0.1f));
+    printf(" OK\n");
+}
+
+static void test_sensitivity_concentrated_attention() {
+    printf("  test_sensitivity_concentrated_attention...");
+    // One position gets all attention → high sensitivity
+    const int n_q = 4, T = 8;
+    std::vector<float> attn(n_q * T, 0.0f);
+    // Each query puts all weight on position 3
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + 3] = 1.0f;
+    }
+
+    float sens = compute_head_sensitivity(attn.data(), n_q, T);
+    // max_importance = 1.0, mean_importance = 1/T = 0.125, ratio = 8
+    assert(approx_eq(sens, (float)T, 0.1f));
+    printf(" OK\n");
+}
+
+static void test_sensitivity_ordering() {
+    printf("  test_sensitivity_ordering...");
+    // Concentrated head should have higher sensitivity than spread head
+    const int n_q = 8, T = 16;
+
+    // Head A: concentrated on 2 positions
+    std::vector<float> attn_a(n_q * T, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn_a[qi * T + 2] = 0.7f;
+        attn_a[qi * T + 5] = 0.3f;
+    }
+
+    // Head B: spread across many positions
+    std::vector<float> attn_b(n_q * T);
+    for (int i = 0; i < n_q * T; i++) attn_b[i] = 1.0f / T;
+
+    float sens_a = compute_head_sensitivity(attn_a.data(), n_q, T);
+    float sens_b = compute_head_sensitivity(attn_b.data(), n_q, T);
+
+    printf("\n    Concentrated sensitivity: %.2f, Uniform sensitivity: %.2f\n", sens_a, sens_b);
+    assert(sens_a > sens_b);
+    printf("  OK\n");
+}
+
+static void test_weighted_importance_basic() {
+    printf("  test_weighted_importance_basic...");
+    // Two heads: head 0 has sensitivity 10, head 1 has sensitivity 1
+    // Head 0 cares about position 2, head 1 cares about position 5
+    // Weighted importance should favor position 2
+    const int T = 8, n_heads = 2;
+
+    std::vector<std::vector<float>> per_head_imp = {
+        {0, 0, 1.0f, 0, 0, 0, 0, 0},  // head 0: position 2
+        {0, 0, 0, 0, 0, 1.0f, 0, 0},  // head 1: position 5
+    };
+    std::vector<float> sensitivities = {10.0f, 1.0f};
+
+    std::vector<float> out(T, 0.0f);
+    accumulate_weighted_importance(per_head_imp, sensitivities, T, n_heads, out.data());
+
+    // Position 2 should have importance 10, position 5 should have importance 1
+    assert(approx_eq(out[2], 10.0f, 0.01f));
+    assert(approx_eq(out[5], 1.0f, 0.01f));
+    assert(approx_eq(out[0], 0.0f, 0.01f));
+
+    // Position 2 should rank higher
+    assert(out[2] > out[5]);
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Beta injection via K-modification tests
 // ============================================================================
 
@@ -897,6 +980,12 @@ int main() {
     test_least_squares_overdetermined();
     test_least_squares_multi_rhs();
     test_least_squares_with_ridge();
+
+    printf("\n=== Per-head sensitivity ===\n");
+    test_sensitivity_uniform_attention();
+    test_sensitivity_concentrated_attention();
+    test_sensitivity_ordering();
+    test_weighted_importance_basic();
 
     printf("\n=== Beta injection via K-modification ===\n");
     test_compute_beta_direction_identity_queries();

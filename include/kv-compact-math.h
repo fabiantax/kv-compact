@@ -241,6 +241,63 @@ static void least_squares_solve(const float * A, const float * b, float * x,
 }
 
 // ============================================================================
+// Per-head sensitivity and budget allocation
+// ============================================================================
+
+// Compute per-head sensitivity (concentration ratio) from attention weights.
+//
+// For each head, the "importance" of position j is max_q(attn_weights[q,j]).
+// Sensitivity = max(importance) / mean(importance).
+// A high ratio means the head concentrates on few positions → more sensitive
+// to losing those positions → should have more influence on key selection.
+//
+// attn_weights: [n_q × T] softmax attention weights for one head
+// n_q:          number of reference queries
+// T:            number of positions
+//
+// Returns sensitivity scalar (>= 1.0)
+static float compute_head_sensitivity(const float * attn_weights, int n_q, int T) {
+    // Per-position importance: max attention weight across queries
+    float sum_imp = 0.0f;
+    float max_imp = 0.0f;
+    for (int j = 0; j < T; j++) {
+        float max_w = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            float w = attn_weights[qi * T + j];
+            if (w > max_w) max_w = w;
+        }
+        sum_imp += max_w;
+        if (max_w > max_imp) max_imp = max_w;
+    }
+    float mean_imp = sum_imp / (float) T;
+    return max_imp / (mean_imp + 1e-12f);
+}
+
+// Compute sensitivity-weighted global importance across multiple heads.
+//
+// For each position j, the weighted importance is the sum across heads of
+// sensitivity[h] * per_head_importance[h][j]. This gives more influence to
+// heads that concentrate attention on fewer positions.
+//
+// per_head_importance: [n_heads][T] max-attention-weight per position per head
+// sensitivities:       [n_heads] sensitivity scalars
+// T:                   number of positions
+// n_heads:             number of heads
+// out:                 [T] output weighted importance (accumulated, not zeroed)
+static void accumulate_weighted_importance(
+        const std::vector<std::vector<float>> & per_head_importance,
+        const std::vector<float> & sensitivities,
+        int T, int n_heads, float * out) {
+    for (int h = 0; h < n_heads; h++) {
+        const float s = sensitivities[h];
+        const float * imp = per_head_importance[h].data();
+        for (int j = 0; j < T; j++) {
+            out[j] += s * imp[j];
+        }
+    }
+}
+
+// ============================================================================
 // Beta injection via K-vector modification
 // ============================================================================
 

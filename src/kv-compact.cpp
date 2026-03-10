@@ -164,6 +164,7 @@ static void print_usage(int argc, char ** argv) {
     LOG("  -n  N             tokens to generate after compaction (default: 128)\n");
     LOG("  --no-writeback    skip write-back (demo mode: compute quality metrics only)\n");
     LOG("  --no-eviction     skip token eviction baseline\n");
+    LOG("  --sensitivity-budget  weight key selection by per-head sensitivity\n");
     LOG("\n");
 }
 
@@ -175,6 +176,7 @@ int main(int argc, char ** argv) {
     int   n_ref_queries = 0;   // 0 = auto (last quarter)
     bool  do_writeback  = true;
     bool  do_eviction   = true;
+    bool  sensitivity_budget = false;  // per-head sensitivity-weighted budget
 
     // Parse standard params
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
@@ -191,6 +193,8 @@ int main(int argc, char ** argv) {
             do_writeback = false;
         } else if (strcmp(argv[i], "--no-eviction") == 0) {
             do_eviction = false;
+        } else if (strcmp(argv[i], "--sensitivity-budget") == 0) {
+            sensitivity_budget = true;
         }
     }
 
@@ -404,7 +408,7 @@ int main(int argc, char ** argv) {
     LOG_INF("Computing global key importance across %u layers × %d heads...\n",
             sd.n_layer, n_head_kv);
 
-    // Global importance: max across all layers and heads
+    // Global importance: aggregated across all layers and heads
     std::vector<float> global_importance(sd.cell_count, 0.0f);
 
     // Store per-layer precomputed data for reuse in NNLS/LSQ steps
@@ -418,6 +422,15 @@ int main(int argc, char ** argv) {
 
     const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
     const int T = (int) sd.cell_count;
+
+    // For sensitivity-weighted budget: collect per-head importance vectors
+    // and sensitivities, then aggregate at the end
+    std::vector<std::vector<float>> per_layer_head_imp;  // [n_heads_total][T]
+    std::vector<float> all_sensitivities;                // [n_heads_total]
+    if (sensitivity_budget) {
+        per_layer_head_imp.reserve((size_t)sd.n_layer * n_head_kv);
+        all_sensitivities.reserve((size_t)sd.n_layer * n_head_kv);
+    }
 
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
@@ -450,15 +463,28 @@ int main(int argc, char ** argv) {
             memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
             softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
 
-            // Per-key max attention across queries → global importance
+            // Per-key max attention across queries
+            std::vector<float> head_importance(T);
             for (int j = 0; j < T; j++) {
                 float max_w = 0.0f;
                 for (int qi = 0; qi < n_ref_queries; qi++) {
                     float w = hc.attn_weights[qi * T + j];
                     if (w > max_w) max_w = w;
                 }
-                if (max_w > global_importance[j]) {
-                    global_importance[j] = max_w;
+                head_importance[j] = max_w;
+            }
+
+            if (sensitivity_budget) {
+                // Store per-head importance and sensitivity for weighted aggregation
+                float sens = compute_head_sensitivity(hc.attn_weights.data(), n_ref_queries, T);
+                per_layer_head_imp.push_back(std::move(head_importance));
+                all_sensitivities.push_back(sens);
+            } else {
+                // Original: max across all heads
+                for (int j = 0; j < T; j++) {
+                    if (head_importance[j] > global_importance[j]) {
+                        global_importance[j] = head_importance[j];
+                    }
                 }
             }
         }
@@ -466,6 +492,23 @@ int main(int argc, char ** argv) {
         if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
             LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
         }
+    }
+
+    // Sensitivity-weighted aggregation
+    if (sensitivity_budget) {
+        int total_heads = (int)all_sensitivities.size();
+        accumulate_weighted_importance(per_layer_head_imp, all_sensitivities,
+                                       T, total_heads, global_importance.data());
+
+        // Log sensitivity statistics
+        float min_s = all_sensitivities[0], max_s = all_sensitivities[0], sum_s = 0.0f;
+        for (float s : all_sensitivities) {
+            if (s < min_s) min_s = s;
+            if (s > max_s) max_s = s;
+            sum_s += s;
+        }
+        LOG_INF("Head sensitivity: min=%.1f, max=%.1f, mean=%.1f (%.1fx spread)\n",
+                min_s, max_s, sum_s / total_heads, max_s / (min_s + 1e-8f));
     }
 
     // Select top-t globally
