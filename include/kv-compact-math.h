@@ -11,12 +11,18 @@
 #include <numeric>
 #include <vector>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define KV_COMPACT_UNUSED __attribute__((unused))
+#else
+#define KV_COMPACT_UNUSED
+#endif
+
 // ============================================================================
 // Linear algebra utilities (CPU-side, float32)
 // ============================================================================
 
 // Compute C = A * B^T  where A is (m x k), B is (n x k), result is (m x n)
-static void mat_mul_ABt(const float * A, const float * B, float * C, int m, int n, int k) {
+KV_COMPACT_UNUSED static void mat_mul_ABt(const float * A, const float * B, float * C, int m, int n, int k) {
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
             float sum = 0.0f;
@@ -29,7 +35,7 @@ static void mat_mul_ABt(const float * A, const float * B, float * C, int m, int 
 }
 
 // Compute C = A^T * B  where A is (m x k), B is (m x n), result is (k x n)
-static void mat_mul_AtB(const float * A, const float * B, float * C, int m, int k, int n) {
+KV_COMPACT_UNUSED static void mat_mul_AtB(const float * A, const float * B, float * C, int m, int k, int n) {
     // zero out C
     memset(C, 0, k * n * sizeof(float));
     for (int i = 0; i < m; i++) {
@@ -135,7 +141,7 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
 
         // w = max(0, w - step * grad)
         for (int i = 0; i < n; i++) {
-            w[i] = std::max(1e-12f, w[i] - step * grad[i]);
+            w[i] = std::max(0.0f, w[i] - step * grad[i]);
         }
     }
 }
@@ -273,7 +279,7 @@ struct compacted_layer {
 //   d_v:     value dimension
 //
 // Returns compacted_head with selected indices, beta, and C_v
-static compacted_head compact_head_highest_attn(
+KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
         const float * K, const float * V, const float * Q_ref,
         int T, int n_q, int d_k, int d_v, int t) {
 
@@ -361,13 +367,10 @@ static compacted_head compact_head_highest_attn(
     //   Solve: X * C_v = Y
 
     // Compute X: attention weights with compacted keys + bias
+    // scores[i*T + j] is already scaled by inv_sqrt_dk from Step 1
     std::vector<float> X(n_q * t);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < t; j++) {
-            X[i * t + j] = scores[i * T + selected[j]] * inv_sqrt_dk + result.beta[j];
-            // Wait, scores was already scaled. Let me recompute properly.
-            // Actually scores[i*T + selected[j]] is already q*K/sqrt(d)
-            // But we already scaled scores by inv_sqrt_dk above, so:
             X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
         }
     }
@@ -407,7 +410,7 @@ static compacted_head compact_head_highest_attn(
 //   2. Global key selection: max importance across heads for each position
 //   3. Per-head NNLS (beta) and least-squares (C_v) on shared selection
 //
-static compacted_layer compact_layer_all_heads(
+KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
         const float * K_all, const float * V_all, const float * Q_ref_all,
         int T, int n_q, int n_head_kv, int d_k, int d_v, int t) {
 

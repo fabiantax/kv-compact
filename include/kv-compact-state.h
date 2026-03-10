@@ -21,6 +21,12 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define KV_COMPACT_UNUSED __attribute__((unused))
+#else
+#define KV_COMPACT_UNUSED
+#endif
+
 // Forward declare ggml types we need (avoid full ggml.h dependency in header)
 #ifndef GGML_TYPE_F32
 #define KV_COMPACT_GGML_TYPE_F32  0
@@ -322,7 +328,7 @@ private:
 // ============================================================================
 
 // Convert float32 to F16 (IEEE 754)
-static uint16_t f32_to_f16(float val) {
+KV_COMPACT_UNUSED static uint16_t f32_to_f16(float val) {
     uint32_t f;
     memcpy(&f, &val, 4);
 
@@ -351,7 +357,7 @@ static uint16_t f32_to_f16(float val) {
 // cv_per_head: [n_head_kv][t * d_v] refitted values per head
 //
 // Returns the new state buffer ready for llama_state_seq_set_data()
-static std::vector<uint8_t> build_compacted_state(
+KV_COMPACT_UNUSED static std::vector<uint8_t> build_compacted_state(
         const parsed_kv_state & state,
         const std::vector<int> & selected_indices,
         // Per-layer, per-head C_v: cv_all[layer][head] = vector<float> of [t * d_v]

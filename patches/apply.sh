@@ -50,7 +50,7 @@ fi
 
 # --- 4. Patch arg.cpp: add --kv-compact-ratio CLI argument ---
 if ! grep -q "kv-compact-ratio" "$ARG_CPP"; then
-    python3 << 'PYEOF'
+    python3 - "$ARG_CPP" << 'PYEOF'
 import sys
 
 arg_cpp = sys.argv[1] if len(sys.argv) > 1 else "_deps/llama_cpp-src/common/arg.cpp"
@@ -81,9 +81,7 @@ with open(arg_cpp, 'w') as f:
     f.write(content)
 print("Patched: added --kv-compact-ratio CLI argument")
 PYEOF
-    python3 "$ARG_CPP" 2>/dev/null || python3 - "$ARG_CPP" << 'PYEOF2'
-# Fallback if the above fails
-PYEOF2
+    echo "Warning: inline Python patch for arg.cpp may have failed. Check manually."
 fi
 
 # --- 5. Patch server-context.cpp: add compaction hooks ---

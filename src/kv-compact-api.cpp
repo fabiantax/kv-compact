@@ -29,10 +29,12 @@ static int score_importance(
     std::vector<float> & global_importance)
 {
     const int T = (int)sd.cell_count;
+    if (n_head_kv == 0) return 0;
     const int n_embd_k_gqa = sd.layers[0].n_embd_k_gqa();
     const int d_k = n_embd_k_gqa / n_head_kv;
+    if (d_k == 0) return 0;
     const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
-    const int ref_start = T - n_ref;
+    const int ref_start = std::max(0, T - n_ref);
 
     global_importance.assign(T, 0.0f);
     int scored_layers = 0;
@@ -115,11 +117,13 @@ int kv_compact_sequence(
     const int T = (int)sd.cell_count;
     if (T < 4) return -1;
 
+    if (n_head_kv == 0) return -1;
+
     const int n_embd_k_gqa = sd.layers[0].n_embd_k_gqa();
     const int n_embd_v_gqa = sd.layers[0].n_embd_v_gqa_computed();
     const int d_k = n_embd_k_gqa / n_head_kv;
     const int d_v = n_embd_v_gqa / n_head_kv;
-    if (d_k == 0) return -1;
+    if (d_k == 0 || d_v == 0) return -1;
 
     int t = std::max(2, (int)(T * params.compact_ratio));
     if (params.n_keep > 0 && t < params.n_keep) t = params.n_keep;
