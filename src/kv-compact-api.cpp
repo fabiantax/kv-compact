@@ -1,11 +1,12 @@
 // KV Cache Compaction API — implementation
 //
 // Uses attention-matching importance scoring to select which KV positions to
-// keep, then removes unimportant positions.
+// keep, then refits the compacted values via least-squares optimization.
 //
-// For pure attention models: removes positions directly via llama_memory_seq_rm.
-// For hybrid SSM+attention models: saves recurrent state separately, rebuilds
-// compacted KV state, restores both independently.
+// All models (pure attention and hybrid SSM+attention) go through the same
+// refitting pipeline: importance scoring → NNLS bias fitting → least-squares
+// value refitting → state rebuild via llama_state_seq_set_data().
+// Hybrid models additionally save/restore recurrent state separately.
 
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
@@ -203,9 +204,6 @@ int kv_compact_sequence(
     std::vector<int> selected(indices.begin(), indices.begin() + t);
     std::sort(selected.begin(), selected.end());
 
-    std::vector<bool> keep(T, false);
-    for (int i = 0; i < t; i++) keep[indices[i]] = true;
-
     // Fill kept_positions output if caller provided a buffer
     if (params.kept_positions && params.kept_positions_cap > 0) {
         int n_out = std::min(t, params.kept_positions_cap);
@@ -214,104 +212,66 @@ int kv_compact_sequence(
         }
     }
 
-    // Step 5: Detect model type and choose compaction strategy
+    // Step 5: Per-layer, per-head NNLS bias + least-squares value refitting
+    //         C_v is fitted with un-biased softmax so it works at inference time
+    //         (betas are not stored in the state format).
+    const int ref_start_refit = std::max(0, T - n_ref);
+
+    std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
+    for (uint32_t l = 0; l < sd.n_layer; l++) {
+        const auto & ld = sd.layers[l];
+        cv_all[l].resize(n_head_kv);
+
+        if (ld.K.empty()) {
+            // SSM layer with no K data — fill with zeros
+            for (int h = 0; h < n_head_kv; h++) {
+                cv_all[l][h].assign(t * d_v, 0.0f);
+            }
+            continue;
+        }
+
+        for (int h = 0; h < n_head_kv; h++) {
+            auto rr = refit_head_values(
+                ld.K.data(), ld.V.data(),
+                T, n_embd_k_gqa, n_embd_v_gqa,
+                h, d_k, d_v,
+                n_ref, ref_start_refit,
+                selected,
+                false /* use_beta_for_cv: false since betas aren't stored */);
+
+            cv_all[l][h] = std::move(rr.C_v);
+        }
+    }
+
+    // Step 6: Renumber selected cell positions to [0..t-1] so the server can
+    //         continue generating from position t without conflicts.
+    parsed_kv_state compacted_state = kv_state;
+    for (uint32_t s = 0; s < compacted_state.n_stream; s++) {
+        auto & csd = compacted_state.streams[s];
+        for (int j = 0; j < t; j++) {
+            csd.cells[selected[j]].pos = (int32_t)j;
+        }
+    }
+
+    // Step 7: Handle hybrid recurrent state if present
     llama_memory_t mem = llama_get_memory(ctx);
     const bool is_hybrid = llama_model_is_hybrid(model);
 
-    int result;
+    std::vector<uint8_t> recr_buf;
+    size_t recr_saved = 0;
 
-    if (!is_hybrid) {
-        // Pure attention model: try direct KV eviction via llama_memory_seq_rm
-        bool direct_ok = true;
-        for (int i = T - 1; i >= 0; i--) {
-            if (!keep[i]) {
-                llama_pos pos = sd.cells[i].pos;
-                if (!llama_memory_seq_rm(mem, seq_id, pos, pos + 1)) {
-                    direct_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if (!direct_ok) {
-            // Shouldn't happen for pure attention models, but handle gracefully
-            LOG_ERR("kv_compact: seq %d direct eviction failed on non-hybrid model\n", seq_id);
-            return -1;
-        }
-
-        // Renumber remaining positions to [0..t-1] so the server can continue
-        // generating from position t without position conflicts.
-        // Process left-to-right: for each gap between consecutive remaining
-        // positions, shift all subsequent positions down by the gap size.
-        llama_pos offset = 0;
-        for (int j = 0; j < t; j++) {
-            llama_pos actual = sd.cells[selected[j]].pos - offset;
-            llama_pos target = (llama_pos)j;
-            llama_pos gap = actual - target;
-            if (gap > 0) {
-                llama_memory_seq_add(mem, seq_id, actual, -1, -gap);
-                offset += gap;
-            }
-        }
-
-        result = t;
-    } else {
-        // Hybrid SSM+attention model: rebuild KV state, preserve recurrent state
+    if (is_hybrid) {
         LOG_INF("kv_compact: seq %d using hybrid path (save recurrent + rebuild KV)\n", seq_id);
 
-        // 1. Save recurrent state separately via PARTIAL_ONLY (skips KV, saves only recurrent)
+        // Save recurrent state separately via PARTIAL_ONLY (skips KV, saves only recurrent)
         const size_t recr_size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        std::vector<uint8_t> recr_buf(recr_size);
-        size_t recr_saved = 0;
+        recr_buf.resize(recr_size);
         if (recr_size > 0) {
             recr_saved = llama_state_seq_get_data_ext(ctx, recr_buf.data(), recr_buf.size(),
                                                        seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             if (recr_saved == 0) {
                 LOG_ERR("kv_compact: seq %d failed to save recurrent state\n", seq_id);
                 return -1;
-            }
-        }
-
-        // 2. Per-layer, per-head NNLS bias + least-squares value refitting
-        //    C_v is fitted with un-biased softmax so it works at inference time
-        //    (betas are not stored in the state format).
-        const int ref_start_hybrid = std::max(0, T - n_ref);
-
-        std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
-        for (uint32_t l = 0; l < sd.n_layer; l++) {
-            const auto & ld = sd.layers[l];
-            cv_all[l].resize(n_head_kv);
-
-            if (ld.K.empty()) {
-                // SSM layer with no K data — fill with zeros
-                for (int h = 0; h < n_head_kv; h++) {
-                    cv_all[l][h].assign(t * d_v, 0.0f);
-                }
-                continue;
-            }
-
-            for (int h = 0; h < n_head_kv; h++) {
-                auto rr = refit_head_values(
-                    ld.K.data(), ld.V.data(),
-                    T, n_embd_k_gqa, n_embd_v_gqa,
-                    h, d_k, d_v,
-                    n_ref, ref_start_hybrid,
-                    selected,
-                    false /* use_beta_for_cv: false since betas aren't stored */);
-
-                cv_all[l][h] = std::move(rr.C_v);
-            }
-        }
-
-        // 3. Renumber selected cell positions to [0..t-1] to avoid position
-        //    conflicts when the server continues generating from position t.
-        //    Also update the recurrent state's tail position to match.
-        parsed_kv_state compacted_state = kv_state;
-        for (uint32_t s = 0; s < compacted_state.n_stream; s++) {
-            auto & csd = compacted_state.streams[s];
-            // Renumber only the selected cells to [0, 1, 2, ..., t-1]
-            for (int j = 0; j < t; j++) {
-                csd.cells[selected[j]].pos = (int32_t)j;
             }
         }
 
@@ -326,42 +286,37 @@ int kv_compact_sequence(
                 memcpy(compacted_state.trailing_data.data() + 4, &new_tail_pos, sizeof(int32_t));
             }
         }
-
-        // 4. Build full compacted state buffer (KV + recurrent trailing data)
-        auto compacted_buf = build_compacted_state(
-            compacted_state, selected, cv_all, n_head_kv, d_k, d_v, n_pos_per_embd);
-
-        if (compacted_buf.empty()) return -1;
-
-        // 5. Clear everything and restore compacted state in one step
-        llama_memory_seq_rm(mem, seq_id, -1, -1);
-
-        size_t loaded = llama_state_seq_set_data(ctx, compacted_buf.data(),
-                                                  compacted_buf.size(), seq_id);
-        if (loaded == 0) {
-            // Full state restore failed — try to recover by restoring recurrent only
-            LOG_ERR("kv_compact: seq %d full state restore failed, attempting recurrent recovery\n", seq_id);
-            if (recr_saved > 0) {
-                llama_state_seq_set_data_ext(ctx, recr_buf.data(), recr_buf.size(),
-                                              seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            }
-            return -1;
-        }
-
-        // 6. Restore recurrent state from clean PARTIAL_ONLY save to ensure consistency.
-        //    This overwrites the recurrent data from trailing_data with a fresh copy
-        //    saved via the proper llama.cpp API, eliminating any format alignment issues.
-        if (recr_saved > 0) {
-            size_t recr_loaded = llama_state_seq_set_data_ext(ctx, recr_buf.data(), recr_buf.size(),
-                                                               seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            if (recr_loaded == 0) {
-                LOG_ERR("kv_compact: seq %d failed to restore recurrent state (non-fatal)\n", seq_id);
-                // Continue anyway — the trailing_data restore might be sufficient
-            }
-        }
-
-        result = t;
     }
+
+    // Step 8: Build compacted state buffer with refitted values and restore
+    auto compacted_buf = build_compacted_state(
+        compacted_state, selected, cv_all, n_head_kv, d_k, d_v, n_pos_per_embd);
+
+    if (compacted_buf.empty()) return -1;
+
+    llama_memory_seq_rm(mem, seq_id, -1, -1);
+
+    size_t loaded = llama_state_seq_set_data(ctx, compacted_buf.data(),
+                                              compacted_buf.size(), seq_id);
+    if (loaded == 0) {
+        LOG_ERR("kv_compact: seq %d state restore failed\n", seq_id);
+        if (recr_saved > 0) {
+            llama_state_seq_set_data_ext(ctx, recr_buf.data(), recr_buf.size(),
+                                          seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        return -1;
+    }
+
+    // For hybrid models, restore recurrent state from clean PARTIAL_ONLY save
+    if (recr_saved > 0) {
+        size_t recr_loaded = llama_state_seq_set_data_ext(ctx, recr_buf.data(), recr_buf.size(),
+                                                           seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (recr_loaded == 0) {
+            LOG_ERR("kv_compact: seq %d failed to restore recurrent state (non-fatal)\n", seq_id);
+        }
+    }
+
+    int result = t;
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
