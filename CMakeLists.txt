@@ -31,10 +31,12 @@ if(KV_COMPACT_BUILD_TOOL)
         FetchContent_Declare(
             llama_cpp
             GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-            GIT_TAG        master
+            GIT_TAG        6c770d16ca6870a9a419e37431f84f8b820df0c5
             GIT_SHALLOW    TRUE
+            PATCH_COMMAND  bash ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh <SOURCE_DIR>
         )
         message(STATUS "Fetching llama.cpp from GitHub (this may take a while)...")
+        set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(llama_cpp)
     endif()
 

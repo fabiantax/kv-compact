@@ -534,6 +534,32 @@ int main(int argc, char ** argv) {
         } else {
             LOG_INF("Loaded compacted state: %zu bytes\n", loaded);
 
+            // Compute averaged beta across heads and layers for mask injection
+            // beta_avg[j] = mean over all layers and heads of beta_all[l][h][j]
+            std::vector<float> beta_avg(t, 0.0f);
+            for (uint32_t l = 0; l < sd.n_layer; l++) {
+                for (int h = 0; h < n_head_kv; h++) {
+                    for (int j = 0; j < t; j++) {
+                        beta_avg[j] += beta_all[l][h][j];
+                    }
+                }
+            }
+            const float inv_count = 1.0f / (sd.n_layer * n_head_kv);
+            float beta_min = 0.0f, beta_max = 0.0f, beta_mean = 0.0f;
+            for (int j = 0; j < t; j++) {
+                beta_avg[j] *= inv_count;
+                beta_mean += beta_avg[j];
+                if (beta_avg[j] < beta_min) beta_min = beta_avg[j];
+                if (beta_avg[j] > beta_max) beta_max = beta_avg[j];
+            }
+            beta_mean /= t;
+            LOG_INF("Beta bias: mean=%.4f min=%.4f max=%.4f (averaged across %u layers × %d heads)\n",
+                    beta_mean, beta_min, beta_max, sd.n_layer, n_head_kv);
+
+            // Inject beta into the attention mask via per-cell bias
+            llama_memory_set_attn_bias(mem, 0, beta_avg.data(), t);
+            LOG_INF("Set attention bias for %d compacted cells\n", t);
+
             // Generate with compacted cache
             // Position after the max position in selected cells
             llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
