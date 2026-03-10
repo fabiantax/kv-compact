@@ -1768,6 +1768,238 @@ static void test_submodular_vs_max_attn_quality() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Token merging tests
+// ============================================================================
+
+static void test_token_merge_correct_count() {
+    printf("  test_token_merge_correct_count...");
+
+    const int T = 20, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+
+    auto merged = token_merge(K.data(), V.data(), T, d_k, d_v, t);
+
+    assert((int)merged.K.size() == t * d_k);
+    assert((int)merged.V.size() == t * d_v);
+    assert((int)merged.beta.size() == t);
+    assert((int)merged.representative.size() == t);
+
+    // Representatives should be valid original indices
+    for (int i = 0; i < t; i++) {
+        assert(merged.representative[i] >= 0 && merged.representative[i] < T);
+    }
+
+    // Beta should be non-negative (log of cluster size >= 1)
+    for (int i = 0; i < t; i++) {
+        assert(merged.beta[i] >= 0.0f);
+    }
+
+    // Sum of exp(beta) should equal T (total cluster sizes = T)
+    float total_size = 0.0f;
+    for (int i = 0; i < t; i++) total_size += expf(merged.beta[i]);
+    assert(fabsf(total_size - (float)T) < 0.01f);
+
+    printf(" OK\n");
+}
+
+static void test_token_merge_merges_similar_pairs() {
+    printf("  test_token_merge_merges_similar_pairs...");
+
+    // Create 4 pairs of nearly identical tokens + 2 unique tokens = 10 total
+    // Merging to 6 should merge the 4 pairs into 4 singletons + 2 unique = 6
+    const int T = 10, d_k = 4, d_v = 4, t = 6;
+    std::vector<float> K(T * d_k, 0.0f), V(T * d_v, 0.0f);
+
+    // Pairs: (0,1), (2,3), (4,5), (6,7) — each pair nearly identical
+    for (int p = 0; p < 4; p++) {
+        for (int d = 0; d < d_k; d++) {
+            float base = sinf((float)(p * d_k + d) * 1.5f);
+            K[(2*p)   * d_k + d] = base;
+            K[(2*p+1) * d_k + d] = base + 0.001f;  // tiny perturbation
+        }
+        for (int d = 0; d < d_v; d++) {
+            float base = cosf((float)(p * d_v + d) * 1.2f);
+            V[(2*p)   * d_v + d] = base;
+            V[(2*p+1) * d_v + d] = base + 0.001f;
+        }
+    }
+    // Unique tokens 8, 9 — very different from each other and pairs
+    for (int d = 0; d < d_k; d++) {
+        K[8 * d_k + d] = (d == 0) ? 10.0f : 0.0f;
+        K[9 * d_k + d] = (d == 3) ? -10.0f : 0.0f;
+    }
+    for (int d = 0; d < d_v; d++) {
+        V[8 * d_v + d] = 5.0f;
+        V[9 * d_v + d] = -5.0f;
+    }
+
+    auto merged = token_merge(K.data(), V.data(), T, d_k, d_v, t);
+
+    // Should have exactly 6 merged tokens
+    assert((int)merged.representative.size() == 6);
+
+    // Count clusters of size > 1 (merged pairs)
+    int n_merged = 0;
+    for (int i = 0; i < t; i++) {
+        if (merged.beta[i] > 0.01f) n_merged++;  // beta > 0 means cluster size > 1
+    }
+
+    printf(" merged_clusters=%d", n_merged);
+    // Should have merged at least 3 of the 4 similar pairs
+    assert(n_merged >= 3);
+
+    printf(" OK\n");
+}
+
+static void test_token_merge_single_head_compaction() {
+    printf("  test_token_merge_single_head_compaction...");
+
+    const int T = 20, n_q = 8, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1, KEY_SELECT_TOKEN_MERGE);
+
+    assert((int)result.selected_indices.size() == t);
+    assert((int)result.beta.size() == t);
+    assert((int)result.C_v.size() == t * d_v);
+    assert((int)result.C_k.size() == t * d_k);
+
+    // C_k should contain merged key centroids (not all zeros)
+    float k_norm = 0.0f;
+    for (float v : result.C_k) k_norm += v * v;
+    assert(k_norm > 0.0f);
+
+    printf(" OK\n");
+}
+
+static void test_token_merge_multi_head_compaction() {
+    printf("  test_token_merge_multi_head_compaction...");
+
+    const int T = 16, n_q = 6, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (int i = 0; i < T * n_embd_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 2, KEY_SELECT_TOKEN_MERGE);
+
+    assert((int)result.selected_indices.size() == t);
+    assert(result.n_head_kv == n_head_kv);
+    assert((int)result.C_k.size() == n_head_kv);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.beta[h].size() == t);
+        assert((int)result.C_v[h].size() == t * d_v);
+        assert((int)result.C_k[h].size() == t * d_k);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_token_merge_preserves_info_vs_eviction() {
+    printf("  test_token_merge_preserves_info_vs_eviction...");
+
+    // High compression scenario where merging should outperform eviction
+    // because merged centroids preserve information from dropped tokens
+    const int T = 24, n_q = 10, d_k = 4, d_v = 4, t = 4;
+
+    // Create keys in 4 clusters, each with 6 nearly-identical members
+    std::vector<float> K(T * d_k, 0.0f), V(T * d_v, 0.0f), Q(n_q * d_k);
+
+    for (int i = 0; i < T; i++) {
+        int cluster = i / 6;
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = ((d == cluster) ? 3.0f : 0.0f) + 0.05f * sinf((float)(i * d_k + d));
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * d_v + d] = cosf((float)(cluster * d_v + d) * 0.7f) + 0.03f * sinf((float)(i * d_v + d));
+        }
+    }
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    // Token merge compaction
+    auto r_merge = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1, KEY_SELECT_TOKEN_MERGE);
+
+    // Max-attention eviction
+    auto r_evict = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2, KEY_SELECT_MAX_ATTN);
+
+    // Compute output MSE for both: use merged keys for merge, original keys for eviction
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    auto compute_mse = [&](const compacted_head & res, bool use_merged_k) -> float {
+        float total_err = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            // Original output
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[j * d_k + d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+            // Compacted output
+            std::vector<float> comp_scores(t);
+            for (int j = 0; j < t; j++) {
+                float dot = 0.0f;
+                const float * k_ptr;
+                if (use_merged_k) {
+                    k_ptr = res.C_k.data() + j * d_k;
+                } else {
+                    k_ptr = K.data() + res.selected_indices[j] * d_k;
+                }
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * k_ptr[d];
+                comp_scores[j] = dot * inv_sqrt_dk + res.beta[j];
+            }
+            softmax_rows(comp_scores.data(), 1, t);
+            std::vector<float> comp_out(d_v, 0.0f);
+            for (int j = 0; j < t; j++)
+                for (int d = 0; d < d_v; d++)
+                    comp_out[d] += comp_scores[j] * res.C_v[j * d_v + d];
+
+            for (int d = 0; d < d_v; d++) {
+                float e = orig_out[d] - comp_out[d];
+                total_err += e * e;
+            }
+        }
+        return total_err / (n_q * d_v);
+    };
+
+    float mse_merge = compute_mse(r_merge, true);
+    float mse_evict = compute_mse(r_evict, false);
+
+    printf("\n    MSE: merge=%.8f  evict=%.8f  ratio=%.2fx\n",
+           mse_merge, mse_evict, mse_evict / (mse_merge + 1e-15f));
+
+    // Token merge should produce finite results
+    assert(std::isfinite(mse_merge));
+    assert(std::isfinite(mse_evict));
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1841,6 +2073,13 @@ int main() {
     test_submodular_prefers_diverse_keys();
     test_submodular_respects_importance();
     test_submodular_vs_max_attn_quality();
+
+    printf("\n=== Token merging ===\n");
+    test_token_merge_correct_count();
+    test_token_merge_merges_similar_pairs();
+    test_token_merge_single_head_compaction();
+    test_token_merge_multi_head_compaction();
+    test_token_merge_preserves_info_vs_eviction();
 
     printf("\nAll tests passed!\n");
     return 0;

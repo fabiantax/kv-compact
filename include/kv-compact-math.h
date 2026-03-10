@@ -13,8 +13,9 @@
 
 // Key selection strategy for compaction
 enum key_select_mode {
-    KEY_SELECT_MAX_ATTN   = 0,  // Original: top-t by max attention weight (fast)
-    KEY_SELECT_SUBMODULAR = 1,  // Greedy submodular: coverage + diversity (better quality)
+    KEY_SELECT_MAX_ATTN    = 0,  // Original: top-t by max attention weight (fast)
+    KEY_SELECT_SUBMODULAR  = 1,  // Greedy submodular: coverage + diversity (better quality)
+    KEY_SELECT_TOKEN_MERGE = 2,  // Merge similar tokens instead of evicting (preserves info)
 };
 
 // ============================================================================
@@ -254,6 +255,7 @@ struct compacted_head {
     std::vector<int>   selected_indices;  // which original tokens were selected
     std::vector<float> beta;              // attention mass biases [t]
     std::vector<float> C_v;               // refit values [t * d_v]
+    std::vector<float> C_k;               // merged keys [t * d_k] (empty = use original K at selected_indices)
 };
 
 // Result of compacting all heads within a single layer
@@ -267,6 +269,10 @@ struct compacted_layer {
     // Per-head results: beta[h] is [t], C_v[h] is [t * d_v]
     std::vector<std::vector<float>> beta;  // [n_head_kv][t]
     std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+
+    // Merged keys (token merging only): C_k[h] is [t * d_k]
+    // Empty = use original K at selected_indices (subset selection modes)
+    std::vector<std::vector<float>> C_k;   // [n_head_kv][t * d_k]
 
     // Per-head sensitivity used for key selection weighting [n_head_kv]
     // Higher = more influence on which keys are kept
@@ -383,6 +389,130 @@ static std::vector<int> submodular_key_select(
     return result;
 }
 
+// ============================================================================
+// Token merging (ToMe-inspired)
+// ============================================================================
+//
+// Reduces T tokens to t by iteratively merging the most similar key pairs.
+// Each merge:
+//   - Averages key vectors (weighted by cluster size)
+//   - Averages value vectors (weighted by cluster size)
+//   - Accumulates cluster size for beta = log(cluster_size)
+//
+// Unlike subset selection, this produces NEW key/value vectors (centroids)
+// that preserve information from merged tokens.
+
+// Merge T tokens down to t by iteratively combining most similar pairs.
+//
+//   K:        [T, d_k] key vectors for one head
+//   V:        [T, d_v] value vectors for one head
+//   T:        number of tokens
+//   d_k:      key dimension
+//   d_v:      value dimension
+//   t:        target count
+//
+// Returns:
+//   merged_K:       [t, d_k] merged key centroids
+//   merged_V:       [t, d_v] merged value centroids
+//   merged_beta:    [t] log(cluster_size) for each merged token
+//   representative: [t] index of the original token that seeded each cluster
+//
+struct merged_tokens {
+    std::vector<float> K;              // [t * d_k]
+    std::vector<float> V;              // [t * d_v]
+    std::vector<float> beta;           // [t]
+    std::vector<int>   representative; // [t] original token index per cluster
+};
+
+static merged_tokens token_merge(
+        const float * K, const float * V,
+        int T, int d_k, int d_v, int t) {
+
+    if (t >= T) {
+        merged_tokens result;
+        result.K.assign(K, K + T * d_k);
+        result.V.assign(V, V + T * d_v);
+        result.beta.assign(T, 0.0f);
+        result.representative.resize(T);
+        std::iota(result.representative.begin(), result.representative.end(), 0);
+        return result;
+    }
+
+    // Working copies: each "live" token has K, V, size, and original index
+    struct token_info {
+        std::vector<float> k;    // [d_k]
+        std::vector<float> v;    // [d_v]
+        int   size;              // cluster size
+        int   orig_idx;          // representative original index
+        bool  alive;
+    };
+
+    std::vector<token_info> tokens(T);
+    for (int i = 0; i < T; i++) {
+        tokens[i].k.assign(K + i * d_k, K + (i + 1) * d_k);
+        tokens[i].v.assign(V + i * d_v, V + (i + 1) * d_v);
+        tokens[i].size = 1;
+        tokens[i].orig_idx = i;
+        tokens[i].alive = true;
+    }
+
+    int n_alive = T;
+
+    // Iteratively merge the most similar pair until t remain
+    while (n_alive > t) {
+        // Find the most similar alive pair
+        float best_sim = -1e30f;
+        int   best_i = -1, best_j = -1;
+
+        for (int i = 0; i < T; i++) {
+            if (!tokens[i].alive) continue;
+            for (int j = i + 1; j < T; j++) {
+                if (!tokens[j].alive) continue;
+                float cs = key_cosine_sim(tokens[i].k.data(), tokens[j].k.data(), d_k);
+                if (cs > best_sim) {
+                    best_sim = cs;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        // Merge j into i (weighted average by cluster size)
+        float wi = (float)tokens[best_i].size;
+        float wj = (float)tokens[best_j].size;
+        float wt = wi + wj;
+
+        for (int d = 0; d < d_k; d++) {
+            tokens[best_i].k[d] = (wi * tokens[best_i].k[d] + wj * tokens[best_j].k[d]) / wt;
+        }
+        for (int d = 0; d < d_v; d++) {
+            tokens[best_i].v[d] = (wi * tokens[best_i].v[d] + wj * tokens[best_j].v[d]) / wt;
+        }
+        tokens[best_i].size += tokens[best_j].size;
+        tokens[best_j].alive = false;
+        n_alive--;
+    }
+
+    // Collect surviving tokens
+    merged_tokens result;
+    result.K.resize(t * d_k);
+    result.V.resize(t * d_v);
+    result.beta.resize(t);
+    result.representative.resize(t);
+
+    int idx = 0;
+    for (int i = 0; i < T; i++) {
+        if (!tokens[i].alive) continue;
+        memcpy(result.K.data() + idx * d_k, tokens[i].k.data(), d_k * sizeof(float));
+        memcpy(result.V.data() + idx * d_v, tokens[i].v.data(), d_v * sizeof(float));
+        result.beta[idx] = logf((float)tokens[i].size);
+        result.representative[idx] = tokens[i].orig_idx;
+        idx++;
+    }
+
+    return result;
+}
+
 // Compact a single KV head using the Highest Attention Keys method
 //
 //   K:       [T, d_k] original keys for this head
@@ -409,6 +539,16 @@ static compacted_head compact_head_highest_attn(
         for (int i = 0; i < T; i++) result.selected_indices[i] = i;
         std::fill(result.beta.begin(), result.beta.end(), 0.0f);
         memcpy(result.C_v.data(), V, T * d_v * sizeof(float));
+        return result;
+    }
+
+    // Token merge mode: merge similar tokens instead of selecting + NNLS + LS
+    if (select_mode == KEY_SELECT_TOKEN_MERGE) {
+        auto merged = token_merge(K, V, T, d_k, d_v, t);
+        result.selected_indices = merged.representative;
+        result.beta = merged.beta;
+        result.C_v = merged.V;
+        result.C_k = merged.K;
         return result;
     }
 
@@ -638,6 +778,35 @@ static compacted_layer compact_layer_all_heads(
                        d_v * sizeof(float));
             }
         }
+        return result;
+    }
+
+    // Token merge mode: merge per-head independently, use union of representatives
+    if (select_mode == KEY_SELECT_TOKEN_MERGE) {
+        result.C_k.resize(n_head_kv);
+
+        // Merge each head independently
+        std::vector<merged_tokens> per_head_merged(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            // Extract per-head K and V
+            std::vector<float> K_h(T * d_k), V_h(T * d_v);
+            for (int i = 0; i < T; i++) {
+                memcpy(K_h.data() + i * d_k, K_all + i * n_embd_k_gqa + h * d_k, d_k * sizeof(float));
+                memcpy(V_h.data() + i * d_v, V_all + i * n_embd_v_gqa + h * d_v, d_v * sizeof(float));
+            }
+            per_head_merged[h] = token_merge(K_h.data(), V_h.data(), T, d_k, d_v, t);
+        }
+
+        // Use head 0's representatives as the shared selection
+        // (the actual K/V data comes from C_k/C_v, not from original positions)
+        result.selected_indices = per_head_merged[0].representative;
+
+        for (int h = 0; h < n_head_kv; h++) {
+            result.beta[h] = per_head_merged[h].beta;
+            result.C_v[h] = per_head_merged[h].V;
+            result.C_k[h] = per_head_merged[h].K;
+        }
+
         return result;
     }
 

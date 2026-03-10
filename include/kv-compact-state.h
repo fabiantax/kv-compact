@@ -848,7 +848,10 @@ static std::vector<uint8_t> build_compacted_state(
         // Per-layer, per-head C_v: cv_all[layer][head] = vector<float> of [t * d_v]
         const std::vector<std::vector<std::vector<float>>> & cv_all,
         int n_head_kv, int d_k, int d_v,
-        uint32_t n_pos_per_embd = 1) {
+        uint32_t n_pos_per_embd = 1,
+        // Optional merged keys (token merging): ck_all[layer][head] = vector<float> of [t * d_k]
+        // When non-empty, writes these instead of original K at selected_indices
+        const std::vector<std::vector<std::vector<float>>> * ck_all = nullptr) {
 
     const int t = (int) selected_indices.size();
 
@@ -907,12 +910,26 @@ static std::vector<uint8_t> build_compacted_state(
 
             const int n_embd_k = ld.n_embd_k_gqa();
 
-            // Write selected K rows, re-quantizing to original type
+            // Write K rows: use merged keys (C_k) if available, otherwise original K at selected_indices
             const uint64_t k_row_bytes = parsed_kv_state::row_bytes_for(ld.k_type, n_embd_k);
             std::vector<uint8_t> k_buf(k_row_bytes);
+            const bool has_merged_k = ck_all && l < ck_all->size() && !(*ck_all)[l].empty();
             for (int j = 0; j < t; j++) {
-                int orig_idx = selected_indices[j];
-                const float * k_row = ld.K.data() + orig_idx * n_embd_k;
+                std::vector<float> k_row_buf;
+                const float * k_row;
+                if (has_merged_k) {
+                    // Build full K row from per-head merged keys
+                    k_row_buf.resize(n_embd_k);
+                    for (int h = 0; h < n_head_kv; h++) {
+                        memcpy(k_row_buf.data() + h * d_k,
+                               (*ck_all)[l][h].data() + j * d_k,
+                               d_k * sizeof(float));
+                    }
+                    k_row = k_row_buf.data();
+                } else {
+                    int orig_idx = selected_indices[j];
+                    k_row = ld.K.data() + orig_idx * n_embd_k;
+                }
                 convert_from_f32(k_row, ld.k_type, k_buf.data(), n_embd_k);
                 write(k_buf.data(), k_row_bytes);
             }
