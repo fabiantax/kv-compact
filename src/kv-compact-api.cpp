@@ -176,6 +176,22 @@ int kv_compact_sequence(
             LOG_ERR("kv_compact: seq %d direct eviction failed on non-hybrid model\n", seq_id);
             return -1;
         }
+
+        // Renumber remaining positions to [0..t-1] so the server can continue
+        // generating from position t without position conflicts.
+        // Process left-to-right: for each gap between consecutive remaining
+        // positions, shift all subsequent positions down by the gap size.
+        llama_pos offset = 0;
+        for (int j = 0; j < t; j++) {
+            llama_pos actual = sd.cells[selected[j]].pos - offset;
+            llama_pos target = (llama_pos)j;
+            llama_pos gap = actual - target;
+            if (gap > 0) {
+                llama_memory_seq_add(mem, seq_id, actual, -1, -gap);
+                offset += gap;
+            }
+        }
+
         result = t;
     } else {
         // Hybrid SSM+attention model: rebuild KV state, preserve recurrent state
@@ -194,19 +210,94 @@ int kv_compact_sequence(
             }
         }
 
-        // 2. Build compacted V values for selected positions
+        // 2. Per-layer, per-head NNLS bias + least-squares value refitting
+        //    Uses the reference queries (last n_ref keys) to compute attention-
+        //    matching importance and refit V values for the selected positions.
+        const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
         std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
         for (uint32_t l = 0; l < sd.n_layer; l++) {
             const auto & ld = sd.layers[l];
             cv_all[l].resize(n_head_kv);
+
+            if (ld.K.empty()) {
+                // SSM layer with no K data — fill with zeros
+                for (int h = 0; h < n_head_kv; h++) {
+                    cv_all[l][h].assign(t * d_v, 0.0f);
+                }
+                continue;
+            }
+
             for (int h = 0; h < n_head_kv; h++) {
                 auto & cv = cv_all[l][h];
                 cv.resize(t * d_v);
-                for (int j = 0; j < t; j++) {
-                    int orig_idx = selected[j];
-                    const float * v_row = ld.V.data() + orig_idx * n_embd_v_gqa + h * d_v;
-                    memcpy(cv.data() + j * d_v, v_row, d_v * sizeof(float));
+
+                // Compute attention scores: Q_ref @ K^T / sqrt(d_k) for this head
+                const int ref_start = T - n_ref;
+                std::vector<float> scores(n_ref * T);
+                std::vector<float> exp_scores(n_ref * T);
+                std::vector<float> row_sums(n_ref);
+                std::vector<float> attn_weights(n_ref * T);
+
+                for (int qi = 0; qi < n_ref; qi++) {
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
                 }
+
+                // Compute exp(scores) for NNLS mass matching
+                memcpy(exp_scores.data(), scores.data(), n_ref * T * sizeof(float));
+                exp_rows_stable(exp_scores.data(), row_sums.data(), n_ref, T);
+
+                // Softmax attention weights for value refitting target
+                memcpy(attn_weights.data(), scores.data(), n_ref * T * sizeof(float));
+                softmax_rows(attn_weights.data(), n_ref, T);
+
+                // NNLS for beta (attention mass matching)
+                std::vector<float> M(n_ref * t);
+                for (int qi = 0; qi < n_ref; qi++) {
+                    for (int j = 0; j < t; j++) {
+                        M[qi * t + j] = exp_scores[qi * T + selected[j]];
+                    }
+                }
+
+                std::vector<float> w(t);
+                nnls_solve(M.data(), row_sums.data(), w.data(), n_ref, t);
+
+                std::vector<float> beta(t);
+                for (int j = 0; j < t; j++) {
+                    beta[j] = logf(std::max(1e-12f, w[j]));
+                }
+
+                // Least-squares for C_v (value refitting)
+                // X_ij = softmax(score[qi, selected[j]] + beta[j])
+                std::vector<float> X(n_ref * t);
+                for (int qi = 0; qi < n_ref; qi++) {
+                    for (int j = 0; j < t; j++) {
+                        X[qi * t + j] = scores[qi * T + selected[j]] + beta[j];
+                    }
+                }
+                softmax_rows(X.data(), n_ref, t);
+
+                // Y = original attention output: attn_weights @ V_head  [n_ref, d_v]
+                std::vector<float> Y(n_ref * d_v, 0.0f);
+                for (int qi = 0; qi < n_ref; qi++) {
+                    for (int ki = 0; ki < T; ki++) {
+                        float w_ij = attn_weights[qi * T + ki];
+                        const float * v_row = ld.V.data() + ki * n_embd_v_gqa + h * d_v;
+                        for (int d = 0; d < d_v; d++) {
+                            Y[qi * d_v + d] += w_ij * v_row[d];
+                        }
+                    }
+                }
+
+                least_squares_solve(X.data(), Y.data(), cv.data(), n_ref, t, d_v);
             }
         }
 
