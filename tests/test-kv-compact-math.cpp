@@ -1570,6 +1570,204 @@ static void test_alternating_minimization_multi_head() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Submodular key selection tests
+// ============================================================================
+
+static void test_submodular_selects_correct_count() {
+    printf("  test_submodular_selects_correct_count...");
+
+    const int T = 20, d_k = 4, t = 7;
+    std::vector<float> K(T * d_k), importance(T);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T; i++) importance[i] = 1.0f / (1.0f + i);
+
+    auto selected = submodular_key_select(K.data(), importance.data(), T, d_k, t);
+
+    assert((int)selected.size() == t);
+    // Check sorted and unique
+    for (int i = 1; i < t; i++) assert(selected[i] > selected[i-1]);
+    // Check valid range
+    for (int i = 0; i < t; i++) assert(selected[i] >= 0 && selected[i] < T);
+
+    printf(" OK\n");
+}
+
+static void test_submodular_prefers_diverse_keys() {
+    printf("  test_submodular_prefers_diverse_keys...");
+
+    // Create 8 nearly-identical keys and 4 orthogonal keys
+    const int T = 12, d_k = 4, t = 4;
+    std::vector<float> K(T * d_k, 0.0f);
+    std::vector<float> importance(T, 1.0f);
+
+    // Keys 0-7: all nearly identical (same direction, tiny perturbation)
+    for (int i = 0; i < 8; i++) {
+        K[i * d_k + 0] = 1.0f;
+        K[i * d_k + 1] = 0.5f;
+        K[i * d_k + 2] = 0.01f * i;
+    }
+    // Keys 8-11: each in a distinct orthogonal direction
+    for (int i = 8; i < 12; i++) {
+        K[i * d_k + (i - 8)] = 2.0f;
+    }
+
+    auto selected = submodular_key_select(K.data(), importance.data(), T, d_k, t, 0.5f);
+
+    // Count how many from the redundant cluster (0-7) vs diverse set (8-11)
+    int redundant_count = 0;
+    for (int idx : selected) {
+        if (idx < 8) redundant_count++;
+    }
+
+    printf(" redundant=%d/4 diverse=%d/4", redundant_count, 4 - redundant_count);
+    // Submodular should NOT select more than 2 from the redundant cluster
+    // (diminishing returns: after 1, the rest are already covered)
+    assert(redundant_count <= 2);
+
+    printf(" OK\n");
+}
+
+static void test_submodular_respects_importance() {
+    printf("  test_submodular_respects_importance...");
+
+    // All keys equally spaced but with varying importance
+    const int T = 16, d_k = 4, t = 4;
+    std::vector<float> K(T * d_k);
+    std::vector<float> importance(T);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = sinf((float)(i * d_k + d) * 0.7f);
+        }
+        // First 4 keys have 10x importance
+        importance[i] = (i < 4) ? 10.0f : 1.0f;
+    }
+
+    auto selected = submodular_key_select(K.data(), importance.data(), T, d_k, t, 0.9f);
+
+    // With high lambda (coverage-dominant) and high importance on first 4,
+    // should select mostly from the important keys
+    int important_count = 0;
+    for (int idx : selected) {
+        if (idx < 4) important_count++;
+    }
+
+    printf(" important=%d/4", important_count);
+    assert(important_count >= 2);
+
+    printf(" OK\n");
+}
+
+static void test_submodular_vs_max_attn_quality() {
+    printf("  test_submodular_vs_max_attn_quality...");
+
+    // Scenario designed to show submodular advantage: clustered keys where
+    // max-attention picks redundant keys from the same cluster
+    const int T = 30, n_q = 10, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+
+    // Create 3 clusters of keys, with one cluster having very high attention scores
+    for (int i = 0; i < T; i++) {
+        int cluster = i % 3;
+        for (int h = 0; h < n_head_kv; h++) {
+            for (int d = 0; d < d_k; d++) {
+                float base = (cluster == 0) ? 3.0f : ((cluster == 1) ? -2.0f : 0.5f);
+                K[i * n_embd_k + h * d_k + d] = base + 0.1f * sinf((float)(i * d_k + d + h * 100));
+            }
+        }
+        for (int d = 0; d < n_embd_v; d++) {
+            V[i * n_embd_v + d] = cosf((float)(i * n_embd_v + d) * 0.2f);
+        }
+    }
+
+    // Queries that attend to cluster 0 heavily
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            for (int d = 0; d < d_k; d++) {
+                Q[qi * n_embd_k + h * d_k + d] = 2.0f + 0.3f * sinf((float)(qi * d + h));
+            }
+        }
+    }
+
+    // Max-attention selection
+    auto r_max = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 2, KEY_SELECT_MAX_ATTN);
+
+    // Submodular selection
+    auto r_sub = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 2, KEY_SELECT_SUBMODULAR);
+
+    // Check diversity of selection: count unique clusters
+    auto count_clusters = [](const std::vector<int> & sel) {
+        bool has[3] = {false, false, false};
+        for (int idx : sel) has[idx % 3] = true;
+        return (int)has[0] + (int)has[1] + (int)has[2];
+    };
+
+    int clusters_max = count_clusters(r_max.selected_indices);
+    int clusters_sub = count_clusters(r_sub.selected_indices);
+
+    printf("\n    Clusters covered: max_attn=%d  submodular=%d\n", clusters_max, clusters_sub);
+
+    // Submodular should cover at least as many clusters
+    assert(clusters_sub >= clusters_max);
+
+    // Compute per-head MSE for both
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+    for (int h = 0; h < n_head_kv; h++) {
+        auto compute_mse = [&](const compacted_layer & res) {
+            float mse = 0.0f;
+            for (int qi = 0; qi < n_q; qi++) {
+                std::vector<float> orig_scores(T);
+                for (int j = 0; j < T; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++)
+                        dot += Q[qi * n_embd_k + h * d_k + d] * K[j * n_embd_k + h * d_k + d];
+                    orig_scores[j] = dot * inv_sqrt_dk;
+                }
+                softmax_rows(orig_scores.data(), 1, T);
+                std::vector<float> orig_out(d_v, 0.0f);
+                for (int j = 0; j < T; j++)
+                    for (int d = 0; d < d_v; d++)
+                        orig_out[d] += orig_scores[j] * V[j * n_embd_v + h * d_v + d];
+
+                std::vector<float> comp_scores(t);
+                for (int j = 0; j < t; j++) {
+                    float dot = 0.0f;
+                    int idx = res.selected_indices[j];
+                    for (int d = 0; d < d_k; d++)
+                        dot += Q[qi * n_embd_k + h * d_k + d] * K[idx * n_embd_k + h * d_k + d];
+                    comp_scores[j] = dot * inv_sqrt_dk + res.beta[h][j];
+                }
+                softmax_rows(comp_scores.data(), 1, t);
+                std::vector<float> comp_out(d_v, 0.0f);
+                for (int j = 0; j < t; j++)
+                    for (int d = 0; d < d_v; d++)
+                        comp_out[d] += comp_scores[j] * res.C_v[h][j * d_v + d];
+
+                for (int d = 0; d < d_v; d++) {
+                    float e = orig_out[d] - comp_out[d];
+                    mse += e * e;
+                }
+            }
+            return mse / (n_q * d_v);
+        };
+
+        float mse_max = compute_mse(r_max);
+        float mse_sub = compute_mse(r_sub);
+        printf("    Head %d: max_attn_mse=%.8f  submodular_mse=%.8f\n", h, mse_max, mse_sub);
+    }
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1637,6 +1835,12 @@ int main() {
     printf("\n=== Alternating minimization ===\n");
     test_alternating_minimization_single_head();
     test_alternating_minimization_multi_head();
+
+    printf("\n=== Submodular key selection ===\n");
+    test_submodular_selects_correct_count();
+    test_submodular_prefers_diverse_keys();
+    test_submodular_respects_importance();
+    test_submodular_vs_max_attn_quality();
 
     printf("\nAll tests passed!\n");
     return 0;

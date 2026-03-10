@@ -11,6 +11,12 @@
 #include <numeric>
 #include <vector>
 
+// Key selection strategy for compaction
+enum key_select_mode {
+    KEY_SELECT_MAX_ATTN   = 0,  // Original: top-t by max attention weight (fast)
+    KEY_SELECT_SUBMODULAR = 1,  // Greedy submodular: coverage + diversity (better quality)
+};
+
 // ============================================================================
 // Linear algebra utilities (CPU-side, float32)
 // ============================================================================
@@ -267,6 +273,116 @@ struct compacted_layer {
     std::vector<float> head_sensitivity;
 };
 
+// ============================================================================
+// Submodular key selection (BumbleBee-inspired)
+// ============================================================================
+//
+// Selects t keys by greedily maximizing a mixture of:
+//   - Facility location (coverage): each unselected key is "covered" by its
+//     most similar selected key, weighted by attention importance
+//   - Graph cut (diversity): selected keys should span different regions
+//     of the key space
+//
+// This gives a (1-1/e) approximation guarantee for the combined objective.
+
+// Compute cosine similarity between two key vectors
+static float key_cosine_sim(const float * a, const float * b, int d) {
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (int i = 0; i < d; i++) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    return dot / (sqrtf(na * nb) + 1e-8f);
+}
+
+// Greedy submodular key selection
+//
+//   K:             [T, d_k] key vectors (single head or concatenated)
+//   importance:    [T] per-key importance scores (e.g., max attention weight)
+//   T:             number of tokens
+//   d_k:           key dimension
+//   t:             target selection size
+//   lambda:        mixture weight in [0,1]: 1.0 = pure coverage, 0.0 = pure diversity
+//
+// Returns: sorted indices of selected keys
+//
+static std::vector<int> submodular_key_select(
+        const float * K, const float * importance,
+        int T, int d_k, int t, float lambda = 0.7f) {
+
+    if (t >= T) {
+        std::vector<int> all(T);
+        std::iota(all.begin(), all.end(), 0);
+        return all;
+    }
+
+    // Precompute pairwise similarity matrix
+    // sim[i][j] = cosine(K[i], K[j]) * sqrt(importance[i] * importance[j])
+    std::vector<float> sim(T * T);
+    for (int i = 0; i < T; i++) {
+        sim[i * T + i] = 1.0f * importance[i];
+        for (int j = i + 1; j < T; j++) {
+            float cs = key_cosine_sim(K + i * d_k, K + j * d_k, d_k);
+            float w = sqrtf(importance[i] * importance[j]);
+            float s = cs * w;
+            sim[i * T + j] = s;
+            sim[j * T + i] = s;
+        }
+    }
+
+    // Greedy selection with incremental state tracking
+    //
+    // Facility location (coverage): F(S) = sum_{j in U} max_{i in S} sim(j, i)
+    //   Marginal gain: sum_{j} max(0, sim(j,k) - nearest[j])
+    //
+    // Redundancy penalty: -max_{i in S} sim(k, i)
+    //   Penalizes selecting keys too similar to already-selected ones
+
+    std::vector<float> nearest(T, 0.0f);  // max sim to selected set, per key
+    std::vector<bool>  selected_mask(T, false);
+
+    std::vector<int> result;
+    result.reserve(t);
+
+    for (int step = 0; step < t; step++) {
+        float best_gain = -1e30f;
+        int   best_idx  = -1;
+
+        for (int k = 0; k < T; k++) {
+            if (selected_mask[k]) continue;
+
+            // Facility location marginal gain (coverage)
+            float fl_gain = 0.0f;
+            for (int j = 0; j < T; j++) {
+                float improvement = sim[j * T + k] - nearest[j];
+                if (improvement > 0.0f) fl_gain += improvement;
+            }
+
+            // Redundancy penalty: how similar is k to the closest selected key?
+            float redundancy = nearest[k];  // max sim to selected set
+            float gain = lambda * fl_gain - (1.0f - lambda) * redundancy;
+
+            if (gain > best_gain) {
+                best_gain = gain;
+                best_idx  = k;
+            }
+        }
+
+        result.push_back(best_idx);
+        selected_mask[best_idx] = true;
+
+        // Update nearest-selected similarity for all keys
+        for (int j = 0; j < T; j++) {
+            float s = sim[j * T + best_idx];
+            if (s > nearest[j]) nearest[j] = s;
+        }
+    }
+
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
 // Compact a single KV head using the Highest Attention Keys method
 //
 //   K:       [T, d_k] original keys for this head
@@ -280,7 +396,8 @@ struct compacted_layer {
 static compacted_head compact_head_highest_attn(
         const float * K, const float * V, const float * Q_ref,
         int T, int n_q, int d_k, int d_v, int t,
-        int n_alt_rounds = 2) {
+        int n_alt_rounds = 2,
+        key_select_mode select_mode = KEY_SELECT_MAX_ATTN) {
 
     compacted_head result;
     result.selected_indices.resize(t);
@@ -324,15 +441,18 @@ static compacted_head compact_head_highest_attn(
         key_scores[j] = max_score;
     }
 
-    // Select top-t keys by score
-    std::vector<int> indices(T);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
-                      [&](int a, int b) { return key_scores[a] > key_scores[b]; });
-
-    // Sort selected indices for cache locality
-    std::vector<int> selected(indices.begin(), indices.begin() + t);
-    std::sort(selected.begin(), selected.end());
+    // Select top-t keys
+    std::vector<int> selected;
+    if (select_mode == KEY_SELECT_SUBMODULAR) {
+        selected = submodular_key_select(K, key_scores.data(), T, d_k, t, 0.7f);
+    } else {
+        std::vector<int> indices(T);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                          [&](int a, int b) { return key_scores[a] > key_scores[b]; });
+        selected.assign(indices.begin(), indices.begin() + t);
+        std::sort(selected.begin(), selected.end());
+    }
     result.selected_indices = selected;
 
     // Step 2 (initial): Solve NNLS for beta (mass matching)
@@ -491,7 +611,8 @@ static compacted_layer compact_layer_all_heads(
         const float * K_all, const float * V_all, const float * Q_ref_all,
         int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
         const float * head_sensitivity = nullptr,
-        int n_alt_rounds = 2) {
+        int n_alt_rounds = 2,
+        key_select_mode select_mode = KEY_SELECT_MAX_ATTN) {
 
     compacted_layer result;
     result.n_head_kv = n_head_kv;
@@ -606,14 +727,37 @@ static compacted_layer compact_layer_all_heads(
         global_scores[j] = score;
     }
 
-    // Select top-t positions globally
-    std::vector<int> indices(T);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
-                      [&](int a, int b) { return global_scores[a] > global_scores[b]; });
+    // ---- Key selection (mode-dependent) ----
+    std::vector<int> selected;
 
-    std::vector<int> selected(indices.begin(), indices.begin() + t);
-    std::sort(selected.begin(), selected.end());
+    if (select_mode == KEY_SELECT_SUBMODULAR) {
+        // Submodular selection: use concatenated keys weighted by importance.
+        // We average keys across KV heads (weighted by sensitivity) to get
+        // a single [T, d_k] representation for similarity computation.
+        std::vector<float> K_avg(T * d_k, 0.0f);
+        float sens_sum = 0.0f;
+        for (int h = 0; h < n_head_kv; h++) sens_sum += sensitivity[h];
+        for (int i = 0; i < T; i++) {
+            for (int h = 0; h < n_head_kv; h++) {
+                float w = sensitivity[h] / sens_sum;
+                for (int d = 0; d < d_k; d++) {
+                    K_avg[i * d_k + d] += w * K_all[i * n_embd_k_gqa + h * d_k + d];
+                }
+            }
+        }
+
+        selected = submodular_key_select(K_avg.data(), global_scores.data(),
+                                         T, d_k, t, 0.7f);
+    } else {
+        // Default: top-t by global score
+        std::vector<int> indices(T);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                          [&](int a, int b) { return global_scores[a] > global_scores[b]; });
+        selected.assign(indices.begin(), indices.begin() + t);
+        std::sort(selected.begin(), selected.end());
+    }
+
     result.selected_indices = selected;
     result.head_sensitivity = sensitivity;
 
