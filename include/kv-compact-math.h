@@ -279,7 +279,8 @@ struct compacted_layer {
 // Returns compacted_head with selected indices, beta, and C_v
 static compacted_head compact_head_highest_attn(
         const float * K, const float * V, const float * Q_ref,
-        int T, int n_q, int d_k, int d_v, int t) {
+        int T, int n_q, int d_k, int d_v, int t,
+        int n_alt_rounds = 2) {
 
     compacted_head result;
     result.selected_indices.resize(t);
@@ -334,12 +335,9 @@ static compacted_head compact_head_highest_attn(
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
 
-    // Step 2: Solve NNLS for beta (mass matching)
-    //   We want: sum_j exp(q_i * C_k_j / sqrt(d)) * w_j ≈ sum_j exp(q_i * K_j / sqrt(d))
-    //   where C_k are the selected keys and w_j = exp(beta_j)
-    //
+    // Step 2 (initial): Solve NNLS for beta (mass matching)
     //   Design matrix M: M_ij = exp(q_i * K_{selected[j]} / sqrt(d))
-    //   Target: m_i = sum_j exp(q_i * K_j / sqrt(d)) = row_sums[i] (already computed)
+    //   Target: m_i = row_sums[i] (already computed)
 
     std::vector<float> M(n_q * t);
     for (int i = 0; i < n_q; i++) {
@@ -348,36 +346,14 @@ static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Target mass: already computed as row_sums
     std::vector<float> w(t);
     nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
 
-    // beta = log(w)
     for (int j = 0; j < t; j++) {
         result.beta[j] = logf(std::max(1e-12f, w[j]));
     }
 
-    // Step 3: Solve least squares for C_v (value fitting)
-    //   We want: softmax(q * C_k^T + beta) * C_v ≈ softmax(q * K^T) * V
-    //
-    //   X_ij = softmax(q_i * C_k_j + beta_j) (compacted attention weights)
-    //   Y_i  = softmax(q_i * K^T) * V         (original attention output)
-    //   Solve: X * C_v = Y
-
-    // Compute X: attention weights with compacted keys + bias
-    std::vector<float> X(n_q * t);
-    for (int i = 0; i < n_q; i++) {
-        for (int j = 0; j < t; j++) {
-            X[i * t + j] = scores[i * T + selected[j]] * inv_sqrt_dk + result.beta[j];
-            // Wait, scores was already scaled. Let me recompute properly.
-            // Actually scores[i*T + selected[j]] is already q*K/sqrt(d)
-            // But we already scaled scores by inv_sqrt_dk above, so:
-            X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
-        }
-    }
-    softmax_rows(X.data(), n_q, t);
-
-    // Compute Y: original attention output = attn_weights @ V  [n_q, d_v]
+    // Compute Y (original attention output) once: attn_weights @ V [n_q, d_v]
     std::vector<float> Y(n_q * d_v, 0.0f);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < T; j++) {
@@ -388,8 +364,67 @@ static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Solve: X * C_v = Y  =>  C_v = (X^T X)^{-1} X^T Y
-    least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
+    // Steps 2-3 alternating minimization: refine beta and C_v jointly
+    std::vector<float> X(n_q * t);
+
+    for (int round = 0; round < n_alt_rounds; round++) {
+        // Step 3: Build X from current beta, solve LS for C_v
+        for (int i = 0; i < n_q; i++) {
+            for (int j = 0; j < t; j++) {
+                X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
+            }
+        }
+        softmax_rows(X.data(), n_q, t);
+
+        least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
+
+        // Gradient refinement of beta given C_v (skip on last round)
+        if (round < n_alt_rounds - 1) {
+            std::vector<float> R(n_q * d_v);
+            for (int qi = 0; qi < n_q; qi++) {
+                for (int d = 0; d < d_v; d++) {
+                    float o = 0.0f;
+                    for (int j = 0; j < t; j++) {
+                        o += X[qi * t + j] * result.C_v[j * d_v + d];
+                    }
+                    R[qi * d_v + d] = o - Y[qi * d_v + d];
+                }
+            }
+
+            std::vector<float> grad_beta(t, 0.0f);
+            for (int qi = 0; qi < n_q; qi++) {
+                std::vector<float> g(t);
+                for (int j = 0; j < t; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_v; d++) {
+                        dot += R[qi * d_v + d] * result.C_v[j * d_v + d];
+                    }
+                    g[j] = 2.0f * dot;
+                }
+
+                float g_bar = 0.0f;
+                for (int k = 0; k < t; k++) {
+                    g_bar += X[qi * t + k] * g[k];
+                }
+
+                for (int j = 0; j < t; j++) {
+                    grad_beta[j] += X[qi * t + j] * (g[j] - g_bar);
+                }
+            }
+
+            float grad_norm = 0.0f;
+            for (int j = 0; j < t; j++) {
+                grad_beta[j] /= n_q;
+                grad_norm += grad_beta[j] * grad_beta[j];
+            }
+            grad_norm = sqrtf(grad_norm + 1e-12f);
+            float lr = std::min(0.5f, 1.0f / (grad_norm + 1e-8f));
+
+            for (int j = 0; j < t; j++) {
+                result.beta[j] -= lr * grad_beta[j];
+            }
+        }
+    }
 
     return result;
 }
@@ -455,7 +490,8 @@ static float compute_head_sensitivity(const float * attn_weights, int n_q, int T
 static compacted_layer compact_layer_all_heads(
         const float * K_all, const float * V_all, const float * Q_ref_all,
         int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
-        const float * head_sensitivity = nullptr) {
+        const float * head_sensitivity = nullptr,
+        int n_alt_rounds = 2) {
 
     compacted_layer result;
     result.n_head_kv = n_head_kv;
@@ -582,6 +618,12 @@ static compacted_layer compact_layer_all_heads(
     result.head_sensitivity = sensitivity;
 
     // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
+    //
+    // With alternating minimization: after the initial NNLS+LS pass,
+    // refine beta via gradient descent on ||softmax(s+beta)·C_v - Y||^2,
+    // then re-solve LS for C_v. Repeat for n_alt_rounds total.
+
+
 
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hd = hdata[h];
@@ -589,8 +631,7 @@ static compacted_layer compact_layer_all_heads(
         result.beta[h].resize(t);
         result.C_v[h].resize(t * d_v);
 
-        // Step 2: NNLS for beta
-        // M_ij = exp(q_i * K_{selected[j]} / sqrt(d)) (from precomputed exp_scores)
+        // Step 2 (initial): NNLS for beta
         std::vector<float> M(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
@@ -605,17 +646,7 @@ static compacted_layer compact_layer_all_heads(
             result.beta[h][j] = logf(std::max(1e-12f, w[j]));
         }
 
-        // Step 3: Least squares for C_v
-        // X_ij = softmax(score[qi, selected[j]] + beta[j])
-        std::vector<float> X(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int j = 0; j < t; j++) {
-                X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
-            }
-        }
-        softmax_rows(X.data(), n_q, t);
-
-        // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
+        // Compute Y (original attention output) once: attn_weights @ V_head [n_q, d_v]
         std::vector<float> Y(n_q * d_v, 0.0f);
         for (int qi = 0; qi < n_q; qi++) {
             for (int ki = 0; ki < T; ki++) {
@@ -627,7 +658,75 @@ static compacted_layer compact_layer_all_heads(
             }
         }
 
-        least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
+        // Alternating minimization rounds
+        std::vector<float> X(n_q * t);
+
+        for (int round = 0; round < n_alt_rounds; round++) {
+            // Step 3: Build X from current beta, solve LS for C_v
+            for (int qi = 0; qi < n_q; qi++) {
+                for (int j = 0; j < t; j++) {
+                    X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
+                }
+            }
+            softmax_rows(X.data(), n_q, t);
+
+            least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
+
+            // Gradient refinement of beta given C_v (skip on last round)
+            if (round < n_alt_rounds - 1) {
+                // Compute output residual R = X·C_v - Y  [n_q, d_v]
+                std::vector<float> R(n_q * d_v);
+                for (int qi = 0; qi < n_q; qi++) {
+                    for (int d = 0; d < d_v; d++) {
+                        float o = 0.0f;
+                        for (int j = 0; j < t; j++) {
+                            o += X[qi * t + j] * result.C_v[h][j * d_v + d];
+                        }
+                        R[qi * d_v + d] = o - Y[qi * d_v + d];
+                    }
+                }
+
+                // g[qi,j] = 2 * R[qi] · C_v[j]  (per-query, per-key gradient component)
+                // dL/d(beta_j) = sum_qi X[qi,j] * (g[qi,j] - g_bar[qi])
+                //   where g_bar[qi] = sum_k X[qi,k] * g[qi,k]
+                std::vector<float> grad_beta(t, 0.0f);
+                for (int qi = 0; qi < n_q; qi++) {
+                    // Compute g[qi,j] for all j
+                    std::vector<float> g(t);
+                    for (int j = 0; j < t; j++) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_v; d++) {
+                            dot += R[qi * d_v + d] * result.C_v[h][j * d_v + d];
+                        }
+                        g[j] = 2.0f * dot;
+                    }
+
+                    // g_bar = sum_k X[qi,k] * g[k]
+                    float g_bar = 0.0f;
+                    for (int k = 0; k < t; k++) {
+                        g_bar += X[qi * t + k] * g[k];
+                    }
+
+                    // Accumulate gradient
+                    for (int j = 0; j < t; j++) {
+                        grad_beta[j] += X[qi * t + j] * (g[j] - g_bar);
+                    }
+                }
+
+                // Gradient step with adaptive learning rate
+                float grad_norm = 0.0f;
+                for (int j = 0; j < t; j++) {
+                    grad_beta[j] /= n_q;
+                    grad_norm += grad_beta[j] * grad_beta[j];
+                }
+                grad_norm = sqrtf(grad_norm + 1e-12f);
+                float lr = std::min(0.5f, 1.0f / (grad_norm + 1e-8f));
+
+                for (int j = 0; j < t; j++) {
+                    result.beta[h][j] -= lr * grad_beta[j];
+                }
+            }
+        }
     }
 
     return result;

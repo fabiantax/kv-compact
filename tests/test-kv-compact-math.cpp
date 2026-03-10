@@ -1379,6 +1379,197 @@ static void test_sensitivity_weighted_selection() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Alternating minimization tests
+// ============================================================================
+
+static void test_alternating_minimization_single_head() {
+    printf("  test_alternating_minimization_single_head...");
+
+    // Generate a scenario where single-pass is suboptimal: many keys, moderate compression
+    const int T = 40, n_q = 16, d_k = 8, d_v = 8, t = 8;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    // Keys with correlated structure (makes beta/C_v interaction matter)
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = sinf((float)(i * 3 + d) * 0.4f) + 0.5f * cosf((float)(i + d * 7) * 0.2f);
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * d_v + d] = cosf((float)(i * d_v + d) * 0.3f) + 0.3f * sinf((float)(i * 2 + d) * 0.7f);
+        }
+    }
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[qi * d_k + d] = sinf((float)(qi * d_k + d) * 0.5f);
+        }
+    }
+
+    // Single-pass (n_alt_rounds=1)
+    auto r1 = compact_head_highest_attn(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1);
+
+    // With alternation (n_alt_rounds=2)
+    auto r2 = compact_head_highest_attn(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2);
+
+    // With more alternation (n_alt_rounds=3)
+    auto r3 = compact_head_highest_attn(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 3);
+
+    // Compute MSE for each: compare output on test queries
+    auto compute_mse = [&](const compacted_head & res) -> float {
+        float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+        float total_err = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            // Original output
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[j * d_k + d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+            // Compacted output
+            std::vector<float> comp_scores(t);
+            for (int j = 0; j < t; j++) {
+                float dot = 0.0f;
+                int idx = res.selected_indices[j];
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[idx * d_k + d];
+                comp_scores[j] = dot * inv_sqrt_dk + res.beta[j];
+            }
+            softmax_rows(comp_scores.data(), 1, t);
+            std::vector<float> comp_out(d_v, 0.0f);
+            for (int j = 0; j < t; j++)
+                for (int d = 0; d < d_v; d++)
+                    comp_out[d] += comp_scores[j] * res.C_v[j * d_v + d];
+
+            for (int d = 0; d < d_v; d++) {
+                float e = orig_out[d] - comp_out[d];
+                total_err += e * e;
+            }
+        }
+        return total_err / (n_q * d_v);
+    };
+
+    float mse1 = compute_mse(r1);
+    float mse2 = compute_mse(r2);
+    float mse3 = compute_mse(r3);
+
+    printf("\n    MSE: 1-pass=%.8f  2-pass=%.8f  3-pass=%.8f\n",
+           mse1, mse2, mse3);
+    printf("    Improvement: 2-pass=%.2fx  3-pass=%.2fx over 1-pass\n",
+           mse1 / (mse2 + 1e-15f), mse1 / (mse3 + 1e-15f));
+
+    // Alternation should not make things worse
+    assert(mse2 <= mse1 * 1.01f);  // allow tiny numerical tolerance
+    // More rounds should be at least as good
+    assert(mse3 <= mse2 * 1.01f);
+
+    printf("  OK\n");
+}
+
+static void test_alternating_minimization_multi_head() {
+    printf("  test_alternating_minimization_multi_head...");
+
+    const int T = 30, n_q = 12, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 3;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < n_embd_k; d++)
+            K[i * n_embd_k + d] = sinf((float)(i * n_embd_k + d) * 0.3f);
+        for (int d = 0; d < n_embd_v; d++)
+            V[i * n_embd_v + d] = cosf((float)(i * n_embd_v + d) * 0.2f);
+    }
+    for (int qi = 0; qi < n_q; qi++)
+        for (int d = 0; d < n_embd_k; d++)
+            Q[qi * n_embd_k + d] = sinf((float)(qi * n_embd_k + d) * 0.5f);
+
+    // 1-pass
+    auto r1 = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 1);
+
+    // 2-pass (default)
+    auto r2 = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 2);
+
+    // Compute per-head MSE
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+    float total_mse1 = 0.0f, total_mse2 = 0.0f;
+
+    for (int h = 0; h < n_head_kv; h++) {
+        float mse1 = 0.0f, mse2 = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            // Original output for head h
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * n_embd_k + h * d_k + d] * K[j * n_embd_k + h * d_k + d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    orig_out[d] += orig_scores[j] * V[j * n_embd_v + h * d_v + d];
+
+            // Compacted output for each result
+            auto comp_out = [&](const compacted_layer & res) {
+                std::vector<float> scores(t), out(d_v, 0.0f);
+                for (int j = 0; j < t; j++) {
+                    float dot = 0.0f;
+                    int idx = res.selected_indices[j];
+                    for (int d = 0; d < d_k; d++)
+                        dot += Q[qi * n_embd_k + h * d_k + d] * K[idx * n_embd_k + h * d_k + d];
+                    scores[j] = dot * inv_sqrt_dk + res.beta[h][j];
+                }
+                softmax_rows(scores.data(), 1, t);
+                for (int j = 0; j < t; j++)
+                    for (int d = 0; d < d_v; d++)
+                        out[d] += scores[j] * res.C_v[h][j * d_v + d];
+                return out;
+            };
+
+            auto out1 = comp_out(r1);
+            auto out2 = comp_out(r2);
+
+            for (int d = 0; d < d_v; d++) {
+                float e1 = orig_out[d] - out1[d];
+                float e2 = orig_out[d] - out2[d];
+                mse1 += e1 * e1;
+                mse2 += e2 * e2;
+            }
+        }
+        mse1 /= (n_q * d_v);
+        mse2 /= (n_q * d_v);
+        total_mse1 += mse1;
+        total_mse2 += mse2;
+        printf("\n    Head %d: 1-pass=%.8f  2-pass=%.8f", h, mse1, mse2);
+    }
+
+    float avg_mse1 = total_mse1 / n_head_kv;
+    float avg_mse2 = total_mse2 / n_head_kv;
+    printf("\n    Average: 1-pass=%.8f  2-pass=%.8f  improvement=%.2fx\n",
+           avg_mse1, avg_mse2, avg_mse1 / (avg_mse2 + 1e-15f));
+
+    // Alternation should not make things worse
+    assert(avg_mse2 <= avg_mse1 * 1.01f);
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1442,6 +1633,10 @@ int main() {
     printf("\n=== Non-uniform head budgets ===\n");
     test_head_sensitivity_computation();
     test_sensitivity_weighted_selection();
+
+    printf("\n=== Alternating minimization ===\n");
+    test_alternating_minimization_single_head();
+    test_alternating_minimization_multi_head();
 
     printf("\nAll tests passed!\n");
     return 0;
