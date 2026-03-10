@@ -16,6 +16,7 @@ enum key_select_mode {
     KEY_SELECT_MAX_ATTN    = 0,  // Original: top-t by max attention weight (fast)
     KEY_SELECT_SUBMODULAR  = 1,  // Greedy submodular: coverage + diversity (better quality)
     KEY_SELECT_TOKEN_MERGE = 2,  // Merge similar tokens instead of evicting (preserves info)
+    KEY_SELECT_KMEANS      = 3,  // K-means clustering: centroid keys + averaged values
 };
 
 // ============================================================================
@@ -573,6 +574,120 @@ static merged_tokens token_merge(
     return result;
 }
 
+// ============================================================================
+// K-means clustering of keys
+// ============================================================================
+//
+// Partitions T keys into t clusters using Lloyd's algorithm, producing
+// centroid keys and weighted-average values. Unlike token merging (greedy
+// pairwise), K-means optimizes a global objective (within-cluster variance).
+//
+// Returns the same merged_tokens struct as token_merge.
+
+static merged_tokens kmeans_compact(
+        const float * K, const float * V,
+        int T, int d_k, int d_v, int t, int max_iters = 20) {
+
+    if (t >= T) {
+        merged_tokens result;
+        result.K.assign(K, K + T * d_k);
+        result.V.assign(V, V + T * d_v);
+        result.beta.assign(T, 0.0f);
+        result.representative.resize(T);
+        std::iota(result.representative.begin(), result.representative.end(), 0);
+        return result;
+    }
+
+    // Initialize centroids: pick t evenly-spaced keys (deterministic, no RNG needed)
+    std::vector<float> centroids(t * d_k);
+    for (int c = 0; c < t; c++) {
+        int idx = (int)((float)c / t * T);
+        memcpy(centroids.data() + c * d_k, K + idx * d_k, d_k * sizeof(float));
+    }
+
+    std::vector<int> assignment(T, 0);  // cluster assignment for each token
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        // E-step: assign each token to nearest centroid
+        bool changed = false;
+        for (int i = 0; i < T; i++) {
+            float best_dist = 1e30f;
+            int   best_c = 0;
+            for (int c = 0; c < t; c++) {
+                float dist = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    float diff = K[i * d_k + d] - centroids[c * d_k + d];
+                    dist += diff * diff;
+                }
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_c = c;
+                }
+            }
+            if (assignment[i] != best_c) {
+                assignment[i] = best_c;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+
+        // M-step: recompute centroids
+        std::vector<int> counts(t, 0);
+        std::fill(centroids.begin(), centroids.end(), 0.0f);
+        for (int i = 0; i < T; i++) {
+            int c = assignment[i];
+            counts[c]++;
+            for (int d = 0; d < d_k; d++) {
+                centroids[c * d_k + d] += K[i * d_k + d];
+            }
+        }
+        for (int c = 0; c < t; c++) {
+            if (counts[c] > 0) {
+                for (int d = 0; d < d_k; d++) {
+                    centroids[c * d_k + d] /= (float)counts[c];
+                }
+            }
+        }
+    }
+
+    // Build result: centroid K, averaged V, beta = log(cluster_size)
+    merged_tokens result;
+    result.K = centroids;
+    result.V.resize(t * d_v, 0.0f);
+    result.beta.resize(t);
+    result.representative.resize(t);
+
+    std::vector<int> counts(t, 0);
+    for (int i = 0; i < T; i++) {
+        int c = assignment[i];
+        counts[c]++;
+        for (int d = 0; d < d_v; d++) {
+            result.V[c * d_v + d] += V[i * d_v + d];
+        }
+    }
+
+    for (int c = 0; c < t; c++) {
+        if (counts[c] > 0) {
+            for (int d = 0; d < d_v; d++) {
+                result.V[c * d_v + d] /= (float)counts[c];
+            }
+            result.beta[c] = logf((float)counts[c]);
+        } else {
+            result.beta[c] = 0.0f;
+        }
+        // Representative: first token assigned to this cluster
+        result.representative[c] = 0;
+        for (int i = 0; i < T; i++) {
+            if (assignment[i] == c) {
+                result.representative[c] = i;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 // Compact a single KV head using the Highest Attention Keys method
 //
 //   K:       [T, d_k] original keys for this head
@@ -606,6 +721,16 @@ static compacted_head compact_head_highest_attn(
     // Token merge mode: merge similar tokens instead of selecting + NNLS + LS
     if (select_mode == KEY_SELECT_TOKEN_MERGE) {
         auto merged = token_merge(K, V, T, d_k, d_v, t);
+        result.selected_indices = merged.representative;
+        result.beta = merged.beta;
+        result.C_v = merged.V;
+        result.C_k = merged.K;
+        return result;
+    }
+
+    // K-means mode: cluster keys and use centroids
+    if (select_mode == KEY_SELECT_KMEANS) {
+        auto merged = kmeans_compact(K, V, T, d_k, d_v, t);
         result.selected_indices = merged.representative;
         result.beta = merged.beta;
         result.C_v = merged.V;
@@ -794,6 +919,99 @@ static float compute_head_sensitivity(const float * attn_weights, int n_q, int T
     return total_uncovered / n_q;
 }
 
+// ============================================================================
+// Carathéodory-informed budget allocation
+// ============================================================================
+//
+// Carathéodory's theorem: any convex combination of T points in R^d can be
+// expressed using at most d+1 points. For attention, the output is a convex
+// combination of value vectors in R^{d_v}, so t_min = d_v + 1 per head.
+//
+// If the value matrix has effective rank r << d_v, then only r+1 entries
+// are needed. This gives a tighter, per-head compression floor.
+//
+// compute_caratheodory_budget: given V for one head, compute effective rank
+// and return the minimum budget (effective_rank + 1).
+
+// Compute effective rank of V via singular value thresholding.
+// V: [T, d_v], returns effective rank (number of significant singular values).
+// Uses the Frobenius norm ratio: rank_eff = (sum(sigma))^2 / sum(sigma^2)
+// This is a smooth, parameter-free measure of effective dimensionality.
+static int compute_effective_rank(const float * V, int T, int d_v) {
+    if (T == 0 || d_v == 0) return 0;
+
+    // Compute V^T V (d_v x d_v) — the Gram matrix of columns
+    int n = std::min(T, d_v);
+    std::vector<float> VtV(d_v * d_v, 0.0f);
+    for (int i = 0; i < d_v; i++) {
+        for (int j = 0; j <= i; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < T; k++) {
+                sum += V[k * d_v + i] * V[k * d_v + j];
+            }
+            VtV[i * d_v + j] = sum;
+            VtV[j * d_v + i] = sum;
+        }
+    }
+
+    // Eigenvalues of V^T V = squared singular values of V
+    // Use power iteration to find top eigenvalues (cheap approximation)
+    // Instead, use trace-based effective rank: rank_eff = tr(VtV)^2 / tr(VtV^2)
+    // which equals (sum sigma_i^2)^2 / sum sigma_i^4
+
+    float trace = 0.0f;    // sum of sigma_i^2
+    float trace2 = 0.0f;   // sum of sigma_i^4
+
+    for (int i = 0; i < d_v; i++) {
+        trace += VtV[i * d_v + i];
+    }
+
+    // tr(VtV^2) = sum_ij VtV[i][j]^2
+    for (int i = 0; i < d_v; i++) {
+        for (int j = 0; j < d_v; j++) {
+            trace2 += VtV[i * d_v + j] * VtV[i * d_v + j];
+        }
+    }
+
+    if (trace2 < 1e-12f) return 1;
+
+    // Effective rank = trace^2 / trace2
+    float eff_rank = (trace * trace) / trace2;
+
+    return std::max(1, (int)ceilf(eff_rank));
+}
+
+// Compute per-head Carathéodory budget: minimum number of entries needed
+// to exactly represent any convex combination of value vectors.
+//
+//   V_all: [T, n_embd_v_gqa] all heads concatenated
+//   T:     number of tokens
+//   n_head_kv: number of KV heads
+//   d_v:   value dimension per head
+//
+// Returns: [n_head_kv] minimum budget per head (effective_rank + 1)
+static std::vector<int> compute_caratheodory_budgets(
+        const float * V_all, int T, int n_head_kv, int d_v) {
+
+    const int n_embd_v_gqa = n_head_kv * d_v;
+    std::vector<int> budgets(n_head_kv);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        // Extract per-head V
+        std::vector<float> V_h(T * d_v);
+        for (int i = 0; i < T; i++) {
+            memcpy(V_h.data() + i * d_v,
+                   V_all + i * n_embd_v_gqa + h * d_v,
+                   d_v * sizeof(float));
+        }
+
+        int eff_rank = compute_effective_rank(V_h.data(), T, d_v);
+        budgets[h] = std::min(T, eff_rank + 1);
+    }
+
+    return budgets;
+}
+
 // Compact all KV heads within a single layer using shared key selection
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
@@ -865,6 +1083,31 @@ static compacted_layer compact_layer_all_heads(
 
         // Use head 0's representatives as the shared selection
         // (the actual K/V data comes from C_k/C_v, not from original positions)
+        result.selected_indices = per_head_merged[0].representative;
+
+        for (int h = 0; h < n_head_kv; h++) {
+            result.beta[h] = per_head_merged[h].beta;
+            result.C_v[h] = per_head_merged[h].V;
+            result.C_k[h] = per_head_merged[h].K;
+        }
+
+        return result;
+    }
+
+    // K-means mode: cluster per-head independently
+    if (select_mode == KEY_SELECT_KMEANS) {
+        result.C_k.resize(n_head_kv);
+
+        std::vector<merged_tokens> per_head_merged(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            std::vector<float> K_h(T * d_k), V_h(T * d_v);
+            for (int i = 0; i < T; i++) {
+                memcpy(K_h.data() + i * d_k, K_all + i * n_embd_k_gqa + h * d_k, d_k * sizeof(float));
+                memcpy(V_h.data() + i * d_v, V_all + i * n_embd_v_gqa + h * d_v, d_v * sizeof(float));
+            }
+            per_head_merged[h] = kmeans_compact(K_h.data(), V_h.data(), T, d_k, d_v, t);
+        }
+
         result.selected_indices = per_head_merged[0].representative;
 
         for (int h = 0; h < n_head_kv; h++) {

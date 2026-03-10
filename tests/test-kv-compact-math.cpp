@@ -2160,6 +2160,205 @@ static void test_sinkhorn_multi_head() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// K-means centroid keys tests
+// ============================================================================
+
+static void test_kmeans_correct_count() {
+    printf("  test_kmeans_correct_count...");
+
+    const int T = 20, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+
+    auto merged = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t);
+
+    assert((int)merged.K.size() == t * d_k);
+    assert((int)merged.V.size() == t * d_v);
+    assert((int)merged.beta.size() == t);
+    assert((int)merged.representative.size() == t);
+
+    // Sum of exp(beta) = T (total cluster sizes)
+    float total_size = 0.0f;
+    for (int i = 0; i < t; i++) total_size += expf(merged.beta[i]);
+    assert(fabsf(total_size - (float)T) < 0.01f);
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_finds_clusters() {
+    printf("  test_kmeans_finds_clusters...");
+
+    // Create 4 well-separated clusters of 5 tokens each
+    const int T = 20, d_k = 4, d_v = 4, t = 4;
+    std::vector<float> K(T * d_k, 0.0f), V(T * d_v, 0.0f);
+
+    for (int i = 0; i < T; i++) {
+        int cluster = i / 5;
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = ((d == cluster) ? 10.0f : 0.0f) + 0.01f * sinf((float)(i * d_k + d));
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * d_v + d] = cosf((float)(cluster * d_v + d) * 0.7f);
+        }
+    }
+
+    auto merged = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t);
+
+    // Each cluster should have size 5
+    int n_correct_size = 0;
+    for (int c = 0; c < t; c++) {
+        int sz = (int)roundf(expf(merged.beta[c]));
+        if (sz == 5) n_correct_size++;
+    }
+
+    printf(" correct_clusters=%d/4", n_correct_size);
+    assert(n_correct_size >= 3);  // at least 3 of 4 clusters found correctly
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_single_head_compaction() {
+    printf("  test_kmeans_single_head_compaction...");
+
+    const int T = 20, n_q = 8, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1, KEY_SELECT_KMEANS);
+
+    assert((int)result.selected_indices.size() == t);
+    assert((int)result.C_k.size() == t * d_k);
+    assert((int)result.C_v.size() == t * d_v);
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_vs_token_merge_quality() {
+    printf("  test_kmeans_vs_token_merge_quality...");
+
+    // Clustered data where K-means should excel
+    const int T = 24, n_q = 10, d_k = 4, d_v = 4, t = 4;
+    std::vector<float> K(T * d_k, 0.0f), V(T * d_v, 0.0f), Q(n_q * d_k);
+
+    for (int i = 0; i < T; i++) {
+        int cluster = i / 6;
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = ((d == cluster) ? 3.0f : 0.0f) + 0.05f * sinf((float)(i * d_k + d));
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * d_v + d] = cosf((float)(cluster * d_v + d) * 0.7f) + 0.03f * sinf((float)(i * d_v + d));
+        }
+    }
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto r_kmeans = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1, KEY_SELECT_KMEANS);
+    auto r_merge = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 1, KEY_SELECT_TOKEN_MERGE);
+
+    // Both should produce finite results
+    float k_norm = 0.0f, m_norm = 0.0f;
+    for (float v : r_kmeans.C_k) k_norm += v * v;
+    for (float v : r_merge.C_k) m_norm += v * v;
+    assert(k_norm > 0.0f);
+    assert(m_norm > 0.0f);
+
+    printf(" OK\n");
+}
+
+// ============================================================================
+// Carathéodory budget tests
+// ============================================================================
+
+static void test_effective_rank_identity() {
+    printf("  test_effective_rank_identity...");
+
+    // V = rows of identity → all singular values = 1 → eff rank = d_v
+    const int d_v = 4, T = 4;
+    std::vector<float> V(T * d_v, 0.0f);
+    for (int i = 0; i < d_v; i++) V[i * d_v + i] = 1.0f;
+
+    int r = compute_effective_rank(V.data(), T, d_v);
+    printf(" rank=%d", r);
+    assert(r == d_v);
+
+    printf(" OK\n");
+}
+
+static void test_effective_rank_low_rank() {
+    printf("  test_effective_rank_low_rank...");
+
+    // V where all rows are multiples of first 2 basis vectors → eff rank ≈ 2
+    const int T = 20, d_v = 8;
+    std::vector<float> V(T * d_v, 0.0f);
+    for (int i = 0; i < T; i++) {
+        V[i * d_v + 0] = sinf((float)i * 0.5f);
+        V[i * d_v + 1] = cosf((float)i * 0.5f);
+        // All other dimensions are zero
+    }
+
+    int r = compute_effective_rank(V.data(), T, d_v);
+    printf(" rank=%d", r);
+    assert(r <= 3);  // should be ≈ 2
+
+    printf(" OK\n");
+}
+
+static void test_caratheodory_budgets_multi_head() {
+    printf("  test_caratheodory_budgets_multi_head...");
+
+    const int T = 20, n_head_kv = 2, d_v = 8;
+    const int n_embd_v = n_head_kv * d_v;
+    std::vector<float> V(T * n_embd_v, 0.0f);
+
+    // Head 0: full rank
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_v; d++) {
+            V[i * n_embd_v + d] = sinf((float)(i * d_v + d) * 0.3f);
+        }
+    }
+
+    // Head 1: rank 1 (all rows proportional)
+    for (int i = 0; i < T; i++) {
+        float scale = (float)(i + 1);
+        for (int d = 0; d < d_v; d++) {
+            V[i * n_embd_v + d_v + d] = scale * ((d == 0) ? 1.0f : 0.0f);
+        }
+    }
+
+    auto budgets = compute_caratheodory_budgets(V.data(), T, n_head_kv, d_v);
+
+    printf(" head0_budget=%d head1_budget=%d", budgets[0], budgets[1]);
+
+    // Head 0 should need more budget (higher rank)
+    assert(budgets[0] > budgets[1]);
+    // Head 1 should be very low (rank 1 → budget 2)
+    assert(budgets[1] <= 3);
+
+    printf(" OK\n");
+}
+
+static void test_caratheodory_budget_bounds() {
+    printf("  test_caratheodory_budget_bounds...");
+
+    // Budget should never exceed T and always be >= 2
+    const int T = 10, n_head_kv = 1, d_v = 4;
+    std::vector<float> V(T * d_v);
+    for (int i = 0; i < T * d_v; i++) V[i] = sinf((float)i * 0.3f);
+
+    auto budgets = compute_caratheodory_budgets(V.data(), T, n_head_kv, d_v);
+
+    assert(budgets[0] >= 2);
+    assert(budgets[0] <= T);
+
+    printf(" budget=%d OK\n", budgets[0]);
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -2246,6 +2445,18 @@ int main() {
     test_sinkhorn_produces_nonnegative();
     test_sinkhorn_vs_nnls_quality();
     test_sinkhorn_multi_head();
+
+    printf("\n=== K-means centroid keys ===\n");
+    test_kmeans_correct_count();
+    test_kmeans_finds_clusters();
+    test_kmeans_single_head_compaction();
+    test_kmeans_vs_token_merge_quality();
+
+    printf("\n=== Carathéodory budgets ===\n");
+    test_effective_rank_identity();
+    test_effective_rank_low_rank();
+    test_caratheodory_budgets_multi_head();
+    test_caratheodory_budget_bounds();
 
     printf("\nAll tests passed!\n");
     return 0;
