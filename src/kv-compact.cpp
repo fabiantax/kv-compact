@@ -61,6 +61,19 @@ static std::string generate_tokens(llama_context * ctx, llama_model * model,
     return output;
 }
 
+// Parse a KV cache type string to ggml_type. Returns GGML_TYPE_COUNT on error.
+static enum ggml_type parse_cache_type(const char * s) {
+    if (strcmp(s, "f32")  == 0) return GGML_TYPE_F32;
+    if (strcmp(s, "f16")  == 0) return GGML_TYPE_F16;
+    if (strcmp(s, "bf16") == 0) return GGML_TYPE_BF16;
+    if (strcmp(s, "q8_0") == 0) return GGML_TYPE_Q8_0;
+    if (strcmp(s, "q4_0") == 0) return GGML_TYPE_Q4_0;
+    if (strcmp(s, "q4_1") == 0) return GGML_TYPE_Q4_1;
+    if (strcmp(s, "q5_0") == 0) return GGML_TYPE_Q5_0;
+    if (strcmp(s, "q5_1") == 0) return GGML_TYPE_Q5_1;
+    return GGML_TYPE_COUNT; // sentinel for error
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -76,6 +89,8 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --compact-ratio R     compaction ratio (default: 0.2, meaning keep 20%%)\n");
     LOG("  --auto-ratio-mem M    auto-compute ratio from memory budget (MB) and --n-parallel\n");
     LOG("  --n-parallel N        target parallel agents/slots (default: 1, used with --auto-ratio-mem)\n");
+    LOG("  --cache-type-k TYPE   KV cache type for K (f16, q8_0, q4_0, q4_1; default: f16)\n");
+    LOG("  --cache-type-v TYPE   KV cache type for V (f16, q8_0, q4_0, q4_1; default: f16)\n");
     LOG("  --n-ref-queries N     reference queries (default: 0 = last quarter of context)\n");
     LOG("  -n  N                 tokens to generate after compaction (default: 128)\n");
     LOG("  --no-writeback        skip write-back (demo mode: compute quality metrics only)\n");
@@ -96,10 +111,15 @@ static void print_usage(int argc, char ** argv) {
     LOG("  - KV cache reads dominate memory bandwidth during token generation\n");
     LOG("  - Smaller KV = less bandwidth per decode step = higher tg/s\n");
     LOG("  - Smaller KV = less memory per agent = more parallel agents\n\n");
-    LOG("  Example: AMD Strix Halo, 8GB KV budget, Qwen-7B, 4096 ctx, 8 agents:\n");
-    LOG("    %s -m qwen7b.gguf -c 4096 --auto-ratio-mem 8192 --n-parallel 8\n\n", argv[0]);
-    LOG("  The tool will auto-compute: KV/seq ≈ 1GB → 8 agents need 8GB → ratio ≈ 1.0 (fits!)\n");
-    LOG("  If you want 16 agents: --n-parallel 16 → ratio ≈ 0.50 (2x compression)\n");
+    LOG("  KV cache quantization (--cache-type-k, --cache-type-v) reduces memory per token:\n");
+    LOG("    f16:  2.00 bytes/elem (default)    q4_0: 0.56 bytes/elem (3.6x smaller)\n");
+    LOG("    q8_0: 1.06 bytes/elem (1.9x)       q4_1: 0.63 bytes/elem (3.2x smaller)\n\n");
+    LOG("  Combining quantized KV with compaction is multiplicative:\n");
+    LOG("    q8_0 cache + 0.25 ratio = 1.9x × 4x = 7.6x total memory reduction\n\n");
+    LOG("  Example: AMD Strix Halo, 8GB KV budget, Qwen-7B, 4096 ctx, 8 agents, Q8 cache:\n");
+    LOG("    %s -m qwen7b.gguf -c 4096 --auto-ratio-mem 8192 --n-parallel 8 \\\n", argv[0]);
+    LOG("      --cache-type-k q8_0 --cache-type-v q8_0\n\n");
+    LOG("  The auto-ratio accounts for cache quantization when computing memory usage.\n");
     LOG("\n");
 }
 
@@ -110,6 +130,8 @@ int main(int argc, char ** argv) {
     float compact_ratio    = 0.2f;
     float auto_ratio_mem   = 0.0f;  // 0 = disabled; >0 = memory budget in MB
     int   n_parallel       = 1;     // target parallel agents/slots
+    enum ggml_type cache_type_k = GGML_TYPE_F16;
+    enum ggml_type cache_type_v = GGML_TYPE_F16;
     int   n_ref_queries    = 0;     // 0 = auto (last quarter)
     bool  do_writeback     = true;
     bool  do_eviction      = true;
@@ -124,6 +146,18 @@ int main(int argc, char ** argv) {
             auto_ratio_mem = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--n-parallel") == 0 && i + 1 < argc) {
             n_parallel = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
+            cache_type_k = parse_cache_type(argv[++i]);
+            if (cache_type_k == GGML_TYPE_COUNT) {
+                LOG_ERR("Unknown cache type for K: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
+            cache_type_v = parse_cache_type(argv[++i]);
+            if (cache_type_v == GGML_TYPE_COUNT) {
+                LOG_ERR("Unknown cache type for V: %s\n", argv[i]);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--n-ref-queries") == 0 && i + 1 < argc) {
             n_ref_queries = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-writeback") == 0) {
@@ -178,7 +212,8 @@ int main(int argc, char ** argv) {
 
     // ---- Auto-ratio from memory budget ----
     if (auto_ratio_mem > 0.0f) {
-        float suggested = kv_compact_suggest_ratio(model, n_ctx, auto_ratio_mem, n_parallel);
+        float suggested = kv_compact_suggest_ratio(model, n_ctx, auto_ratio_mem, n_parallel,
+                                                   cache_type_k, cache_type_v);
         if (suggested < 0.0f) {
             LOG_ERR("Failed to compute auto ratio (invalid model?)\n");
             return 1;

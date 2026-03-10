@@ -665,27 +665,32 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
 // Compute suggested compact_ratio given model dimensions and memory budget.
 //
 // Parameters:
-//   n_layer        - number of attention layers
-//   n_embd         - embedding dimension
-//   n_head         - number of attention heads
-//   n_head_kv      - number of KV heads (may differ from n_head in GQA)
-//   ctx_size       - context window per sequence
-//   mem_budget_mb  - total memory budget for KV caches (MB)
-//   n_parallel     - number of parallel sequences
+//   n_layer          - number of attention layers
+//   n_embd           - embedding dimension
+//   n_head           - number of attention heads
+//   n_head_kv        - number of KV heads (may differ from n_head in GQA)
+//   ctx_size         - context window per sequence
+//   mem_budget_mb    - total memory budget for KV caches (MB)
+//   n_parallel       - number of parallel sequences
+//   bytes_per_elem_k - bytes per element for K cache (e.g. 2.0 for F16, 1.0625 for Q8_0)
+//   bytes_per_elem_v - bytes per element for V cache
 //
 // Returns ratio in [0.05, 1.0], or -1.0 on invalid input.
 KV_COMPACT_UNUSED static float compute_suggest_ratio(
     int n_layer, int n_embd, int n_head, int n_head_kv,
-    int ctx_size, float mem_budget_mb, int n_parallel)
+    int ctx_size, float mem_budget_mb, int n_parallel,
+    float bytes_per_elem_k = 2.0f, float bytes_per_elem_v = 2.0f)
 {
     if (n_head == 0 || n_head_kv == 0 || n_layer <= 0) return -1.0f;
     if (ctx_size <= 0 || mem_budget_mb <= 0.0f || n_parallel <= 0) return -1.0f;
+    if (bytes_per_elem_k <= 0.0f || bytes_per_elem_v <= 0.0f) return -1.0f;
 
     const int d_head = n_embd / n_head;
     const int n_embd_kv_gqa = d_head * n_head_kv;
 
-    // K (fp16) + V (fp16) per token per layer
-    const float bytes_per_token_per_layer = 2.0f * n_embd_kv_gqa * 2.0f;
+    // K + V per token per layer, respecting quantization type
+    const float bytes_per_token_per_layer =
+        n_embd_kv_gqa * bytes_per_elem_k + n_embd_kv_gqa * bytes_per_elem_v;
 
     const float kv_bytes_per_seq = bytes_per_token_per_layer * n_layer * ctx_size;
     const float total_kv_bytes = kv_bytes_per_seq * n_parallel;

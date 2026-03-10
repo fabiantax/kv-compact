@@ -29,7 +29,9 @@ float kv_compact_suggest_ratio(
     const llama_model * model,
     int ctx_size,
     float mem_budget_mb,
-    int n_parallel)
+    int n_parallel,
+    enum ggml_type type_k,
+    enum ggml_type type_v)
 {
     if (!model) return -1.0f;
 
@@ -38,19 +40,26 @@ float kv_compact_suggest_ratio(
     const int n_head    = llama_model_n_head(model);
     const int n_head_kv = llama_model_n_head_kv(model);
 
+    // Compute bytes per element from ggml types
+    // ggml_type_size returns bytes per block, ggml_blck_size returns elements per block
+    const float bpe_k = (float)ggml_type_size(type_k) / (float)ggml_blck_size(type_k);
+    const float bpe_v = (float)ggml_type_size(type_v) / (float)ggml_blck_size(type_v);
+
     float ratio = compute_suggest_ratio(n_layer, n_embd, n_head, n_head_kv,
-                                        ctx_size, mem_budget_mb, n_parallel);
+                                        ctx_size, mem_budget_mb, n_parallel,
+                                        bpe_k, bpe_v);
 
     if (ratio > 0.0f && ratio < 1.0f) {
-        // GQA dimensions for logging
         const int d_head = n_embd / n_head;
         const int n_embd_kv_gqa = d_head * n_head_kv;
-        const float bytes_per_token_per_layer = 2.0f * n_embd_kv_gqa * 2.0f;
+        const float bytes_per_token_per_layer =
+            n_embd_kv_gqa * bpe_k + n_embd_kv_gqa * bpe_v;
         const float kv_bytes_per_seq = bytes_per_token_per_layer * n_layer * ctx_size;
         const float total_kv_bytes = kv_bytes_per_seq * n_parallel;
 
-        LOG_INF("kv_compact_suggest_ratio: model KV = %.1f MB/seq × %d parallel = %.1f MB total, "
-                "budget = %.1f MB → ratio = %.2f\n",
+        LOG_INF("kv_compact_suggest_ratio: KV cache type K=%s V=%s (%.2f + %.2f bpe), "
+                "%.1f MB/seq × %d parallel = %.1f MB total, budget = %.1f MB → ratio = %.2f\n",
+                ggml_type_name(type_k), ggml_type_name(type_v), bpe_k, bpe_v,
                 kv_bytes_per_seq / (1024.0f * 1024.0f), n_parallel,
                 total_kv_bytes / (1024.0f * 1024.0f), mem_budget_mb, ratio);
     }

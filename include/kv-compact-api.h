@@ -34,19 +34,23 @@ extern "C" {
 //   ctx_size         - context size per sequence (n_ctx)
 //   mem_budget_mb    - total memory budget for KV caches (in MB)
 //   n_parallel       - number of parallel sequences (agents/slots)
+//   type_k           - ggml type for K cache (e.g. GGML_TYPE_F16, GGML_TYPE_Q8_0)
+//   type_v           - ggml type for V cache (e.g. GGML_TYPE_F16, GGML_TYPE_Q4_0)
 //
 // Returns:
 //   Suggested compact_ratio in (0, 1].  Returns 1.0 if no compaction needed.
 //   Returns -1.0 on error (null model).
 //
-// Example: Strix Halo with 8 GB KV budget, 8 parallel agents, 4096 ctx:
-//   float ratio = kv_compact_suggest_ratio(model, 4096, 8192, 8);
-//   // → might return 0.25 (keep 25%, 4x compression)
+// Example: Strix Halo with 8 GB KV budget, 8 parallel agents, Q8 cache:
+//   float ratio = kv_compact_suggest_ratio(model, 4096, 8192, 8,
+//                                          GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 float kv_compact_suggest_ratio(
     const llama_model * model,
     int ctx_size,
     float mem_budget_mb,
-    int n_parallel);
+    int n_parallel,
+    enum ggml_type type_k,
+    enum ggml_type type_v);
 
 // ---- Compaction parameters ----
 

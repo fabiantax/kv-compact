@@ -916,7 +916,66 @@ static void test_suggest_ratio_invalid_inputs() {
     assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 0.0f, 8) < 0.0f);      // budget=0
     assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 256.0f, 0) < 0.0f);    // n_parallel=0
     assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, -1.0f, 8) < 0.0f);     // negative budget
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 256.0f, 8, 0.0f) < 0.0f);  // zero bpe_k
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 256.0f, 8, 2.0f, -1.0f) < 0.0f); // neg bpe_v
     printf(" OK\n");
+}
+
+static void test_suggest_ratio_quantized_kv() {
+    printf("  test_suggest_ratio_quantized_kv...");
+    // 7B model, 32 layers, 4096 embd, 32 heads, 32 KV heads, 4096 ctx, 1 agent
+    // F16 (default): bytes/tok/layer = 4096 * 2.0 + 4096 * 2.0 = 16384
+    //   KV/seq = 16384 * 32 * 4096 = 2048 MB
+    // Q8_0: bytes/tok/layer = 4096 * 1.0625 + 4096 * 1.0625 = 8704
+    //   KV/seq = 8704 * 32 * 4096 ≈ 1088 MB
+    // Q4_0: bytes/tok/layer = 4096 * 0.5625 + 4096 * 0.5625 = 4608
+    //   KV/seq = 4608 * 32 * 4096 ≈ 576 MB
+
+    const float bpe_f16  = 2.0f;
+    const float bpe_q8_0 = 34.0f / 32.0f;  // 1.0625
+    const float bpe_q4_0 = 18.0f / 32.0f;  // 0.5625
+
+    // Same budget, Q8 needs less compaction than F16
+    float ratio_f16 = compute_suggest_ratio(32, 4096, 32, 32, 4096, 1024.0f, 1, bpe_f16, bpe_f16);
+    float ratio_q8  = compute_suggest_ratio(32, 4096, 32, 32, 4096, 1024.0f, 1, bpe_q8_0, bpe_q8_0);
+    float ratio_q4  = compute_suggest_ratio(32, 4096, 32, 32, 4096, 1024.0f, 1, bpe_q4_0, bpe_q4_0);
+
+    // Q4 needs least compaction, F16 needs most
+    assert(ratio_q4 > ratio_q8);
+    assert(ratio_q8 > ratio_f16);
+
+    // F16: 1024/2048 = 0.5
+    assert(approx_eq(ratio_f16, 0.5f, 0.01f));
+
+    // Q8: KV/seq ≈ 1088 MB, budget 1024 → ratio ≈ 0.94
+    assert(ratio_q8 > 0.9f && ratio_q8 < 1.0f);
+
+    // Q4: KV/seq ≈ 576 MB, budget 1024 → fits! ratio = 1.0
+    assert(approx_eq(ratio_q4, 1.0f));
+
+    printf(" f16=%.3f q8=%.3f q4=%.3f OK\n", ratio_f16, ratio_q8, ratio_q4);
+}
+
+static void test_suggest_ratio_mixed_kv_types() {
+    printf("  test_suggest_ratio_mixed_kv_types...");
+    // Common pattern: Q8 keys + Q4 values (keys need more precision for attention)
+    const float bpe_q8_0 = 34.0f / 32.0f;  // 1.0625
+    const float bpe_q4_0 = 18.0f / 32.0f;  // 0.5625
+
+    // 32 layers, 4096 embd, 32 heads/kv, 4096 ctx
+    // bytes/tok/layer = 4096 * 1.0625 + 4096 * 0.5625 = 6656
+    // KV/seq = 6656 * 32 * 4096 = 832 MB
+    float ratio_mixed = compute_suggest_ratio(32, 4096, 32, 32, 4096, 832.0f, 1,
+                                               bpe_q8_0, bpe_q4_0);
+    // Should be right at boundary ≈ 1.0
+    assert(ratio_mixed >= 0.99f);
+
+    // 2 agents same budget → need ~0.5
+    float ratio_2x = compute_suggest_ratio(32, 4096, 32, 32, 4096, 832.0f, 2,
+                                            bpe_q8_0, bpe_q4_0);
+    assert(approx_eq(ratio_2x, 0.5f, 0.01f));
+
+    printf(" mixed=%.3f 2x=%.3f OK\n", ratio_mixed, ratio_2x);
 }
 
 // ============================================================================
@@ -976,6 +1035,8 @@ int main() {
     test_suggest_ratio_fits_without_compaction();
     test_suggest_ratio_gqa();
     test_suggest_ratio_invalid_inputs();
+    test_suggest_ratio_quantized_kv();
+    test_suggest_ratio_mixed_kv_types();
 
     printf("\nAll tests passed!\n");
     return 0;
