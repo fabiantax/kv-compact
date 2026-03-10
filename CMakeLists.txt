@@ -11,6 +11,11 @@ option(KV_COMPACT_BUILD_TOOL  "Build CLI tool (requires llama.cpp)" ON)
 add_library(kv-compact-math INTERFACE)
 target_include_directories(kv-compact-math INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# ---- C library API (standalone, no llama.cpp needed) ----
+add_library(kv-compact-api STATIC src/kv-compact-api.cpp)
+target_link_libraries(kv-compact-api PUBLIC kv-compact-math)
+target_include_directories(kv-compact-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # ---- Unit tests (standalone, no llama.cpp needed) ----
 if(KV_COMPACT_BUILD_TESTS)
     add_executable(test-kv-compact-math tests/test-kv-compact-math.cpp)
@@ -18,6 +23,9 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(bench-kv-compact tests/bench-kv-compact.cpp)
     target_link_libraries(bench-kv-compact PRIVATE kv-compact-math)
+
+    add_executable(test-kv-compact-api tests/test-kv-compact-api.cpp)
+    target_link_libraries(test-kv-compact-api PRIVATE kv-compact-api)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
