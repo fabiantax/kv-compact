@@ -21,6 +21,47 @@
 #include <numeric>
 #include <vector>
 
+// ============================================================================
+// Bandwidth-aware ratio suggestion
+// ============================================================================
+
+float kv_compact_suggest_ratio(
+    const llama_model * model,
+    int ctx_size,
+    float mem_budget_mb,
+    int n_parallel)
+{
+    if (!model) return -1.0f;
+
+    const int n_layer   = llama_model_n_layer(model);
+    const int n_embd    = llama_model_n_embd(model);
+    const int n_head    = llama_model_n_head(model);
+    const int n_head_kv = llama_model_n_head_kv(model);
+
+    float ratio = compute_suggest_ratio(n_layer, n_embd, n_head, n_head_kv,
+                                        ctx_size, mem_budget_mb, n_parallel);
+
+    if (ratio > 0.0f && ratio < 1.0f) {
+        // GQA dimensions for logging
+        const int d_head = n_embd / n_head;
+        const int n_embd_kv_gqa = d_head * n_head_kv;
+        const float bytes_per_token_per_layer = 2.0f * n_embd_kv_gqa * 2.0f;
+        const float kv_bytes_per_seq = bytes_per_token_per_layer * n_layer * ctx_size;
+        const float total_kv_bytes = kv_bytes_per_seq * n_parallel;
+
+        LOG_INF("kv_compact_suggest_ratio: model KV = %.1f MB/seq × %d parallel = %.1f MB total, "
+                "budget = %.1f MB → ratio = %.2f\n",
+                kv_bytes_per_seq / (1024.0f * 1024.0f), n_parallel,
+                total_kv_bytes / (1024.0f * 1024.0f), mem_budget_mb, ratio);
+    }
+
+    return ratio;
+}
+
+// ============================================================================
+// Importance scoring
+// ============================================================================
+
 // Score importance of each KV position using attention matching.
 static int score_importance(
     const parsed_kv_state::stream_data & sd,

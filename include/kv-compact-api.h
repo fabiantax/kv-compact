@@ -20,6 +20,36 @@
 extern "C" {
 #endif
 
+// ---- Bandwidth-aware ratio suggestion ----
+//
+// On bandwidth-limited hardware (APUs, mobile GPUs), KV cache reads during
+// decode dominate memory bandwidth.  Compacting the cache allows either:
+//   (a) more parallel agents at the same tg/s, or
+//   (b) higher tg/s per agent with the same memory.
+//
+// This function suggests a compact_ratio given hardware constraints.
+//
+// Parameters:
+//   model            - loaded model (used to read layer/head/embd dimensions)
+//   ctx_size         - context size per sequence (n_ctx)
+//   mem_budget_mb    - total memory budget for KV caches (in MB)
+//   n_parallel       - number of parallel sequences (agents/slots)
+//
+// Returns:
+//   Suggested compact_ratio in (0, 1].  Returns 1.0 if no compaction needed.
+//   Returns -1.0 on error (null model).
+//
+// Example: Strix Halo with 8 GB KV budget, 8 parallel agents, 4096 ctx:
+//   float ratio = kv_compact_suggest_ratio(model, 4096, 8192, 8);
+//   // → might return 0.25 (keep 25%, 4x compression)
+float kv_compact_suggest_ratio(
+    const llama_model * model,
+    int ctx_size,
+    float mem_budget_mb,
+    int n_parallel);
+
+// ---- Compaction parameters ----
+
 struct kv_compact_params {
     float compact_ratio;   // fraction of tokens to keep (0.0-1.0), default 0.5
     int   n_keep;          // first n positions to always keep (sink tokens), default 0

@@ -863,6 +863,63 @@ static void test_refit_head_values_beta_vs_unbias() {
 }
 
 // ============================================================================
+// Bandwidth-aware ratio suggestion tests
+// ============================================================================
+
+static void test_suggest_ratio_basic() {
+    printf("  test_suggest_ratio_basic...");
+    // 7B-class model: 32 layers, 4096 embd, 32 heads, 32 KV heads
+    // d_head = 128, n_embd_kv_gqa = 4096
+    // bytes/tok/layer = 2 * 4096 * 2 = 16384
+    // KV/seq at 4096 ctx = 16384 * 32 * 4096 = 2048 MB
+    // 1 agent with 1024 MB budget → ratio = 1024/2048 = 0.5
+    float ratio = compute_suggest_ratio(32, 4096, 32, 32, 4096, 1024.0f, 1);
+    assert(ratio > 0.0f && ratio < 1.0f);
+    assert(approx_eq(ratio, 0.5f, 0.01f));
+    printf(" ratio=%.3f OK\n", ratio);
+}
+
+static void test_suggest_ratio_fits_without_compaction() {
+    printf("  test_suggest_ratio_fits_without_compaction...");
+    // Same model but huge budget — should return 1.0 (no compaction needed)
+    float ratio = compute_suggest_ratio(32, 4096, 32, 32, 4096, 100000.0f, 8);
+    assert(approx_eq(ratio, 1.0f));
+    printf(" OK\n");
+}
+
+static void test_suggest_ratio_gqa() {
+    printf("  test_suggest_ratio_gqa...");
+    // GQA model: 32 heads but only 8 KV heads → 4x less KV memory
+    // d_head = 128, n_embd_kv_gqa = 128 * 8 = 1024
+    // bytes/tok/layer = 2 * 1024 * 2 = 4096
+    // KV/seq = 4096 * 32 * 4096 = 512 MB
+    // 2 agents = 1024 MB total; budget 512 MB → ratio = 0.5
+    float ratio_gqa = compute_suggest_ratio(32, 4096, 32, 8, 4096, 512.0f, 2);
+    assert(ratio_gqa > 0.0f && ratio_gqa < 1.0f);
+    assert(approx_eq(ratio_gqa, 0.5f, 0.01f));
+
+    // Full MHA same budget: KV/seq = 2048 MB, 2 agents = 4096 MB
+    // ratio = 512 / 4096 = 0.125
+    float ratio_mha = compute_suggest_ratio(32, 4096, 32, 32, 4096, 512.0f, 2);
+    assert(ratio_mha > 0.0f && ratio_mha < ratio_gqa);
+    assert(approx_eq(ratio_mha, 0.125f, 0.01f));
+
+    printf(" gqa=%.3f mha=%.3f OK\n", ratio_gqa, ratio_mha);
+}
+
+static void test_suggest_ratio_invalid_inputs() {
+    printf("  test_suggest_ratio_invalid_inputs...");
+    assert(compute_suggest_ratio(0, 4096, 32, 32, 4096, 256.0f, 8) < 0.0f);    // n_layer=0
+    assert(compute_suggest_ratio(32, 4096, 0, 32, 4096, 256.0f, 8) < 0.0f);     // n_head=0
+    assert(compute_suggest_ratio(32, 4096, 32, 0, 4096, 256.0f, 8) < 0.0f);     // n_head_kv=0
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 0, 256.0f, 8) < 0.0f);       // ctx_size=0
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 0.0f, 8) < 0.0f);      // budget=0
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, 256.0f, 0) < 0.0f);    // n_parallel=0
+    assert(compute_suggest_ratio(32, 4096, 32, 32, 4096, -1.0f, 8) < 0.0f);     // negative budget
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -913,6 +970,12 @@ int main() {
     test_refit_head_values_basic();
     test_refit_head_values_quality();
     test_refit_head_values_beta_vs_unbias();
+
+    printf("\n=== Bandwidth-aware ratio suggestion ===\n");
+    test_suggest_ratio_basic();
+    test_suggest_ratio_fits_without_compaction();
+    test_suggest_ratio_gqa();
+    test_suggest_ratio_invalid_inputs();
 
     printf("\nAll tests passed!\n");
     return 0;

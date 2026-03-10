@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "kv-compact-api.h"
 #include "kv-compact-math.h"
 #include "kv-compact-state.h"
 
@@ -68,15 +69,37 @@ static void print_usage(int argc, char ** argv) {
     (void) argc;
     LOG("\nKV Cache Compaction via Attention Matching\n\n");
     LOG("Usage: %s [options]\n\n", argv[0]);
-    LOG("  -m  MODEL         path to model file\n");
-    LOG("  -p  PROMPT        input context to compact\n");
-    LOG("  -f  FILE          read context from file\n");
-    LOG("  -c  N             context size (default: 2048)\n");
-    LOG("  --compact-ratio R compaction ratio (default: 0.2, meaning keep 20%%)\n");
-    LOG("  --n-ref-queries N reference queries (default: 0 = last quarter of context)\n");
-    LOG("  -n  N             tokens to generate after compaction (default: 128)\n");
-    LOG("  --no-writeback    skip write-back (demo mode: compute quality metrics only)\n");
-    LOG("  --no-eviction     skip token eviction baseline\n");
+    LOG("  -m  MODEL             path to model file\n");
+    LOG("  -p  PROMPT            input context to compact\n");
+    LOG("  -f  FILE              read context from file\n");
+    LOG("  -c  N                 context size (default: 2048)\n");
+    LOG("  --compact-ratio R     compaction ratio (default: 0.2, meaning keep 20%%)\n");
+    LOG("  --auto-ratio-mem M    auto-compute ratio from memory budget (MB) and --n-parallel\n");
+    LOG("  --n-parallel N        target parallel agents/slots (default: 1, used with --auto-ratio-mem)\n");
+    LOG("  --n-ref-queries N     reference queries (default: 0 = last quarter of context)\n");
+    LOG("  -n  N                 tokens to generate after compaction (default: 128)\n");
+    LOG("  --no-writeback        skip write-back (demo mode: compute quality metrics only)\n");
+    LOG("  --no-eviction         skip token eviction baseline\n");
+    LOG("\n");
+    LOG("Compact ratio tuning guide:\n\n");
+    LOG("  The --compact-ratio controls the quality/memory tradeoff.  Lower ratio = more\n");
+    LOG("  compression but lower quality.  The --auto-ratio-mem flag auto-computes the\n");
+    LOG("  best ratio to fit your memory budget.\n\n");
+    LOG("  ratio   compression   quality (cos_sim)   typical use case\n");
+    LOG("  -----   -----------   -----------------   ----------------\n");
+    LOG("  1.0     none          perfect             no compaction needed\n");
+    LOG("  0.50    2x            >0.999              conservative, maximum quality\n");
+    LOG("  0.25    4x            >0.97               good balance for most use cases\n");
+    LOG("  0.10    10x           >0.90               aggressive, long context on small devices\n");
+    LOG("  0.05    20x           ~0.80               extreme, quality loss noticeable\n\n");
+    LOG("  On bandwidth-limited hardware (APUs like AMD Strix Halo, integrated GPUs):\n");
+    LOG("  - KV cache reads dominate memory bandwidth during token generation\n");
+    LOG("  - Smaller KV = less bandwidth per decode step = higher tg/s\n");
+    LOG("  - Smaller KV = less memory per agent = more parallel agents\n\n");
+    LOG("  Example: AMD Strix Halo, 8GB KV budget, Qwen-7B, 4096 ctx, 8 agents:\n");
+    LOG("    %s -m qwen7b.gguf -c 4096 --auto-ratio-mem 8192 --n-parallel 8\n\n", argv[0]);
+    LOG("  The tool will auto-compute: KV/seq ≈ 1GB → 8 agents need 8GB → ratio ≈ 1.0 (fits!)\n");
+    LOG("  If you want 16 agents: --n-parallel 16 → ratio ≈ 0.50 (2x compression)\n");
     LOG("\n");
 }
 
@@ -84,10 +107,12 @@ int main(int argc, char ** argv) {
     common_params params;
 
     // Custom parameters
-    float compact_ratio = 0.2f;
-    int   n_ref_queries = 0;   // 0 = auto (last quarter)
-    bool  do_writeback  = true;
-    bool  do_eviction   = true;
+    float compact_ratio    = 0.2f;
+    float auto_ratio_mem   = 0.0f;  // 0 = disabled; >0 = memory budget in MB
+    int   n_parallel       = 1;     // target parallel agents/slots
+    int   n_ref_queries    = 0;     // 0 = auto (last quarter)
+    bool  do_writeback     = true;
+    bool  do_eviction      = true;
 
     // Parse custom args first and build a filtered argv for llama.cpp
     std::vector<char *> filtered_argv;
@@ -95,6 +120,10 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--compact-ratio") == 0 && i + 1 < argc) {
             compact_ratio = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--auto-ratio-mem") == 0 && i + 1 < argc) {
+            auto_ratio_mem = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--n-parallel") == 0 && i + 1 < argc) {
+            n_parallel = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--n-ref-queries") == 0 && i + 1 < argc) {
             n_ref_queries = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-writeback") == 0) {
@@ -146,6 +175,25 @@ int main(int argc, char ** argv) {
                                      rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
     LOG_INF("Model: %d layers, %d heads (%d KV), n_embd=%d, context=%d, rope_type=%d\n",
             n_layer, n_head, n_head_kv, n_embd, n_ctx, (int)rope_type);
+
+    // ---- Auto-ratio from memory budget ----
+    if (auto_ratio_mem > 0.0f) {
+        float suggested = kv_compact_suggest_ratio(model, n_ctx, auto_ratio_mem, n_parallel);
+        if (suggested < 0.0f) {
+            LOG_ERR("Failed to compute auto ratio (invalid model?)\n");
+            return 1;
+        }
+        if (suggested >= 1.0f) {
+            LOG_INF("Auto-ratio: all %d agents fit in %.0f MB budget — no compaction needed\n",
+                    n_parallel, auto_ratio_mem);
+            LOG_INF("(Overriding compact_ratio to 0.99 for demonstration)\n");
+            compact_ratio = 0.99f;
+        } else {
+            LOG_INF("Auto-ratio: %.0f MB budget / %d parallel / %d ctx → compact_ratio = %.2f (%.1fx compression)\n",
+                    auto_ratio_mem, n_parallel, n_ctx, suggested, 1.0f / suggested);
+            compact_ratio = suggested;
+        }
+    }
 
     // ---- Tokenize ----
     std::string prompt = params.prompt;

@@ -657,3 +657,44 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
 
     return result;
 }
+
+// ============================================================================
+// Bandwidth-aware ratio computation (pure math, no llama.cpp dependency)
+// ============================================================================
+
+// Compute suggested compact_ratio given model dimensions and memory budget.
+//
+// Parameters:
+//   n_layer        - number of attention layers
+//   n_embd         - embedding dimension
+//   n_head         - number of attention heads
+//   n_head_kv      - number of KV heads (may differ from n_head in GQA)
+//   ctx_size       - context window per sequence
+//   mem_budget_mb  - total memory budget for KV caches (MB)
+//   n_parallel     - number of parallel sequences
+//
+// Returns ratio in [0.05, 1.0], or -1.0 on invalid input.
+KV_COMPACT_UNUSED static float compute_suggest_ratio(
+    int n_layer, int n_embd, int n_head, int n_head_kv,
+    int ctx_size, float mem_budget_mb, int n_parallel)
+{
+    if (n_head == 0 || n_head_kv == 0 || n_layer <= 0) return -1.0f;
+    if (ctx_size <= 0 || mem_budget_mb <= 0.0f || n_parallel <= 0) return -1.0f;
+
+    const int d_head = n_embd / n_head;
+    const int n_embd_kv_gqa = d_head * n_head_kv;
+
+    // K (fp16) + V (fp16) per token per layer
+    const float bytes_per_token_per_layer = 2.0f * n_embd_kv_gqa * 2.0f;
+
+    const float kv_bytes_per_seq = bytes_per_token_per_layer * n_layer * ctx_size;
+    const float total_kv_bytes = kv_bytes_per_seq * n_parallel;
+    const float budget_bytes = mem_budget_mb * 1024.0f * 1024.0f;
+
+    if (total_kv_bytes <= budget_bytes) return 1.0f;
+
+    float ratio = budget_bytes / total_kv_bytes;
+    if (ratio < 0.05f) ratio = 0.05f;
+
+    return ratio;
+}
