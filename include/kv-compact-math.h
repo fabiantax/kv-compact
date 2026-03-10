@@ -261,6 +261,10 @@ struct compacted_layer {
     // Per-head results: beta[h] is [t], C_v[h] is [t * d_v]
     std::vector<std::vector<float>> beta;  // [n_head_kv][t]
     std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+
+    // Per-head sensitivity used for key selection weighting [n_head_kv]
+    // Higher = more influence on which keys are kept
+    std::vector<float> head_sensitivity;
 };
 
 // Compact a single KV head using the Highest Attention Keys method
@@ -390,6 +394,46 @@ static compacted_head compact_head_highest_attn(
     return result;
 }
 
+// Compute per-head sensitivity for key selection weighting
+//
+// Sensitivity measures how much attention mass falls outside the top-t keys.
+// Heads that spread attention broadly are harder to compress and should have
+// more influence on which keys are selected.
+//
+//   attn_weights: [n_q, T] softmax attention weights for one head
+//   n_q:          number of queries
+//   T:            number of tokens
+//   t:            target compacted size
+//
+// Returns: sensitivity in [0, 1] where 1 = maximally sensitive (broad attention)
+//
+static float compute_head_sensitivity(const float * attn_weights, int n_q, int T, int t) {
+    if (t >= T) return 0.0f;
+
+    // For each query, compute the mass NOT covered by the top-t keys
+    float total_uncovered = 0.0f;
+
+    std::vector<float> weights(T);
+    for (int qi = 0; qi < n_q; qi++) {
+        // Copy weights for this query
+        for (int j = 0; j < T; j++) {
+            weights[j] = attn_weights[qi * T + j];
+        }
+
+        // Partial sort to find top-t weights
+        std::partial_sort(weights.begin(), weights.begin() + t, weights.end(),
+                          [](float a, float b) { return a > b; });
+
+        float covered = 0.0f;
+        for (int j = 0; j < t; j++) {
+            covered += weights[j];
+        }
+        total_uncovered += (1.0f - covered);
+    }
+
+    return total_uncovered / n_q;
+}
+
 // Compact all KV heads within a single layer using shared key selection
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
@@ -401,6 +445,7 @@ static compacted_head compact_head_highest_attn(
 //   d_k:       key dimension per head
 //   d_v:       value dimension per head
 //   t:         target compacted size
+//   head_sensitivity: optional [n_head_kv] weights for key selection (nullptr = auto-compute)
 //
 // Algorithm:
 //   1. For each head, compute attention scores and per-key importance
@@ -409,7 +454,8 @@ static compacted_head compact_head_highest_attn(
 //
 static compacted_layer compact_layer_all_heads(
         const float * K_all, const float * V_all, const float * Q_ref_all,
-        int T, int n_q, int n_head_kv, int d_k, int d_v, int t) {
+        int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
+        const float * head_sensitivity = nullptr) {
 
     compacted_layer result;
     result.n_head_kv = n_head_kv;
@@ -442,6 +488,7 @@ static compacted_layer compact_layer_all_heads(
 
     // Compute per-head key importance scores, then take max across heads
     std::vector<float> global_scores(T, 0.0f);
+    std::vector<float> per_head_importance(n_head_kv * T, 0.0f);
 
     // Per-head temporary data for reuse in steps 2-3
     struct head_data {
@@ -493,11 +540,34 @@ static compacted_layer compact_layer_all_heads(
                 float w = hd.attn_weights[qi * T + j];
                 if (w > max_w) max_w = w;
             }
-            // Global score = max across heads
-            if (max_w > global_scores[j]) {
-                global_scores[j] = max_w;
-            }
+            per_head_importance[h * T + j] = max_w;
         }
+    }
+
+    // Compute or use provided sensitivity weights
+    std::vector<float> sensitivity(n_head_kv, 1.0f);
+    if (head_sensitivity) {
+        for (int h = 0; h < n_head_kv; h++) {
+            sensitivity[h] = head_sensitivity[h];
+        }
+    } else if (n_head_kv > 1) {
+        // Auto-compute: measure how much mass falls outside top-t per head
+        for (int h = 0; h < n_head_kv; h++) {
+            sensitivity[h] = compute_head_sensitivity(
+                hdata[h].attn_weights.data(), n_q, T, t);
+            // Clamp minimum to avoid zero-weighting any head
+            sensitivity[h] = std::max(0.01f, sensitivity[h]);
+        }
+    }
+
+    // Sensitivity-weighted scoring: sum_h(sensitivity[h] * importance[h][j])
+    // This gives more influence to heads that are harder to compress
+    for (int j = 0; j < T; j++) {
+        float score = 0.0f;
+        for (int h = 0; h < n_head_kv; h++) {
+            score += sensitivity[h] * per_head_importance[h * T + j];
+        }
+        global_scores[j] = score;
     }
 
     // Select top-t positions globally
@@ -509,6 +579,7 @@ static compacted_layer compact_layer_all_heads(
     std::vector<int> selected(indices.begin(), indices.begin() + t);
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
+    result.head_sensitivity = sensitivity;
 
     // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
 

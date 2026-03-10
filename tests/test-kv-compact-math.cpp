@@ -1195,6 +1195,190 @@ static void test_beta_improves_attention_output() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Non-uniform head budget tests
+// ============================================================================
+
+static void test_head_sensitivity_computation() {
+    printf("  test_head_sensitivity_computation...");
+
+    // Create two heads: one with sharp attention (low sensitivity),
+    // one with broad attention (high sensitivity)
+    const int T = 20, n_q = 8, d_k = 4, d_v = 4, t = 5;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    // Head 0: keys are very distinct (sharp attention)
+    // Head 1: keys are similar (broad, uniform attention)
+    std::vector<float> K(T * n_embd_k, 0.0f), V(T * n_embd_v, 0.0f);
+    std::vector<float> Q(n_q * n_embd_k, 0.0f);
+
+    for (int i = 0; i < T; i++) {
+        // Head 0: each key is a strong unit-ish vector in a different direction
+        for (int d = 0; d < d_k; d++) {
+            K[i * n_embd_k + d] = (d == (i % d_k)) ? 3.0f : 0.0f;
+        }
+        // Head 1: all keys are nearly identical
+        for (int d = 0; d < d_k; d++) {
+            K[i * n_embd_k + d_k + d] = 1.0f + 0.01f * sinf((float)(i * d_k + d));
+        }
+        // Values: arbitrary
+        for (int d = 0; d < n_embd_v; d++) {
+            V[i * n_embd_v + d] = cosf((float)(i * n_embd_v + d) * 0.3f);
+        }
+    }
+
+    for (int qi = 0; qi < n_q; qi++) {
+        // Head 0 queries: also sharp (match specific keys)
+        for (int d = 0; d < d_k; d++) {
+            Q[qi * n_embd_k + d] = (d == (qi % d_k)) ? 2.0f : 0.0f;
+        }
+        // Head 1 queries: all similar
+        for (int d = 0; d < d_k; d++) {
+            Q[qi * n_embd_k + d_k + d] = 1.0f;
+        }
+    }
+
+    auto result = compact_layer_all_heads(K.data(), V.data(), Q.data(),
+                                          T, n_q, n_head_kv, d_k, d_v, t);
+
+    assert((int)result.head_sensitivity.size() == n_head_kv);
+
+    printf("\n    Head 0 (sharp):  sensitivity=%.4f\n", result.head_sensitivity[0]);
+    printf("    Head 1 (broad):  sensitivity=%.4f\n", result.head_sensitivity[1]);
+
+    // Head 1 (broad attention) should be MORE sensitive than head 0 (sharp)
+    // because broad attention spreads mass across many keys, so losing keys hurts more
+    assert(result.head_sensitivity[1] > result.head_sensitivity[0]);
+
+    printf("  OK\n");
+}
+
+static void test_sensitivity_weighted_selection() {
+    printf("  test_sensitivity_weighted_selection...");
+
+    // Test that sensitivity-weighted selection improves worst-head quality
+    // compared to uniform weighting (all sensitivities = 1.0)
+    const int T = 30, n_q = 10, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 3;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    // Create heads with varying attention patterns
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+
+    // Head 0: sharp retrieval head (focuses on a few keys)
+    // Head 1: broad attention head (spreads across many keys)
+    // Head 2: medium attention head
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            // Head 0: very distinct keys
+            K[i * n_embd_k + d] = (d == (i % d_k)) ? 5.0f : -0.5f;
+            // Head 1: all keys similar, slight variation
+            K[i * n_embd_k + d_k + d] = 1.0f + 0.02f * sinf((float)(i * 7 + d));
+            // Head 2: moderate distinction
+            K[i * n_embd_k + 2*d_k + d] = sinf((float)(i * d_k + d) * 0.5f);
+        }
+        for (int d = 0; d < n_embd_v; d++) {
+            V[i * n_embd_v + d] = cosf((float)(i * n_embd_v + d) * 0.2f);
+        }
+    }
+
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[qi * n_embd_k + d] = (d == (qi % d_k)) ? 3.0f : 0.0f;
+            Q[qi * n_embd_k + d_k + d] = 1.0f + 0.1f * cosf((float)(qi * d));
+            Q[qi * n_embd_k + 2*d_k + d] = sinf((float)(qi * d_k + d) * 0.7f);
+        }
+    }
+
+    // Sensitivity-weighted (auto-computed)
+    auto result_weighted = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t);
+
+    // Uniform weighting (all sensitivity = 1.0)
+    std::vector<float> uniform_sens(n_head_kv, 1.0f);
+    auto result_uniform = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        uniform_sens.data());
+
+    // Compute per-head cosine similarity for a test query
+    std::vector<float> q_test(n_embd_k);
+    for (int d = 0; d < n_embd_k; d++) q_test[d] = sinf((float)d * 1.3f);
+
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    auto compute_cos_sim = [&](const compacted_layer & res, int h) -> float {
+        // Original output
+        std::vector<float> orig_scores(T);
+        for (int j = 0; j < T; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++)
+                dot += q_test[h * d_k + d] * K[j * n_embd_k + h * d_k + d];
+            orig_scores[j] = dot * inv_sqrt_dk;
+        }
+        softmax_rows(orig_scores.data(), 1, T);
+        std::vector<float> orig_out(d_v, 0.0f);
+        for (int j = 0; j < T; j++)
+            for (int d = 0; d < d_v; d++)
+                orig_out[d] += orig_scores[j] * V[j * n_embd_v + h * d_v + d];
+
+        // Compacted output
+        std::vector<float> comp_scores(t);
+        for (int j = 0; j < t; j++) {
+            float dot = 0.0f;
+            int idx = res.selected_indices[j];
+            for (int d = 0; d < d_k; d++)
+                dot += q_test[h * d_k + d] * K[idx * n_embd_k + h * d_k + d];
+            comp_scores[j] = dot * inv_sqrt_dk + res.beta[h][j];
+        }
+        softmax_rows(comp_scores.data(), 1, t);
+        std::vector<float> comp_out(d_v, 0.0f);
+        for (int j = 0; j < t; j++)
+            for (int d = 0; d < d_v; d++)
+                comp_out[d] += comp_scores[j] * res.C_v[h][j * d_v + d];
+
+        // Cosine similarity
+        float dot_p = 0.0f, n_o = 0.0f, n_c = 0.0f;
+        for (int d = 0; d < d_v; d++) {
+            dot_p += orig_out[d] * comp_out[d];
+            n_o += orig_out[d] * orig_out[d];
+            n_c += comp_out[d] * comp_out[d];
+        }
+        return dot_p / (sqrtf(n_o * n_c) + 1e-8f);
+    };
+
+    printf("\n    Sensitivities:");
+    for (int h = 0; h < n_head_kv; h++)
+        printf(" h%d=%.4f", h, result_weighted.head_sensitivity[h]);
+    printf("\n");
+
+    float worst_weighted = 1.0f, worst_uniform = 1.0f;
+    float sum_weighted = 0.0f, sum_uniform = 0.0f;
+    for (int h = 0; h < n_head_kv; h++) {
+        float cs_w = compute_cos_sim(result_weighted, h);
+        float cs_u = compute_cos_sim(result_uniform, h);
+        printf("    Head %d:  weighted=%.6f  uniform=%.6f\n", h, cs_w, cs_u);
+        if (cs_w < worst_weighted) worst_weighted = cs_w;
+        if (cs_u < worst_uniform) worst_uniform = cs_u;
+        sum_weighted += cs_w;
+        sum_uniform += cs_u;
+    }
+
+    float avg_weighted = sum_weighted / n_head_kv;
+    float avg_uniform = sum_uniform / n_head_kv;
+    printf("    Worst:   weighted=%.6f  uniform=%.6f\n", worst_weighted, worst_uniform);
+    printf("    Average: weighted=%.6f  uniform=%.6f\n", avg_weighted, avg_uniform);
+
+    // Sensitivity weighting should improve worst-case or average quality
+    // (it prioritizes keys for the heads that need them most)
+    assert(worst_weighted >= worst_uniform - 0.01f ||
+           avg_weighted >= avg_uniform - 0.001f);
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1254,6 +1438,10 @@ int main() {
     printf("\n=== Beta averaging and injection ===\n");
     test_beta_averaging_across_heads();
     test_beta_improves_attention_output();
+
+    printf("\n=== Non-uniform head budgets ===\n");
+    test_head_sensitivity_computation();
+    test_sensitivity_weighted_selection();
 
     printf("\nAll tests passed!\n");
     return 0;
