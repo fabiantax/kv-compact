@@ -337,6 +337,53 @@ static void test_multi_round_quality_degradation() {
     printf("  OK\n");
 }
 
+static void test_iterative_refinement() {
+    printf("  test_iterative_refinement...\n");
+    const int T = 128, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 1300);
+    gen_data(V.data(), T * n_embd_v, 1400);
+    gen_data(Q.data(), n_q * n_embd_k, 1500);
+
+    // Compare: no refinement vs 2 refinement rounds at 20% retention
+    // (refinement matters most at high compression)
+    kv_compact_params p_base = kv_compact_params_default();
+    p_base.target_ratio = 0.2f;
+    p_base.refine_rounds = 0;
+
+    kv_compact_params p_refine = p_base;
+    p_refine.refine_rounds = 2;
+
+    kv_compact_result r_base = {}, r_refine = {};
+
+    int rc1 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v, &p_base, &r_base);
+    int rc2 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v, &p_refine, &r_refine);
+    assert(rc1 == 0);
+    assert(rc2 == 0);
+
+    printf("    No refinement:   cos=%.6f mse=%.8f time=%.1fms\n",
+           r_base.stats.avg_cosine_sim, r_base.stats.avg_mse,
+           r_base.stats.elapsed_ms);
+    printf("    2 refine rounds: cos=%.6f mse=%.8f time=%.1fms\n",
+           r_refine.stats.avg_cosine_sim, r_refine.stats.avg_mse,
+           r_refine.stats.elapsed_ms);
+
+    // Refinement should improve or at least not worsen quality
+    assert(r_refine.stats.avg_cosine_sim >= r_base.stats.avg_cosine_sim - 0.01f);
+    // Both must be finite
+    assert(std::isfinite(r_refine.stats.avg_cosine_sim));
+    assert(std::isfinite(r_refine.stats.avg_mse));
+
+    kv_compact_result_free(&r_base);
+    kv_compact_result_free(&r_refine);
+    printf("  OK\n");
+}
+
 static void test_double_free_safe() {
     printf("  test_double_free_safe...");
     kv_compact_result result = {};
@@ -374,6 +421,9 @@ int main() {
     printf("\n=== Multi-round compaction (US-9) ===\n");
     test_multi_round_basic();
     test_multi_round_quality_degradation();
+
+    printf("\n=== Iterative refinement ===\n");
+    test_iterative_refinement();
 
     printf("\n=== Safety ===\n");
     test_double_free_safe();

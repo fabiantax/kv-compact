@@ -39,6 +39,10 @@ typedef struct kv_compact_params {
     int    use_sensitivity;    // weight key selection by per-head sensitivity
     float  ridge;              // ridge regularization for least-squares (default: 1e-6)
     int    nnls_max_iter;      // max NNLS iterations (default: 200)
+    int    refine_rounds;      // iterative refinement rounds (0=disabled, default: 0)
+                               // each round evaluates per-key reconstruction error,
+                               // swaps worst selected keys with best unused, then
+                               // re-runs NNLS + LS. Typically 2-3 rounds.
 } kv_compact_params;
 
 // ============================================================================

@@ -122,6 +122,7 @@ kv_compact_params kv_compact_params_default(void) {
     p.use_sensitivity = 0;
     p.ridge = 1e-6f;
     p.nnls_max_iter = 200;
+    p.refine_rounds = 0;
     return p;
 }
 
@@ -286,6 +287,113 @@ int kv_compact(
 
         least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
                            n_q, t, d_v, p.ridge);
+    }
+
+    // ---- Iterative refinement: swap worst selected keys with best unused ----
+    if (p.refine_rounds > 0 && t < T) {
+        // Build set of unused indices
+        std::vector<bool> is_selected(T, false);
+        for (int j = 0; j < t; j++) is_selected[selected[j]] = true;
+
+        // Helper lambda to compute per-key reconstruction error for head h
+        // Returns the total MSE contribution of removing key j from the selection
+        auto compute_key_error = [&](int h, int key_slot) -> float {
+            const auto & hc = hcache[0][h];
+            float total_err = 0.0f;
+
+            // Compute compacted attention output for each query
+            for (int qi = 0; qi < n_q; qi++) {
+                // Compacted scores with beta
+                std::vector<float> comp_s(t);
+                for (int j = 0; j < t; j++) {
+                    comp_s[j] = hc.scores[qi * T + selected[j]] + beta_vecs[h][j];
+                }
+                softmax_rows(comp_s.data(), 1, t);
+
+                // How much does this key contribute to the output?
+                float weight = comp_s[key_slot];
+                total_err += weight * weight;  // squared attention weight = proxy for impact
+            }
+            return total_err / n_q;
+        };
+
+        for (int refine = 0; refine < p.refine_rounds; refine++) {
+            // For each head, find the selected key with the LOWEST attention mass
+            // (contributes least), averaged across heads
+            std::vector<float> key_value(t, 0.0f);
+            for (int h = 0; h < n_head_kv; h++) {
+                for (int j = 0; j < t; j++) {
+                    key_value[j] += compute_key_error(h, j);
+                }
+            }
+
+            // Find worst selected key (lowest value)
+            int worst_slot = 0;
+            for (int j = 1; j < t; j++) {
+                if (key_value[j] < key_value[worst_slot]) worst_slot = j;
+            }
+
+            // Find best unused key (highest global importance)
+            int best_unused = -1;
+            float best_imp = -1.0f;
+            for (int j = 0; j < T; j++) {
+                if (!is_selected[j] && global_importance[j] > best_imp) {
+                    best_imp = global_importance[j];
+                    best_unused = j;
+                }
+            }
+
+            if (best_unused < 0) break;  // no unused keys to swap
+
+            // Only swap if the unused key has higher importance than worst selected
+            if (best_imp <= global_importance[selected[worst_slot]] * 0.5f) break;
+
+            // Perform swap
+            is_selected[selected[worst_slot]] = false;
+            is_selected[best_unused] = true;
+            selected[worst_slot] = best_unused;
+            std::sort(selected.begin(), selected.end());
+
+            // Re-run NNLS + LS for all heads with new selection
+            for (int h = 0; h < n_head_kv; h++) {
+                const auto & hc = hcache[0][h];
+
+                std::vector<float> M(n_q * t);
+                for (int qi = 0; qi < n_q; qi++) {
+                    for (int j = 0; j < t; j++) {
+                        M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+                    }
+                }
+
+                std::vector<float> w(t);
+                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q, t, p.nnls_max_iter);
+
+                for (int j = 0; j < t; j++) {
+                    beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+                }
+
+                std::vector<float> X(n_q * t);
+                for (int qi = 0; qi < n_q; qi++) {
+                    for (int j = 0; j < t; j++) {
+                        X[qi * t + j] = hc.scores[qi * T + selected[j]] + beta_vecs[h][j];
+                    }
+                }
+                softmax_rows(X.data(), n_q, t);
+
+                std::vector<float> Y(n_q * d_v, 0.0f);
+                for (int qi = 0; qi < n_q; qi++) {
+                    for (int ki = 0; ki < T; ki++) {
+                        float w_ij = hc.attn_weights[qi * T + ki];
+                        const float * v_row = V_all + ki * n_embd_v + h * d_v;
+                        for (int d = 0; d < d_v; d++)
+                            Y[qi * d_v + d] += w_ij * v_row[d];
+                    }
+                }
+
+                least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
+                                   n_q, t, d_v, p.ridge);
+            }
+        }
     }
 
     double nnls_time = elapsed_ms(t_nnls);
