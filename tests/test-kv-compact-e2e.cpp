@@ -88,7 +88,9 @@ int main(int argc, char ** argv) {
     const int n_head_kv = llama_model_n_head_kv(model);
     const int n_embd    = llama_model_n_embd(model);
     const int d_k       = n_embd / n_head;
-    const int d_v       = d_k;
+    // d_v may differ from d_k for some architectures; will be computed from
+    // parsed state below. Use d_k as initial estimate for display purposes.
+    int d_v             = d_k;
     const enum llama_rope_type rope_type = llama_model_rope_type(model);
     const uint32_t n_pos_per_embd = (rope_type == LLAMA_ROPE_TYPE_MROPE ||
                                      rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
@@ -192,23 +194,39 @@ int main(int argc, char ** argv) {
     const int ref_start = T - n_ref;
     const auto & sd = kv_state.streams[0];
 
-    // Global importance scoring
+    // Global importance scoring — use softmax attention weights (same as API)
+    // Raw dot-product scores are unbounded and not comparable across queries,
+    // so we must apply softmax before taking max across queries.
     std::vector<float> global_importance(T, 0.0f);
 
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
 
         for (int h = 0; h < n_head_kv; h++) {
+            // Compute attention scores for all ref queries vs all keys
+            std::vector<float> attn_weights(n_ref * T);
             for (int qi = 0; qi < n_ref; qi++) {
                 const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * actual_d_k;
                 for (int ki = 0; ki < T; ki++) {
                     const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * actual_d_k;
                     float dot = 0.0f;
                     for (int d = 0; d < actual_d_k; d++) dot += q_row[d] * k_row[d];
-                    // We just need max attention for importance, compute simplified
-                    // (skip full softmax for speed in test)
-                    float score = dot * inv_sqrt_dk;
-                    if (score > global_importance[ki]) global_importance[ki] = score;
+                    attn_weights[qi * T + ki] = dot * inv_sqrt_dk;
+                }
+            }
+
+            // Apply softmax per query row to get proper attention weights
+            softmax_rows(attn_weights.data(), n_ref, T);
+
+            // Per-key max attention across queries → global importance
+            for (int ki = 0; ki < T; ki++) {
+                float max_w = 0.0f;
+                for (int qi = 0; qi < n_ref; qi++) {
+                    float w = attn_weights[qi * T + ki];
+                    if (w > max_w) max_w = w;
+                }
+                if (max_w > global_importance[ki]) {
+                    global_importance[ki] = max_w;
                 }
             }
         }

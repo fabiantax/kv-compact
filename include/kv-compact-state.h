@@ -55,9 +55,9 @@ struct kv_layer_data {
     int32_t  k_type;        // original ggml_type
     int32_t  v_type;
     uint64_t k_size_row;    // bytes per row in original format
-    uint64_t v_size_row;    // bytes per row (non-transposed only)
-    uint32_t v_size_el;     // bytes per element (transposed only)
-    uint32_t n_embd_v_gqa;  // V embedding size (transposed only)
+    uint64_t v_size_row;        // bytes per row (non-transposed only)
+    uint32_t v_size_el;         // bytes per element (transposed only)
+    uint32_t n_embd_v_gqa_raw;  // V embedding size from state header (transposed only)
 
     // Float32 data: [cell_count, n_embd_k_gqa] and [cell_count, n_embd_v_gqa]
     // V is always stored as [cell_count, n_embd_v_gqa] regardless of v_trans
@@ -180,15 +180,15 @@ struct parsed_kv_state {
 
                     if (!read_val(ptr, end, ld.v_type)) return false;
                     if (!read_val(ptr, end, ld.v_size_el)) return false;
-                    if (!read_val(ptr, end, ld.n_embd_v_gqa)) return false;
+                    if (!read_val(ptr, end, ld.n_embd_v_gqa_raw)) return false;
 
-                    const size_t v_data_size = (size_t)ld.n_embd_v_gqa * sd.cell_count * ld.v_size_el;
+                    const size_t v_data_size = (size_t)ld.n_embd_v_gqa_raw * sd.cell_count * ld.v_size_el;
                     if (ptr + v_data_size > end) return false;
 
                     // Transpose from [embd][token] to [token][embd]
-                    ld.V.resize((size_t)sd.cell_count * ld.n_embd_v_gqa);
+                    ld.V.resize((size_t)sd.cell_count * ld.n_embd_v_gqa_raw);
                     transpose_v_to_f32(ptr, ld.v_type, ld.V.data(),
-                                       sd.cell_count, ld.n_embd_v_gqa);
+                                       sd.cell_count, ld.n_embd_v_gqa_raw);
 
                     ptr += v_data_size;
                 }

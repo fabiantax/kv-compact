@@ -66,6 +66,7 @@ if(KV_COMPACT_BUILD_TOOL)
 
     add_executable(llama-kv-compact src/kv-compact.cpp)
     target_link_libraries(llama-kv-compact PRIVATE
+        kv-compact-lib
         kv-compact-math
         llama
         common
@@ -75,6 +76,7 @@ if(KV_COMPACT_BUILD_TOOL)
     # E2E test (also needs llama.cpp)
     add_executable(test-kv-compact-e2e tests/test-kv-compact-e2e.cpp)
     target_link_libraries(test-kv-compact-e2e PRIVATE
+        kv-compact-lib
         kv-compact-math
         llama
         common
