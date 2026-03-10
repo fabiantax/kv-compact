@@ -43,6 +43,17 @@ typedef struct kv_compact_params {
                                // each round evaluates per-key reconstruction error,
                                // swaps worst selected keys with best unused, then
                                // re-runs NNLS + LS. Typically 2-3 rounds.
+    int    use_diversity;      // diversity-aware key selection (0=disabled, default: 0)
+                               // down-weights keys similar to already-selected ones,
+                               // reducing redundancy in the compacted cache.
+    float  diversity_strength; // how strongly to penalize similar keys (default: 0.5)
+                               // 0.0 = no effect, 1.0 = full suppression of duplicates
+    int    n_shared_prefix;    // number of shared prefix tokens to always keep (default: 0)
+                               // these positions are never evicted, supporting shared
+                               // prompt KV caches across multiple agents.
+    int    use_cheap_qref;     // use K-vector proxy for Q_ref (0=disabled, default: 0)
+                               // when enabled, Q_ref_all can be NULL and reference
+                               // queries are generated from K vectors automatically.
 } kv_compact_params;
 
 // ============================================================================

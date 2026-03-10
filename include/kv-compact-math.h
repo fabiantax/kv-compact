@@ -79,16 +79,21 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
     }
 }
 
-// Solve non-negative least squares via projected gradient descent:
+// Solve non-negative least squares via Lawson-Hanson active-set method:
 //   min_{w >= 0} ||A*w - b||^2
 // A is (m x n), b is (m), w is (n)
+//
+// The Lawson-Hanson algorithm converges in finitely many iterations.
+// It maintains a passive set P (unconstrained variables) and a zero set Z
+// (variables fixed at 0). Each outer iteration moves one variable from Z to P,
+// inner iterations handle infeasible solutions by moving variables back.
+//
 // Returns solution in w
 static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200) {
     // Precompute A^T * A and A^T * b
     std::vector<float> AtA(n * n);
     std::vector<float> Atb(n);
 
-    // AtA = A^T * A
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             float sum = 0.0f;
@@ -99,7 +104,6 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
         }
     }
 
-    // Atb = A^T * b
     for (int i = 0; i < n; i++) {
         float sum = 0.0f;
         for (int k = 0; k < m; k++) {
@@ -108,35 +112,155 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
         Atb[i] = sum;
     }
 
-    // Initialize w to unconstrained least squares, clamped to >= 0
-    // Simple init: w = max(0, (A^T A)^{-1} A^T b) via gradient descent from w=1
-    for (int i = 0; i < n; i++) {
-        w[i] = 1.0f;
-    }
+    // Initialize: all variables in zero set
+    std::vector<bool> in_P(n, false);  // passive set membership
+    for (int i = 0; i < n; i++) w[i] = 0.0f;
 
-    // Compute step size: 1 / (max eigenvalue of AtA) ≈ 1 / (trace(AtA))
-    float trace = 0.0f;
-    for (int i = 0; i < n; i++) {
-        trace += AtA[i * n + i];
-    }
-    float step = 1.0f / (trace + 1e-8f);
-
-    // Projected gradient descent
+    // Compute initial gradient: grad = AtA * w - Atb = -Atb (since w=0)
     std::vector<float> grad(n);
-    for (int iter = 0; iter < max_iter; iter++) {
-        // grad = AtA * w - Atb
+    for (int i = 0; i < n; i++) grad[i] = -Atb[i];
+
+    // Temporary for sub-problem solution
+    std::vector<float> s(n, 0.0f);
+
+    for (int outer = 0; outer < max_iter; outer++) {
+        // Find the index in Z with the most negative gradient (largest dual variable)
+        int t_idx = -1;
+        float max_dual = 0.0f;
+        for (int i = 0; i < n; i++) {
+            if (!in_P[i] && (-grad[i]) > max_dual) {
+                max_dual = -grad[i];
+                t_idx = i;
+            }
+        }
+
+        // KKT check: if no zero-set variable has negative gradient, we're optimal
+        if (t_idx < 0 || max_dual < 1e-10f) break;
+
+        // Move t_idx from Z to P
+        in_P[t_idx] = true;
+
+        // Inner loop: solve unconstrained LS on P, fix infeasible variables
+        for (int inner = 0; inner < max_iter; inner++) {
+            // Count passive set size
+            int p_count = 0;
+            std::vector<int> p_indices;
+            for (int i = 0; i < n; i++) {
+                if (in_P[i]) p_indices.push_back(i);
+            }
+            p_count = (int) p_indices.size();
+
+            // Solve the sub-problem: min ||A_P * s_P - b||^2
+            // Using normal equations: (A_P^T A_P) s_P = A_P^T b
+            // We already have AtA and Atb, so extract submatrices
+            std::vector<float> sub_AtA(p_count * p_count);
+            std::vector<float> sub_Atb(p_count);
+
+            for (int i = 0; i < p_count; i++) {
+                sub_Atb[i] = Atb[p_indices[i]];
+                for (int j = 0; j < p_count; j++) {
+                    sub_AtA[i * p_count + j] = AtA[p_indices[i] * n + p_indices[j]];
+                }
+                // Add small ridge for numerical stability
+                sub_AtA[i * p_count + i] += 1e-10f;
+            }
+
+            // Solve via Gaussian elimination with partial pivoting
+            std::vector<float> aug(p_count * (p_count + 1));
+            for (int i = 0; i < p_count; i++) {
+                for (int j = 0; j < p_count; j++) {
+                    aug[i * (p_count + 1) + j] = sub_AtA[i * p_count + j];
+                }
+                aug[i * (p_count + 1) + p_count] = sub_Atb[i];
+            }
+
+            for (int col = 0; col < p_count; col++) {
+                int max_row = col;
+                float max_val = fabsf(aug[col * (p_count + 1) + col]);
+                for (int row = col + 1; row < p_count; row++) {
+                    float val = fabsf(aug[row * (p_count + 1) + col]);
+                    if (val > max_val) { max_val = val; max_row = row; }
+                }
+                if (max_row != col) {
+                    for (int j = 0; j < p_count + 1; j++)
+                        std::swap(aug[col * (p_count + 1) + j],
+                                  aug[max_row * (p_count + 1) + j]);
+                }
+                float pivot = aug[col * (p_count + 1) + col];
+                if (fabsf(pivot) < 1e-12f) continue;
+                for (int row = col + 1; row < p_count; row++) {
+                    float factor = aug[row * (p_count + 1) + col] / pivot;
+                    for (int j = col; j < p_count + 1; j++)
+                        aug[row * (p_count + 1) + j] -= factor * aug[col * (p_count + 1) + j];
+                }
+            }
+
+            std::vector<float> s_P(p_count, 0.0f);
+            for (int col = p_count - 1; col >= 0; col--) {
+                float pivot = aug[col * (p_count + 1) + col];
+                if (fabsf(pivot) < 1e-12f) continue;
+                float val = aug[col * (p_count + 1) + p_count];
+                for (int row = col + 1; row < p_count; row++)
+                    val -= aug[col * (p_count + 1) + row] * s_P[row];
+                s_P[col] = val / pivot;
+            }
+
+            // Map s_P back to full s
+            for (int i = 0; i < n; i++) s[i] = 0.0f;
+            for (int i = 0; i < p_count; i++) s[p_indices[i]] = s_P[i];
+
+            // Check feasibility: all s[P] >= 0
+            bool feasible = true;
+            for (int i = 0; i < p_count; i++) {
+                if (s_P[i] <= 0.0f) { feasible = false; break; }
+            }
+
+            if (feasible) {
+                // Accept the solution
+                for (int i = 0; i < n; i++) w[i] = s[i];
+                break;
+            }
+
+            // Find alpha: step size to boundary
+            float alpha = 1.0f;
+            int q_idx = -1;
+            for (int i = 0; i < p_count; i++) {
+                int idx = p_indices[i];
+                if (s[idx] <= 0.0f) {
+                    float a = w[idx] / (w[idx] - s[idx] + 1e-30f);
+                    if (a < alpha) {
+                        alpha = a;
+                        q_idx = idx;
+                    }
+                }
+            }
+
+            // Interpolate: w = w + alpha * (s - w)
+            for (int i = 0; i < n; i++) {
+                w[i] += alpha * (s[i] - w[i]);
+            }
+
+            // Move variables at zero back to Z
+            for (int i = 0; i < p_count; i++) {
+                int idx = p_indices[i];
+                if (fabsf(w[idx]) < 1e-12f) {
+                    w[idx] = 0.0f;
+                    in_P[idx] = false;
+                }
+            }
+        }
+
+        // Update gradient: grad = AtA * w - Atb
         for (int i = 0; i < n; i++) {
             float sum = 0.0f;
-            for (int j = 0; j < n; j++) {
-                sum += AtA[i * n + j] * w[j];
-            }
+            for (int j = 0; j < n; j++) sum += AtA[i * n + j] * w[j];
             grad[i] = sum - Atb[i];
         }
+    }
 
-        // w = max(0, w - step * grad)
-        for (int i = 0; i < n; i++) {
-            w[i] = std::max(1e-12f, w[i] - step * grad[i]);
-        }
+    // Ensure no negative values (numerical safety)
+    for (int i = 0; i < n; i++) {
+        if (w[i] < 1e-12f) w[i] = 1e-12f;
     }
 }
 

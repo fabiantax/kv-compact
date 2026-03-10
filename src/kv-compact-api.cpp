@@ -18,6 +18,111 @@ static double elapsed_ms(clock_type::time_point t0) {
 }
 
 // ============================================================================
+// Cheap Q_ref generation from K vectors
+// ============================================================================
+
+// Generate proxy reference queries from K vectors. Samples evenly-spaced
+// K rows and treats them as if they were Q vectors. This avoids the cost
+// of a full repeat-prefill pass while providing reasonable attention scores
+// for key selection.
+static void generate_cheap_qref(const float * K_all, int T, int n_head_kv,
+                                 int d_k, int n_q_out,
+                                 std::vector<float> & Q_out) {
+    int n_embd_k = n_head_kv * d_k;
+    Q_out.resize((size_t)n_q_out * n_embd_k);
+
+    // Sample evenly-spaced positions, biased toward recent tokens
+    // (more recent = more likely to be queried in practice)
+    for (int qi = 0; qi < n_q_out; qi++) {
+        // Quadratic spacing: more samples from the end
+        float frac = (float)(qi + 1) / (float)(n_q_out + 1);
+        frac = frac * frac;  // bias toward end
+        int pos = (int)(frac * (T - 1));
+        if (pos >= T) pos = T - 1;
+        if (pos < 0) pos = 0;
+
+        memcpy(Q_out.data() + qi * n_embd_k,
+               K_all + pos * n_embd_k,
+               n_embd_k * sizeof(float));
+    }
+}
+
+// ============================================================================
+// Diversity-aware key selection
+// ============================================================================
+
+// Select top-t keys with diversity penalty. Uses a greedy approach:
+// pick highest-importance key, then penalize keys similar to those
+// already selected before picking the next.
+//
+// importance: [T] global importance scores
+// K_all:      [T × n_embd_k] key vectors (for similarity computation)
+// T:          number of positions
+// t:          target count
+// n_embd_k:   total K embedding size
+// strength:   diversity penalty strength (0=none, 1=full)
+// n_prefix:   number of prefix positions to always include first
+static std::vector<int> select_keys_diverse(
+        const float * importance, const float * K_all,
+        int T, int t, int n_embd_k, float strength, int n_prefix) {
+
+    std::vector<int> selected;
+    selected.reserve(t);
+    std::vector<bool> used(T, false);
+    std::vector<float> penalty(T, 0.0f);
+
+    // Force-include shared prefix positions first
+    int prefix_count = n_prefix < t ? n_prefix : t;
+    for (int j = 0; j < prefix_count; j++) {
+        selected.push_back(j);
+        used[j] = true;
+    }
+
+    // Greedy selection with diversity penalty
+    while ((int)selected.size() < t) {
+        int best = -1;
+        float best_score = -1e30f;
+
+        for (int j = 0; j < T; j++) {
+            if (used[j]) continue;
+            float score = importance[j] * (1.0f - strength * penalty[j]);
+            if (score > best_score) {
+                best_score = score;
+                best = j;
+            }
+        }
+
+        if (best < 0) break;
+
+        selected.push_back(best);
+        used[best] = true;
+
+        // Update penalty: compute cosine similarity of newly selected key
+        // with all remaining candidates
+        const float * k_sel = K_all + best * n_embd_k;
+        float norm_sel = 0.0f;
+        for (int d = 0; d < n_embd_k; d++) norm_sel += k_sel[d] * k_sel[d];
+        norm_sel = sqrtf(norm_sel) + 1e-8f;
+
+        for (int j = 0; j < T; j++) {
+            if (used[j]) continue;
+            const float * k_j = K_all + j * n_embd_k;
+            float dot = 0.0f, norm_j = 0.0f;
+            for (int d = 0; d < n_embd_k; d++) {
+                dot += k_sel[d] * k_j[d];
+                norm_j += k_j[d] * k_j[d];
+            }
+            float cos_sim = dot / (norm_sel * sqrtf(norm_j) + 1e-8f);
+            // Track max similarity to any selected key
+            if (cos_sim > penalty[j]) penalty[j] = cos_sim;
+        }
+    }
+
+    std::sort(selected.begin(), selected.end());
+    return selected;
+}
+
+// ============================================================================
 // Quality metrics computation
 // ============================================================================
 
@@ -123,6 +228,10 @@ kv_compact_params kv_compact_params_default(void) {
     p.ridge = 1e-6f;
     p.nnls_max_iter = 200;
     p.refine_rounds = 0;
+    p.use_diversity = 0;
+    p.diversity_strength = 0.5f;
+    p.n_shared_prefix = 0;
+    p.use_cheap_qref = 0;
     return p;
 }
 
@@ -135,11 +244,31 @@ int kv_compact(
     kv_compact_result * result) {
 
     // Validate inputs
-    if (!K_all || !V_all || !Q_ref_all || !result) return -1;
-    if (T <= 0 || n_q <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
+    if (!K_all || !V_all || !result) return -1;
+    if (T <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
 
     // Apply defaults if no params
     kv_compact_params p = params ? *params : kv_compact_params_default();
+
+    int n_embd_k = n_head_kv * d_k;
+
+    // Handle cheap Q_ref: generate proxy queries from K if Q_ref_all is NULL
+    std::vector<float> cheap_qref;
+    const float * Q_ref_used = Q_ref_all;
+    int n_q_used = n_q;
+
+    if (p.use_cheap_qref || !Q_ref_all) {
+        // Auto-size: use min(T/2, 64) reference queries
+        n_q_used = T / 2;
+        if (n_q_used > 64) n_q_used = 64;
+        if (n_q_used < 4) n_q_used = 4;
+        if (n_q_used > T) n_q_used = T;
+
+        generate_cheap_qref(K_all, T, n_head_kv, d_k, n_q_used, cheap_qref);
+        Q_ref_used = cheap_qref.data();
+    } else {
+        if (n_q <= 0) return -2;
+    }
 
     // Determine target size
     int t;
@@ -151,12 +280,17 @@ int kv_compact(
         if (t > T) t = T;
     }
 
+    // Ensure shared prefix fits within target
+    if (p.n_shared_prefix > t) {
+        // If more prefix tokens than target, keep all prefix
+        t = p.n_shared_prefix < T ? p.n_shared_prefix : T;
+    }
+
     auto t_total = clock_type::now();
 
     // ---- Step 1: Attention scoring and key selection ----
     auto t_scoring = clock_type::now();
 
-    int n_embd_k = n_head_kv * d_k;
     int n_embd_v = n_head_kv * d_v;
     float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
 
@@ -179,14 +313,14 @@ int kv_compact(
 
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
-        hc.scores.resize(n_q * T);
-        hc.exp_scores.resize(n_q * T);
-        hc.row_sums.resize(n_q);
-        hc.attn_weights.resize(n_q * T);
+        hc.scores.resize(n_q_used * T);
+        hc.exp_scores.resize(n_q_used * T);
+        hc.row_sums.resize(n_q_used);
+        hc.attn_weights.resize(n_q_used * T);
 
         // Compute scores
-        for (int qi = 0; qi < n_q; qi++) {
-            const float * q_row = Q_ref_all + qi * n_embd_k + h * d_k;
+        for (int qi = 0; qi < n_q_used; qi++) {
+            const float * q_row = Q_ref_used + qi * n_embd_k + h * d_k;
             for (int ki = 0; ki < T; ki++) {
                 const float * k_row = K_all + ki * n_embd_k + h * d_k;
                 float dot = 0.0f;
@@ -195,17 +329,17 @@ int kv_compact(
             }
         }
 
-        memcpy(hc.exp_scores.data(), hc.scores.data(), n_q * T * sizeof(float));
-        exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_q, T);
+        memcpy(hc.exp_scores.data(), hc.scores.data(), n_q_used * T * sizeof(float));
+        exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_q_used, T);
 
-        memcpy(hc.attn_weights.data(), hc.scores.data(), n_q * T * sizeof(float));
-        softmax_rows(hc.attn_weights.data(), n_q, T);
+        memcpy(hc.attn_weights.data(), hc.scores.data(), n_q_used * T * sizeof(float));
+        softmax_rows(hc.attn_weights.data(), n_q_used, T);
 
         // Per-key importance
         std::vector<float> head_imp(T);
         for (int j = 0; j < T; j++) {
             float max_w = 0.0f;
-            for (int qi = 0; qi < n_q; qi++) {
+            for (int qi = 0; qi < n_q_used; qi++) {
                 float w = hc.attn_weights[qi * T + j];
                 if (w > max_w) max_w = w;
             }
@@ -213,7 +347,7 @@ int kv_compact(
         }
 
         if (p.use_sensitivity) {
-            float sens = compute_head_sensitivity(hc.attn_weights.data(), n_q, T);
+            float sens = compute_head_sensitivity(hc.attn_weights.data(), n_q_used, T);
             per_head_imp.push_back(head_imp);
             sensitivities.push_back(sens);
         } else {
@@ -229,14 +363,41 @@ int kv_compact(
                                        T, n_head_kv, global_importance.data());
     }
 
-    // Select top-t
-    std::vector<int> indices(T);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
-                      [&](int a, int b) { return global_importance[a] > global_importance[b]; });
+    // Key selection: diversity-aware or standard
+    std::vector<int> selected;
+    if (p.use_diversity) {
+        selected = select_keys_diverse(global_importance.data(), K_all,
+                                       T, t, n_embd_k, p.diversity_strength,
+                                       p.n_shared_prefix);
+    } else {
+        // Standard top-t selection, with shared prefix forced in
+        if (p.n_shared_prefix > 0) {
+            std::vector<bool> is_prefix(T, false);
+            int prefix_count = p.n_shared_prefix < t ? p.n_shared_prefix : t;
+            for (int j = 0; j < prefix_count; j++) is_prefix[j] = true;
 
-    std::vector<int> selected(indices.begin(), indices.begin() + t);
-    std::sort(selected.begin(), selected.end());
+            // Select remaining from non-prefix by importance
+            std::vector<int> candidates;
+            for (int j = prefix_count; j < T; j++) candidates.push_back(j);
+            int remaining = t - prefix_count;
+            std::partial_sort(candidates.begin(), candidates.begin() + remaining,
+                              candidates.end(),
+                              [&](int a, int b) { return global_importance[a] > global_importance[b]; });
+
+            selected.reserve(t);
+            for (int j = 0; j < prefix_count; j++) selected.push_back(j);
+            for (int j = 0; j < remaining; j++) selected.push_back(candidates[j]);
+            std::sort(selected.begin(), selected.end());
+        } else {
+            std::vector<int> indices(T);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                              [&](int a, int b) { return global_importance[a] > global_importance[b]; });
+
+            selected.assign(indices.begin(), indices.begin() + t);
+            std::sort(selected.begin(), selected.end());
+        }
+    }
 
     double scoring_time = elapsed_ms(t_scoring);
 
@@ -252,8 +413,8 @@ int kv_compact(
         cv_vecs[h].resize(t * d_v);
 
         // NNLS for beta
-        std::vector<float> M(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
+        std::vector<float> M(n_q_used * t);
+        for (int qi = 0; qi < n_q_used; qi++) {
             for (int j = 0; j < t; j++) {
                 M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
             }
@@ -267,16 +428,16 @@ int kv_compact(
         }
 
         // Least squares for C_v
-        std::vector<float> X(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
+        std::vector<float> X(n_q_used * t);
+        for (int qi = 0; qi < n_q_used; qi++) {
             for (int j = 0; j < t; j++) {
                 X[qi * t + j] = hc.scores[qi * T + selected[j]] + beta_vecs[h][j];
             }
         }
-        softmax_rows(X.data(), n_q, t);
+        softmax_rows(X.data(), n_q_used, t);
 
-        std::vector<float> Y(n_q * d_v, 0.0f);
-        for (int qi = 0; qi < n_q; qi++) {
+        std::vector<float> Y(n_q_used * d_v, 0.0f);
+        for (int qi = 0; qi < n_q_used; qi++) {
             for (int ki = 0; ki < T; ki++) {
                 float w_ij = hc.attn_weights[qi * T + ki];
                 const float * v_row = V_all + ki * n_embd_v + h * d_v;
@@ -286,7 +447,7 @@ int kv_compact(
         }
 
         least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
-                           n_q, t, d_v, p.ridge);
+                           n_q_used, t, d_v, p.ridge);
     }
 
     // ---- Iterative refinement: swap worst selected keys with best unused ----
@@ -295,31 +456,22 @@ int kv_compact(
         std::vector<bool> is_selected(T, false);
         for (int j = 0; j < t; j++) is_selected[selected[j]] = true;
 
-        // Helper lambda to compute per-key reconstruction error for head h
-        // Returns the total MSE contribution of removing key j from the selection
         auto compute_key_error = [&](int h, int key_slot) -> float {
             const auto & hc = hcache[0][h];
             float total_err = 0.0f;
-
-            // Compute compacted attention output for each query
-            for (int qi = 0; qi < n_q; qi++) {
-                // Compacted scores with beta
+            for (int qi = 0; qi < n_q_used; qi++) {
                 std::vector<float> comp_s(t);
                 for (int j = 0; j < t; j++) {
                     comp_s[j] = hc.scores[qi * T + selected[j]] + beta_vecs[h][j];
                 }
                 softmax_rows(comp_s.data(), 1, t);
-
-                // How much does this key contribute to the output?
                 float weight = comp_s[key_slot];
-                total_err += weight * weight;  // squared attention weight = proxy for impact
+                total_err += weight * weight;
             }
-            return total_err / n_q;
+            return total_err / n_q_used;
         };
 
         for (int refine = 0; refine < p.refine_rounds; refine++) {
-            // For each head, find the selected key with the LOWEST attention mass
-            // (contributes least), averaged across heads
             std::vector<float> key_value(t, 0.0f);
             for (int h = 0; h < n_head_kv; h++) {
                 for (int j = 0; j < t; j++) {
@@ -327,13 +479,11 @@ int kv_compact(
                 }
             }
 
-            // Find worst selected key (lowest value)
             int worst_slot = 0;
             for (int j = 1; j < t; j++) {
                 if (key_value[j] < key_value[worst_slot]) worst_slot = j;
             }
 
-            // Find best unused key (highest global importance)
             int best_unused = -1;
             float best_imp = -1.0f;
             for (int j = 0; j < T; j++) {
@@ -343,45 +493,41 @@ int kv_compact(
                 }
             }
 
-            if (best_unused < 0) break;  // no unused keys to swap
-
-            // Only swap if the unused key has higher importance than worst selected
+            if (best_unused < 0) break;
             if (best_imp <= global_importance[selected[worst_slot]] * 0.5f) break;
 
-            // Perform swap
             is_selected[selected[worst_slot]] = false;
             is_selected[best_unused] = true;
             selected[worst_slot] = best_unused;
             std::sort(selected.begin(), selected.end());
 
-            // Re-run NNLS + LS for all heads with new selection
             for (int h = 0; h < n_head_kv; h++) {
                 const auto & hc = hcache[0][h];
 
-                std::vector<float> M(n_q * t);
-                for (int qi = 0; qi < n_q; qi++) {
+                std::vector<float> M(n_q_used * t);
+                for (int qi = 0; qi < n_q_used; qi++) {
                     for (int j = 0; j < t; j++) {
                         M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
                     }
                 }
 
                 std::vector<float> w(t);
-                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q, t, p.nnls_max_iter);
+                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
 
                 for (int j = 0; j < t; j++) {
                     beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
                 }
 
-                std::vector<float> X(n_q * t);
-                for (int qi = 0; qi < n_q; qi++) {
+                std::vector<float> X(n_q_used * t);
+                for (int qi = 0; qi < n_q_used; qi++) {
                     for (int j = 0; j < t; j++) {
                         X[qi * t + j] = hc.scores[qi * T + selected[j]] + beta_vecs[h][j];
                     }
                 }
-                softmax_rows(X.data(), n_q, t);
+                softmax_rows(X.data(), n_q_used, t);
 
-                std::vector<float> Y(n_q * d_v, 0.0f);
-                for (int qi = 0; qi < n_q; qi++) {
+                std::vector<float> Y(n_q_used * d_v, 0.0f);
+                for (int qi = 0; qi < n_q_used; qi++) {
                     for (int ki = 0; ki < T; ki++) {
                         float w_ij = hc.attn_weights[qi * T + ki];
                         const float * v_row = V_all + ki * n_embd_v + h * d_v;
@@ -391,7 +537,7 @@ int kv_compact(
                 }
 
                 least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
-                                   n_q, t, d_v, p.ridge);
+                                   n_q_used, t, d_v, p.ridge);
             }
         }
     }
@@ -416,9 +562,9 @@ int kv_compact(
         memcpy(result->C_v[h], cv_vecs[h].data(), t * d_v * sizeof(float));
     }
 
-    // Compute quality metrics
-    compute_quality_metrics(K_all, V_all, Q_ref_all,
-                           T, n_q, n_head_kv, d_k, d_v, result,
+    // Compute quality metrics (using the effective Q_ref)
+    compute_quality_metrics(K_all, V_all, Q_ref_used,
+                           T, n_q_used, n_head_kv, d_k, d_v, result,
                            &result->stats);
 
     result->stats.elapsed_ms = elapsed_ms(t_total);
@@ -438,9 +584,14 @@ int kv_compact_multi_round(
     kv_compact_result * result,
     kv_compact_stats * per_round_stats) {
 
-    if (!K_all || !V_all || !Q_ref_all || !result) return -1;
-    if (T <= 0 || n_q <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
+    if (!K_all || !V_all || !result) return -1;
+    if (T <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
     if (n_rounds < 1) return -3;
+
+    // Check: Q_ref_all is required unless cheap_qref is enabled
+    kv_compact_params p_check = params ? *params : kv_compact_params_default();
+    if (!Q_ref_all && !p_check.use_cheap_qref) return -1;
+    if (Q_ref_all && n_q <= 0 && !p_check.use_cheap_qref) return -2;
 
     int n_embd_k = n_head_kv * d_k;
     int n_embd_v = n_head_kv * d_v;
@@ -454,17 +605,25 @@ int kv_compact_multi_round(
     std::vector<float> cur_V(V_all, V_all + (size_t)T * n_embd_v);
     int cur_T = T;
 
-    // Q_ref stays the same (from original context)
-    // But we need to limit n_q to current T
-    int cur_n_q = n_q;
+    // Handle Q_ref: use provided or generate cheap proxy
+    std::vector<float> cheap_qref_mr;
+    const float * Q_ref_mr = Q_ref_all;
+    int n_q_mr = n_q;
+
+    if (p_check.use_cheap_qref || !Q_ref_all) {
+        n_q_mr = T / 2;
+        if (n_q_mr > 64) n_q_mr = 64;
+        if (n_q_mr < 4) n_q_mr = 4;
+        if (n_q_mr > T) n_q_mr = T;
+        generate_cheap_qref(K_all, T, n_head_kv, d_k, n_q_mr, cheap_qref_mr);
+        Q_ref_mr = cheap_qref_mr.data();
+    }
 
     for (int round = 0; round < n_rounds; round++) {
-        // Use original Q_ref for all rounds
-        // This avoids using beta-distorted K as proxy queries
-        int n_q_round = n_q < cur_T ? n_q : cur_T;
+        int n_q_round = n_q_mr < cur_T ? n_q_mr : cur_T;
 
         kv_compact_result round_result = {};
-        int rc = kv_compact(cur_K.data(), cur_V.data(), Q_ref_all,
+        int rc = kv_compact(cur_K.data(), cur_V.data(), Q_ref_mr,
                            cur_T, n_q_round, n_head_kv, d_k, d_v,
                            params, &round_result);
         if (rc != 0) {
@@ -541,10 +700,8 @@ int kv_compact_multi_round(
     }
 
     // Compute final quality metrics against the ORIGINAL data
-    // result->beta from last round + result->C_v vs original K_all/V_all
-    // Use the original indices to find the right K rows
-    compute_quality_metrics(K_all, V_all, Q_ref_all,
-                           T, n_q, n_head_kv, d_k, d_v, result,
+    compute_quality_metrics(K_all, V_all, Q_ref_mr,
+                           T, n_q_mr, n_head_kv, d_k, d_v, result,
                            &result->stats);
 
     return 0;
