@@ -17,6 +17,15 @@
 LLAMA_SRC="${1:-_deps/llama_cpp-src}"
 PATCH_DIR="$(dirname "$0")"
 
+# Portable in-place sed (macOS sed -i requires '' as backup suffix)
+sed_i() {
+    if sed --version 2>/dev/null | grep -q GNU; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
 if [ ! -d "$LLAMA_SRC/tools/server" ]; then
     echo "Error: llama.cpp source not found at $LLAMA_SRC"
     echo "Usage: $0 [llama_cpp_src_dir]"
@@ -30,20 +39,20 @@ ARG_CPP="$LLAMA_SRC/common/arg.cpp"
 
 # --- 1. Patch server-context.cpp: add kv-compact-api.h include ---
 if ! grep -q "kv-compact-api.h" "$SERVER_CTX"; then
-    sed -i '/#include "server-context.h"/a #include "kv-compact-api.h"' "$SERVER_CTX"
+    sed_i '/#include "server-context.h"/a #include "kv-compact-api.h"' "$SERVER_CTX"
     echo "Patched: added kv-compact-api.h include"
 fi
 
 # --- 2. Patch server CMakeLists: link kv-compact-lib ---
 if ! grep -q "kv-compact-lib" "$SERVER_CMAKE"; then
-    sed -i '/target_link_libraries.*PUBLIC common mtmd/a \
+    sed_i '/target_link_libraries.*PUBLIC common mtmd/a \
 \n# KV compaction integration\nif(TARGET kv-compact-lib)\n    target_link_libraries(${TARGET} PUBLIC kv-compact-lib)\nendif()' "$SERVER_CMAKE"
     echo "Patched: linked kv-compact-lib to server"
 fi
 
 # --- 3. Patch common.h: add kv_compact_ratio parameter ---
 if ! grep -q "kv_compact_ratio" "$COMMON_H"; then
-    sed -i '/bool kv_unified.*=.*false;/a \
+    sed_i '/bool kv_unified.*=.*false;/a \
 \n    float kv_compact_ratio = 0.0f;  \/\/ KV compaction ratio (0.0 = disabled, 0.5 = keep 50%, etc.)' "$COMMON_H"
     echo "Patched: added kv_compact_ratio to common_params"
 fi

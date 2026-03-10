@@ -537,32 +537,21 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
 
     // ---- Step 1: Global key selection via max importance across heads ----
 
+    // Build combined K buffer: [K_all (T rows), Q_ref_all (n_q rows)]
+    // so refit_head_values can use K_combined[T:] as reference queries.
+    const int ref_start = T; // queries start right after original K data
+    std::vector<float> K_combined((size_t)(T + n_q) * n_embd_k_gqa);
+    memcpy(K_combined.data(), K_all, (size_t)T * n_embd_k_gqa * sizeof(float));
+    memcpy(K_combined.data() + (size_t)T * n_embd_k_gqa, Q_ref_all,
+           (size_t)n_q * n_embd_k_gqa * sizeof(float));
+
     // Compute per-head key importance scores, then take max across heads
     std::vector<float> global_scores(T, 0.0f);
-
-    // Per-head temporary data for reuse in steps 2-3
-    struct head_data {
-        std::vector<float> scores;      // [n_q, T] scaled attention logits
-        std::vector<float> exp_scores;  // [n_q, T] exp with max-shift
-        std::vector<float> row_sums;    // [n_q] sum of exp per query
-        std::vector<float> attn_weights;// [n_q, T] softmax attention
-    };
-    std::vector<head_data> hdata(n_head_kv);
-
     const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
 
     for (int h = 0; h < n_head_kv; h++) {
-        auto & hd = hdata[h];
-        hd.scores.resize(n_q * T);
-        hd.exp_scores.resize(n_q * T);
-        hd.row_sums.resize(n_q);
-        hd.attn_weights.resize(n_q * T);
+        std::vector<float> attn_weights(n_q * T);
 
-        // Extract per-head K and Q_ref slices
-        // K_head[i] = K_all[i * n_embd_k_gqa + h * d_k ... + (h+1)*d_k]
-        // Instead of extracting, compute Q_ref_h @ K_h^T directly
-
-        // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
         for (int qi = 0; qi < n_q; qi++) {
             const float * q_row = Q_ref_all + qi * n_embd_k_gqa + h * d_k;
             for (int ki = 0; ki < T; ki++) {
@@ -571,26 +560,18 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
                 for (int d = 0; d < d_k; d++) {
                     dot += q_row[d] * k_row[d];
                 }
-                hd.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                attn_weights[qi * T + ki] = dot * inv_sqrt_dk;
             }
         }
 
-        // Compute exp(scores) for mass computation
-        memcpy(hd.exp_scores.data(), hd.scores.data(), n_q * T * sizeof(float));
-        exp_rows_stable(hd.exp_scores.data(), hd.row_sums.data(), n_q, T);
+        softmax_rows(attn_weights.data(), n_q, T);
 
-        // Compute softmax for key scoring
-        memcpy(hd.attn_weights.data(), hd.scores.data(), n_q * T * sizeof(float));
-        softmax_rows(hd.attn_weights.data(), n_q, T);
-
-        // Per-key max attention weight across queries
         for (int j = 0; j < T; j++) {
             float max_w = 0.0f;
             for (int qi = 0; qi < n_q; qi++) {
-                float w = hd.attn_weights[qi * T + j];
+                float w = attn_weights[qi * T + j];
                 if (w > max_w) max_w = w;
             }
-            // Global score = max across heads
             if (max_w > global_scores[j]) {
                 global_scores[j] = max_w;
             }
@@ -608,51 +589,22 @@ KV_COMPACT_UNUSED static compacted_layer compact_layer_all_heads(
     result.selected_indices = selected;
 
     // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
-    // Q_ref_all is passed separately here, but refit_head_values expects
-    // queries to be a slice of K_all. Use the precomputed head data instead.
+    // Delegate to refit_head_values using the combined K buffer with Q_ref
+    // appended at position T. Pass T (not T_combined) so refit_head_values
+    // only iterates keys 0..T-1 (original positions) while reading queries
+    // from K_combined[T..T+n_q-1] (the appended Q_ref data).
 
     for (int h = 0; h < n_head_kv; h++) {
-        const auto & hd = hdata[h];
+        auto rr = refit_head_values(
+            K_combined.data(), V_all,
+            T, n_embd_k_gqa, n_embd_v_gqa,
+            h, d_k, d_v,
+            n_q, ref_start,
+            selected,
+            false /* use_beta_for_cv */);
 
-        result.beta[h].resize(t);
-        result.C_v[h].resize(t * d_v);
-
-        // NNLS for beta
-        std::vector<float> M(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int j = 0; j < t; j++) {
-                M[qi * t + j] = hd.exp_scores[qi * T + selected[j]];
-            }
-        }
-
-        std::vector<float> w(t);
-        nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
-
-        for (int j = 0; j < t; j++) {
-            result.beta[h][j] = logf(std::max(1e-12f, w[j]));
-        }
-
-        // Least squares for C_v (un-biased: no beta in softmax)
-        std::vector<float> X(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int j = 0; j < t; j++) {
-                X[qi * t + j] = hd.scores[qi * T + selected[j]];
-            }
-        }
-        softmax_rows(X.data(), n_q, t);
-
-        std::vector<float> Y(n_q * d_v, 0.0f);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int ki = 0; ki < T; ki++) {
-                float w_ij = hd.attn_weights[qi * T + ki];
-                const float * v_row = V_all + ki * n_embd_v_gqa + h * d_v;
-                for (int d = 0; d < d_v; d++) {
-                    Y[qi * d_v + d] += w_ij * v_row[d];
-                }
-            }
-        }
-
-        least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
+        result.beta[h] = std::move(rr.beta);
+        result.C_v[h]  = std::move(rr.C_v);
     }
 
     return result;

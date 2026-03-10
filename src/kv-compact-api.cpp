@@ -299,7 +299,12 @@ int kv_compact_sequence(
     size_t loaded = llama_state_seq_set_data(ctx, compacted_buf.data(),
                                               compacted_buf.size(), seq_id);
     if (loaded == 0) {
-        LOG_ERR("kv_compact: seq %d state restore failed\n", seq_id);
+        LOG_ERR("kv_compact: seq %d compacted state restore failed, restoring original\n", seq_id);
+        // Restore original state from the buffer we saved in step 1
+        size_t restored = llama_state_seq_set_data(ctx, state_buf.data(), saved, seq_id);
+        if (restored == 0) {
+            LOG_ERR("kv_compact: seq %d original state restore also failed!\n", seq_id);
+        }
         if (recr_saved > 0) {
             llama_state_seq_set_data_ext(ctx, recr_buf.data(), recr_buf.size(),
                                           seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
