@@ -441,6 +441,28 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Compute beta directions for K-modification (per layer, per head)
+    // Direction v satisfies: Q_ref_h @ v ≈ 1, so that
+    // q @ (k + beta * sqrt(d_k) * v) / sqrt(d_k) ≈ q @ k / sqrt(d_k) + beta
+    std::vector<std::vector<std::vector<float>>> beta_dirs(sd.n_layer);
+    for (uint32_t l = 0; l < sd.n_layer; l++) {
+        const auto & ld = sd.layers[l];
+        beta_dirs[l].resize(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            beta_dirs[l][h].resize(d_k);
+            // Extract Q_ref for this head
+            std::vector<float> Q_ref_head(n_ref_queries * d_k);
+            for (int qi = 0; qi < n_ref_queries; qi++) {
+                memcpy(Q_ref_head.data() + qi * d_k,
+                       ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k,
+                       d_k * sizeof(float));
+            }
+            compute_beta_direction(Q_ref_head.data(), n_ref_queries, d_k,
+                                   beta_dirs[l][h].data());
+        }
+    }
+    LOG_INF("Computed beta directions for %u layers × %d heads\n", sd.n_layer, n_head_kv);
+
     auto t_end = std::chrono::high_resolution_clock::now();
     double compact_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     LOG_INF("Compaction took %.1f ms (%.1f ms/layer)\n", compact_ms, compact_ms / sd.n_layer);
@@ -516,9 +538,10 @@ int main(int argc, char ** argv) {
     if (do_writeback) {
         LOG_INF("\n--- Phase 6: Write-back and generation ---\n");
 
-        // Build compacted state buffer
+        // Build compacted state buffer (with beta folded into K vectors)
         auto compacted_buf = build_compacted_state(
-            kv_state, shared_selected, cv_all, n_head_kv, d_k, d_v, n_pos_per_embd);
+            kv_state, shared_selected, cv_all, n_head_kv, d_k, d_v, n_pos_per_embd,
+            beta_all, beta_dirs);
 
         LOG_INF("Compacted state: %.2f MB (was %.2f MB, %.1fx smaller)\n",
                 compacted_buf.size() / (1024.0 * 1024.0),

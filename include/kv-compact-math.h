@@ -241,6 +241,50 @@ static void least_squares_solve(const float * A, const float * b, float * x,
 }
 
 // ============================================================================
+// Beta injection via K-vector modification
+// ============================================================================
+
+// Compute the optimal direction vector for encoding beta into K vectors.
+//
+// Given reference queries Q_ref [n_q × d_k], finds direction v [d_k] such that
+// Q_ref @ v ≈ 1 (minimizes ||Q_ref @ v - 1||^2 with ridge regularization).
+//
+// After computing v, modified keys k_j' = k_j + beta_j * sqrt(d_k) * v give:
+//   q @ k_j' / sqrt(d_k) = q @ k_j / sqrt(d_k) + beta_j * (q @ v)
+//
+// For queries where q @ v ≈ 1, this exactly reproduces the beta bias.
+static void compute_beta_direction(const float * Q_ref, int n_q, int d_k,
+                                   float * direction, float ridge = 1e-6f) {
+    std::vector<float> ones(n_q, 1.0f);
+    least_squares_solve(Q_ref, ones.data(), direction, n_q, d_k, 1, ridge);
+}
+
+// Apply beta biases to K vectors by modifying keys in-place.
+//
+// For each selected key j: k_j[head_offset..+d_k] += beta_j * sqrt(d_k) * direction
+//
+// K_all:            [cell_count × n_embd_k_gqa] — modified in-place
+// n_embd_k_gqa:     total K embedding size across all heads
+// selected_indices:  [t] which rows to modify
+// beta:             [t] per-selected-position bias for this head
+// direction:        [d_k] beta encoding direction for this head
+// d_k:              key dimension per head
+// head_offset:      starting column for this head's dimensions in K rows
+static void apply_beta_to_keys(float * K_all, int n_embd_k_gqa,
+                               const int * selected_indices, int t,
+                               const float * beta, const float * direction,
+                               int d_k, int head_offset) {
+    const float scale = sqrtf((float) d_k);
+    for (int j = 0; j < t; j++) {
+        float * k_row = K_all + selected_indices[j] * n_embd_k_gqa + head_offset;
+        const float b_scaled = beta[j] * scale;
+        for (int d = 0; d < d_k; d++) {
+            k_row[d] += b_scaled * direction[d];
+        }
+    }
+}
+
+// ============================================================================
 // Compaction algorithm types and implementation
 // ============================================================================
 

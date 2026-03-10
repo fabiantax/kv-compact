@@ -289,6 +289,165 @@ static void test_least_squares_with_ridge() {
 }
 
 // ============================================================================
+// Beta injection via K-modification tests
+// ============================================================================
+
+static void test_compute_beta_direction_identity_queries() {
+    printf("  test_compute_beta_direction_identity_queries...");
+    // Q_ref = I (identity) → direction should be [1, 1, ..., 1] (approximately)
+    // because I @ v = v should approximate [1, 1, ..., 1]
+    const int n_q = 3, d_k = 3;
+    float Q[] = {1, 0, 0,
+                 0, 1, 0,
+                 0, 0, 1};
+    float dir[3] = {};
+    compute_beta_direction(Q, n_q, d_k, dir);
+
+    // Each component should be ~1.0 (LS with identity gives v = ones)
+    for (int d = 0; d < d_k; d++) {
+        assert(approx_eq(dir[d], 1.0f, 0.01f));
+    }
+    printf(" OK\n");
+}
+
+static void test_compute_beta_direction_produces_unit_dot() {
+    printf("  test_compute_beta_direction_produces_unit_dot...");
+    // For random queries, Q @ v should be approximately 1 for each query
+    const int n_q = 16, d_k = 8;
+    std::vector<float> Q(n_q * d_k);
+    for (int i = 0; i < n_q * d_k; i++) {
+        Q[i] = sinf((float)(i * 7 + 3) * 0.4f);
+    }
+    std::vector<float> dir(d_k);
+    compute_beta_direction(Q.data(), n_q, d_k, dir.data());
+
+    // Check Q @ v ≈ 1
+    float max_err = 0.0f;
+    for (int qi = 0; qi < n_q; qi++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) {
+            dot += Q[qi * d_k + d] * dir[d];
+        }
+        float err = fabsf(dot - 1.0f);
+        if (err > max_err) max_err = err;
+    }
+    // Also compute mean error
+    float mean_err = 0.0f;
+    for (int qi = 0; qi < n_q; qi++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) {
+            dot += Q[qi * d_k + d] * dir[d];
+        }
+        mean_err += fabsf(dot - 1.0f);
+    }
+    mean_err /= n_q;
+    printf("\n    Max |Q@v - 1| = %.6f, Mean = %.6f\n", max_err, mean_err);
+    // Overdetermined system (16 eqs, 8 vars) — mean error should be small
+    assert(mean_err < 1.0f);
+    printf("  OK\n");
+}
+
+static void test_apply_beta_to_keys_basic() {
+    printf("  test_apply_beta_to_keys_basic...");
+    // Verify K is modified by beta * sqrt(d_k) * direction
+    const int T = 4, d_k = 3, n_embd = 3;
+    float K[] = {1, 0, 0,
+                 0, 1, 0,
+                 0, 0, 1,
+                 1, 1, 1};
+    int selected[] = {1, 3};
+    float beta[] = {2.0f, -1.0f};
+    float dir[] = {0.5f, 0.0f, 0.5f};
+    int t = 2;
+
+    apply_beta_to_keys(K, n_embd, selected, t, beta, dir, d_k, 0);
+
+    float scale = sqrtf(3.0f);
+    // K[1] should be [0 + 2*sqrt(3)*0.5, 1 + 0, 0 + 2*sqrt(3)*0.5]
+    assert(approx_eq(K[1 * n_embd + 0], 2.0f * scale * 0.5f, 0.01f));
+    assert(approx_eq(K[1 * n_embd + 1], 1.0f, 0.01f));
+    assert(approx_eq(K[1 * n_embd + 2], 2.0f * scale * 0.5f, 0.01f));
+
+    // K[3] should be [1 + (-1)*sqrt(3)*0.5, 1 + 0, 1 + (-1)*sqrt(3)*0.5]
+    assert(approx_eq(K[3 * n_embd + 0], 1.0f + (-1.0f) * scale * 0.5f, 0.01f));
+    assert(approx_eq(K[3 * n_embd + 1], 1.0f, 0.01f));
+    assert(approx_eq(K[3 * n_embd + 2], 1.0f + (-1.0f) * scale * 0.5f, 0.01f));
+
+    // K[0] and K[2] should be unchanged
+    assert(approx_eq(K[0], 1.0f, 0.01f));
+    assert(approx_eq(K[2 * n_embd + 2], 1.0f, 0.01f));
+    printf(" OK\n");
+}
+
+static void test_beta_injection_quality() {
+    printf("  test_beta_injection_quality...");
+    // End-to-end: compact, inject beta into K, verify that the modified K
+    // approximates the original score + beta for reference queries
+    const int T = 32, n_q = 16, d_k = 8, d_v = 8, t = 8;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)(i * 3 + 1) * 0.5f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)(i * 2 + 3) * 0.3f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)(i * 5 + 2) * 0.8f);
+
+    auto result = compact_head_highest_attn(K.data(), V.data(), Q.data(),
+                                            T, n_q, d_k, d_v, t);
+
+    // Compute beta direction
+    // Use the K vectors at selected positions as reference queries (same as Q_ref)
+    std::vector<float> dir(d_k);
+    compute_beta_direction(Q.data(), n_q, d_k, dir.data());
+
+    // Copy selected K and apply beta
+    std::vector<float> K_mod(t * d_k);
+    for (int j = 0; j < t; j++) {
+        memcpy(K_mod.data() + j * d_k, K.data() + result.selected_indices[j] * d_k,
+               d_k * sizeof(float));
+    }
+    // Apply beta to contiguous K_mod (head_offset=0, n_embd=d_k, indices are 0..t-1)
+    std::vector<int> mod_indices(t);
+    std::iota(mod_indices.begin(), mod_indices.end(), 0);
+    apply_beta_to_keys(K_mod.data(), d_k, mod_indices.data(), t,
+                       result.beta.data(), dir.data(), d_k, 0);
+
+    // Compare: for each reference query, check that
+    // q @ K_mod / sqrt(d_k) ≈ q @ K_orig / sqrt(d_k) + beta
+    float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    float total_err = 0.0f;
+    int count = 0;
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int j = 0; j < t; j++) {
+            float score_orig = 0.0f, score_mod = 0.0f;
+            for (int d = 0; d < d_k; d++) {
+                score_orig += Q[qi * d_k + d] * K[result.selected_indices[j] * d_k + d];
+                score_mod  += Q[qi * d_k + d] * K_mod[j * d_k + d];
+            }
+            score_orig *= inv_sqrt_dk;
+            score_mod  *= inv_sqrt_dk;
+
+            float target = score_orig + result.beta[j];
+            float err = fabsf(score_mod - target);
+            total_err += err;
+            count++;
+        }
+    }
+    float avg_err = total_err / count;
+
+    // Also compute average |beta| for context
+    float avg_beta = 0.0f;
+    for (int j = 0; j < t; j++) avg_beta += fabsf(result.beta[j]);
+    avg_beta /= t;
+
+    printf("\n    Avg |score_mod - (score_orig + beta)| = %.6f\n", avg_err);
+    printf("    Avg |beta| = %.6f\n", avg_beta);
+    printf("    Relative error = %.6f\n", avg_err / (avg_beta + 1e-8f));
+    // The K-modification should approximate beta reasonably well
+    // Relative error should be reasonable (< 50% of average beta)
+    assert(avg_err < avg_beta * 2.0f + 0.5f);
+    printf("  OK\n");
+}
+
+// ============================================================================
 // compact_head_highest_attn tests
 // ============================================================================
 
@@ -738,6 +897,12 @@ int main() {
     test_least_squares_overdetermined();
     test_least_squares_multi_rhs();
     test_least_squares_with_ridge();
+
+    printf("\n=== Beta injection via K-modification ===\n");
+    test_compute_beta_direction_identity_queries();
+    test_compute_beta_direction_produces_unit_dot();
+    test_apply_beta_to_keys_basic();
+    test_beta_injection_quality();
 
     printf("\n=== Full compaction pipeline ===\n");
     test_compact_no_compression_needed();

@@ -344,20 +344,27 @@ static uint16_t f32_to_f16(float val) {
 // Build a compacted state buffer from original parsed state + compaction results
 //
 // For each layer:
-//   - K: copy original K rows for selected indices only
+//   - K: copy original K rows for selected indices, optionally modified with beta
 //   - V: write C_v (refitted values) for each head at selected positions
 //
 // selected_indices: [t] shared across all heads within a layer
-// cv_per_head: [n_head_kv][t * d_v] refitted values per head
+// cv_all:  [layer][head] = vector<float> of [t * d_v] (refitted values)
+// beta_all: [layer][head] = vector<float> of [t] (attention biases)
+//           If empty, no beta modification is applied to K.
+// beta_dirs: [layer][head] = vector<float> of [d_k] (beta encoding directions)
+//           Required when beta_all is non-empty.
 //
 // Returns the new state buffer ready for llama_state_seq_set_data()
 static std::vector<uint8_t> build_compacted_state(
         const parsed_kv_state & state,
         const std::vector<int> & selected_indices,
-        // Per-layer, per-head C_v: cv_all[layer][head] = vector<float> of [t * d_v]
         const std::vector<std::vector<std::vector<float>>> & cv_all,
         int n_head_kv, int d_k, int d_v,
-        uint32_t n_pos_per_embd = 1) {
+        uint32_t n_pos_per_embd = 1,
+        const std::vector<std::vector<std::vector<float>>> & beta_all = {},
+        const std::vector<std::vector<std::vector<float>>> & beta_dirs = {}) {
+
+    const bool has_beta = !beta_all.empty() && !beta_dirs.empty();
 
     const int t = (int) selected_indices.size();
 
@@ -416,19 +423,44 @@ static std::vector<uint8_t> build_compacted_state(
 
             const int n_embd_k = ld.n_embd_k_gqa();
 
-            // Write selected K rows
+            // Write selected K rows, optionally with beta folded in
             for (int j = 0; j < t; j++) {
                 int orig_idx = selected_indices[j];
-                const float * k_row = ld.K.data() + orig_idx * n_embd_k;
 
-                if (ld.k_type == KV_COMPACT_GGML_TYPE_F32) {
-                    write(k_row, n_embd_k * sizeof(float));
-                } else if (ld.k_type == KV_COMPACT_GGML_TYPE_F16) {
-                    std::vector<uint16_t> tmp(n_embd_k);
-                    for (int d = 0; d < n_embd_k; d++) {
-                        tmp[d] = f32_to_f16(k_row[d]);
+                if (has_beta && l < (uint32_t)beta_all.size()) {
+                    // Copy K row and apply beta modification per head
+                    std::vector<float> k_mod(ld.K.data() + orig_idx * n_embd_k,
+                                             ld.K.data() + (orig_idx + 1) * n_embd_k);
+                    const float scale = sqrtf((float) d_k);
+                    for (int h = 0; h < n_head_kv; h++) {
+                        const float b_scaled = beta_all[l][h][j] * scale;
+                        const float * dir = beta_dirs[l][h].data();
+                        for (int d = 0; d < d_k; d++) {
+                            k_mod[h * d_k + d] += b_scaled * dir[d];
+                        }
                     }
-                    write(tmp.data(), n_embd_k * sizeof(uint16_t));
+
+                    if (ld.k_type == KV_COMPACT_GGML_TYPE_F32) {
+                        write(k_mod.data(), n_embd_k * sizeof(float));
+                    } else if (ld.k_type == KV_COMPACT_GGML_TYPE_F16) {
+                        std::vector<uint16_t> tmp(n_embd_k);
+                        for (int d = 0; d < n_embd_k; d++) {
+                            tmp[d] = f32_to_f16(k_mod[d]);
+                        }
+                        write(tmp.data(), n_embd_k * sizeof(uint16_t));
+                    }
+                } else {
+                    const float * k_row = ld.K.data() + orig_idx * n_embd_k;
+
+                    if (ld.k_type == KV_COMPACT_GGML_TYPE_F32) {
+                        write(k_row, n_embd_k * sizeof(float));
+                    } else if (ld.k_type == KV_COMPACT_GGML_TYPE_F16) {
+                        std::vector<uint16_t> tmp(n_embd_k);
+                        for (int d = 0; d < n_embd_k; d++) {
+                            tmp[d] = f32_to_f16(k_row[d]);
+                        }
+                        write(tmp.data(), n_embd_k * sizeof(uint16_t));
+                    }
                 }
             }
         }
