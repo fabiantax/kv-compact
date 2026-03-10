@@ -147,6 +147,66 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
     }
 }
 
+// Beta fitting strategy for mass matching (Step 2)
+enum beta_fit_mode {
+    BETA_FIT_NNLS     = 0,  // Projected gradient NNLS (original)
+    BETA_FIT_SINKHORN = 1,  // Sinkhorn multiplicative updates (OT-inspired)
+};
+
+// Solve non-negative mass matching via Sinkhorn-like multiplicative updates:
+//   Given M (m x n) with M_ij >= 0 and target b (m) with b_i > 0,
+//   find w (n) with w_j > 0 such that M * w ≈ b.
+//
+// Multiplicative update: w ← w ⊙ (M^T (b / (M w))) / m
+// This automatically maintains non-negativity and is equivalent to
+// minimizing KL(b || M w) — the entropic OT objective.
+//
+// The entropic regularization (eps) prevents degenerate solutions
+// by adding eps * sum(w * log(w)) to the objective.
+//
+static void sinkhorn_beta_fit(const float * M, const float * b, float * w,
+                              int m, int n, int max_iter = 100, float eps = 0.01f) {
+    // Initialize w uniformly
+    for (int j = 0; j < n; j++) {
+        w[j] = 1.0f;
+    }
+
+    std::vector<float> Mw(m);
+    std::vector<float> ratio(m);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        // Compute M * w
+        for (int i = 0; i < m; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < n; j++) {
+                sum += M[i * n + j] * w[j];
+            }
+            Mw[i] = sum;
+        }
+
+        // Compute ratio = b / (M * w)
+        for (int i = 0; i < m; i++) {
+            ratio[i] = b[i] / (Mw[i] + 1e-12f);
+        }
+
+        // Multiplicative update: w ← w * (M^T * ratio) / (M^T * 1)
+        // The denominator (column sums of M) normalizes for column scale.
+        // Entropic damping: raise the update factor to 1/(1+eps) to
+        // prevent degenerate solutions where all mass goes to one key.
+        float exp_factor = 1.0f / (1.0f + eps);
+        for (int j = 0; j < n; j++) {
+            float num = 0.0f, den = 0.0f;
+            for (int i = 0; i < m; i++) {
+                num += M[i * n + j] * ratio[i];
+                den += M[i * n + j];
+            }
+            float update = num / (den + 1e-12f);
+            w[j] *= powf(std::max(1e-12f, update), exp_factor);
+            w[j] = std::max(1e-12f, w[j]);
+        }
+    }
+}
+
 // Solve least squares: min ||A*x - b||^2 via normal equations
 // A is (m x n), b is (m x p), x is (n x p)
 // Uses Cholesky-like approach: x = (A^T A)^{-1} A^T b
@@ -527,7 +587,8 @@ static compacted_head compact_head_highest_attn(
         const float * K, const float * V, const float * Q_ref,
         int T, int n_q, int d_k, int d_v, int t,
         int n_alt_rounds = 2,
-        key_select_mode select_mode = KEY_SELECT_MAX_ATTN) {
+        key_select_mode select_mode = KEY_SELECT_MAX_ATTN,
+        beta_fit_mode   fit_mode   = BETA_FIT_NNLS) {
 
     compacted_head result;
     result.selected_indices.resize(t);
@@ -607,7 +668,11 @@ static compacted_head compact_head_highest_attn(
     }
 
     std::vector<float> w(t);
-    nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
+    if (fit_mode == BETA_FIT_SINKHORN) {
+        sinkhorn_beta_fit(M.data(), row_sums.data(), w.data(), n_q, t);
+    } else {
+        nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
+    }
 
     for (int j = 0; j < t; j++) {
         result.beta[j] = logf(std::max(1e-12f, w[j]));
@@ -752,7 +817,8 @@ static compacted_layer compact_layer_all_heads(
         int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
         const float * head_sensitivity = nullptr,
         int n_alt_rounds = 2,
-        key_select_mode select_mode = KEY_SELECT_MAX_ATTN) {
+        key_select_mode select_mode = KEY_SELECT_MAX_ATTN,
+        beta_fit_mode   fit_mode    = BETA_FIT_NNLS) {
 
     compacted_layer result;
     result.n_head_kv = n_head_kv;
@@ -953,7 +1019,11 @@ static compacted_layer compact_layer_all_heads(
         }
 
         std::vector<float> w(t);
-        nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+        if (fit_mode == BETA_FIT_SINKHORN) {
+            sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+        } else {
+            nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+        }
 
         for (int j = 0; j < t; j++) {
             result.beta[h][j] = logf(std::max(1e-12f, w[j]));

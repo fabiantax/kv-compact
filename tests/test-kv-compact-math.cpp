@@ -2000,6 +2000,166 @@ static void test_token_merge_preserves_info_vs_eviction() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Sinkhorn beta fitting tests
+// ============================================================================
+
+static void test_sinkhorn_basic_mass_matching() {
+    printf("  test_sinkhorn_basic_mass_matching...");
+
+    // Simple case: M = identity, b = [2, 3, 5] → w should be ≈ [2, 3, 5]
+    const int m = 3, n = 3;
+    float M[9] = {
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+    };
+    float b[3] = {2.0f, 3.0f, 5.0f};
+    float w[3];
+
+    sinkhorn_beta_fit(M, b, w, m, n, 500, 0.001f);
+
+    // Check M*w ≈ b (mass conservation), not w ≈ b (Sinkhorn matches mass, not weights)
+    float Mw[3] = {0};
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++)
+            Mw[i] += M[i * n + j] * w[j];
+
+    for (int i = 0; i < m; i++) {
+        assert(fabsf(Mw[i] - b[i]) / b[i] < 0.15f);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_sinkhorn_produces_nonnegative() {
+    printf("  test_sinkhorn_produces_nonnegative...");
+
+    const int m = 8, n = 5;
+    std::vector<float> M(m * n), b(m);
+
+    // Random-ish non-negative M and positive b
+    for (int i = 0; i < m * n; i++) M[i] = 0.5f + 0.5f * sinf((float)i * 1.7f);
+    for (int i = 0; i < m; i++) b[i] = 1.0f + cosf((float)i * 0.9f);
+
+    std::vector<float> w(n);
+    sinkhorn_beta_fit(M.data(), b.data(), w.data(), m, n);
+
+    for (int j = 0; j < n; j++) {
+        assert(w[j] > 0.0f);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_sinkhorn_vs_nnls_quality() {
+    printf("  test_sinkhorn_vs_nnls_quality...");
+
+    // Compare Sinkhorn vs NNLS on a realistic mass-matching problem
+    const int T = 20, n_q = 10, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto r_nnls = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_NNLS);
+
+    auto r_sink = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_SINKHORN);
+
+    // Compute output MSE for both
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    auto compute_mse = [&](const compacted_head & res) -> float {
+        float total_err = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            // Original output
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[j * d_k + d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+            // Compacted output
+            std::vector<float> comp_scores(t);
+            for (int j = 0; j < t; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[res.selected_indices[j] * d_k + d];
+                comp_scores[j] = dot * inv_sqrt_dk + res.beta[j];
+            }
+            softmax_rows(comp_scores.data(), 1, t);
+            std::vector<float> comp_out(d_v, 0.0f);
+            for (int j = 0; j < t; j++)
+                for (int d = 0; d < d_v; d++)
+                    comp_out[d] += comp_scores[j] * res.C_v[j * d_v + d];
+
+            for (int d = 0; d < d_v; d++) {
+                float e = orig_out[d] - comp_out[d];
+                total_err += e * e;
+            }
+        }
+        return total_err / (n_q * d_v);
+    };
+
+    float mse_nnls = compute_mse(r_nnls);
+    float mse_sink = compute_mse(r_sink);
+
+    printf("\n    MSE: nnls=%.8f  sinkhorn=%.8f", mse_nnls, mse_sink);
+
+    // Both should produce finite, reasonable results
+    assert(std::isfinite(mse_nnls));
+    assert(std::isfinite(mse_sink));
+    // Sinkhorn should be in the same ballpark (within 100x)
+    assert(mse_sink < mse_nnls * 100.0f + 1e-6f);
+
+    printf(" OK\n");
+}
+
+static void test_sinkhorn_multi_head() {
+    printf("  test_sinkhorn_multi_head...");
+
+    const int T = 16, n_q = 6, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (int i = 0; i < T * n_embd_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto result = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
+        nullptr, 2, KEY_SELECT_MAX_ATTN, BETA_FIT_SINKHORN);
+
+    assert((int)result.selected_indices.size() == t);
+    assert(result.n_head_kv == n_head_kv);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.beta[h].size() == t);
+        assert((int)result.C_v[h].size() == t * d_v);
+
+        // Beta should be finite
+        for (int j = 0; j < t; j++) {
+            assert(std::isfinite(result.beta[h][j]));
+        }
+    }
+
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -2080,6 +2240,12 @@ int main() {
     test_token_merge_single_head_compaction();
     test_token_merge_multi_head_compaction();
     test_token_merge_preserves_info_vs_eviction();
+
+    printf("\n=== Sinkhorn beta fitting ===\n");
+    test_sinkhorn_basic_mass_matching();
+    test_sinkhorn_produces_nonnegative();
+    test_sinkhorn_vs_nnls_quality();
+    test_sinkhorn_multi_head();
 
     printf("\nAll tests passed!\n");
     return 0;
