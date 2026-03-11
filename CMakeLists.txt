@@ -18,6 +18,9 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(bench-synthetic tests/bench-synthetic.cpp)
     target_link_libraries(bench-synthetic PRIVATE kv-compact-math)
+
+    add_executable(test-kv-compact-adapter tests/test-kv-compact-adapter.cpp)
+    target_link_libraries(test-kv-compact-adapter PRIVATE kv-compact-math)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
