@@ -3,12 +3,25 @@
 // Pure CPU float32 linear algebra routines used by the compaction algorithm.
 // Extracted for testability.
 //
-// Paper: "KV Cache Compaction via Attention Matching"
-//   Step 1 (Key Selection): select t keys from T (Section 3.1)
-//   Step 2 (Beta Fitting):  fit attention mass biases (Section 3.2)
-//   Step 3 (Value Refitting): least-squares value reconstruction (Section 3.3)
+// Paper: "Fast KV Compaction via Attention Matching" (arXiv:2602.16284)
+//        Zweiger, Fu, Guo, Kim — MIT, Feb 2026
+//        See: docs/attention-matching-paper.md
 //
-// Additional algorithms from docs/adjacent-concepts.md:
+// Paper pipeline (all implemented):
+//   Step 1 (Key Selection):    select t keys from T       — Paper §3, Approach A
+//   Step 2 (Beta Fitting):     NNLS attention mass biases  — Paper §3
+//   Step 3 (Value Refitting):  least-squares C_v           — Paper §3
+//   Nonuniform head budgets:   per-head sensitivity        — Paper §5
+//   Attention bias injection:  β into softmax              — Paper §2, §8
+//
+// Paper pipeline (NOT implemented):
+//   OMP key selection:         Approach B (greedy+NNLS)    — Paper §3 (expensive, 104-565s)
+//   Reference query gen:       repeat-prefill / self-study — Paper §4 (requires model inference)
+//   On-policy compaction:      layer-sequential Q_ref      — Paper §4
+//   Greedy budget exchange:    precomputed per-model       — Paper §5 (requires calibration data)
+//   Online compaction:         compress-during-generation  — Paper §7 (requires runtime hooks)
+//
+// Additional algorithms from docs/adjacent-concepts.md (all implemented):
 //   - Submodular key selection (Sec 21, BumbleBee — COLM 2024)
 //   - Token merging          (Sec 20, ToMe — Bolya et al. 2023)
 //   - K-means centroid keys  (Sec 16, Lloyd's algorithm)
