@@ -421,7 +421,7 @@ int kv_compact(
         }
 
         std::vector<float> w(t);
-        nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q, t, p.nnls_max_iter);
+        nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
 
         for (int j = 0; j < t; j++) {
             beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
