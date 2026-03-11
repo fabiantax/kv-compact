@@ -137,6 +137,54 @@ kv_compact_result_free(&result);
 - Diversity selection: cosine similarity 0.998 → 0.9999
 - Cheap Q_ref: 10x faster (44ms vs 435ms), equivalent quality
 
+## Development Timeline & Roadmap
+
+```mermaid
+timeline
+    title kv-compact Development Timeline
+
+    section Phase 0 — Foundation
+        Mar 9 : Core algorithm (arXiv 2602.16284)
+               : State parser/writer + IMROPE support
+               : Beta injection via K-vector modification
+
+    section Phase 1 — Core Pipeline
+        Mar 10 : Sensitivity-weighted budget (US-5)
+               : Quantized KV support (Q8_0, Q4_0, Q4_1)
+               : C library API (US-8)
+               : Multi-round compaction (US-9)
+               : Iterative refinement
+               : Diversity selection + shared prefix
+               : Cheap Q_ref (K-vector proxy)
+               : ROCm/HIP acceleration (gfx1151)
+               : Automated quality benchmarks (US-10)
+               : Per-phase memory/latency profiling
+
+    section Phase 2 — Model Validation
+        Mar 11 : Algorithm documentation + paper traceability
+               : Real-model benchmark (Qwen3-0.6B)
+               : Thread-parallel per-layer compaction
+               : Hybrid layer awareness (A1)
+               : Layer filter API (periodic, explicit, auto-detect)
+
+    section Phase 3 — Scale (planned)
+        Planned : R-KV reasoning token compression (A4)
+                : Cross-layer KV sharing via SVD (A2)
+                : Shared prompt KV cache (CoW) (C2)
+                : Config-driven model adaptation
+```
+
+### Status
+
+| Phase | Status | Features |
+|-------|--------|----------|
+| **0** Foundation | Done | Core algorithm, state parser, beta injection |
+| **1** Core pipeline | Done | NNLS, diversity, shared prefix, cheap Q_ref, multi-round, API, ROCm |
+| **2** Model validation | Done | Real-model benchmarks, hybrid layer awareness, thread-parallel |
+| **3** Scale | Planned | R-KV reasoning compression, cross-layer sharing, shared prompt cache |
+
+See [docs/prioritization-frameworks.md](docs/prioritization-frameworks.md) for detailed RICE/WSJF/Kano/ROI scoring of all features.
+
 ## Paper
 
 > **Fast KV Compaction via Attention Matching**
