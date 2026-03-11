@@ -28,6 +28,7 @@ Each step is convex or closed-form. No gradient descent needed — the entire pi
 | **ROCm/HIP acceleration** | Tiled matmul for AMD APUs (gfx1151 / RDNA 3.5) |
 | **Sensitivity weighting** | Per-head budget allocation based on compression sensitivity |
 | **Iterative refinement** | Swap worst keys and re-solve for higher quality |
+| **Hybrid layer awareness** | Layer filter for MoE/hybrid models (Qwen 3.5, etc.) — skips non-attention layers |
 
 ## Quality
 
@@ -47,7 +48,7 @@ src/kv-compact-api.cpp           # API implementation
 src/kv-compact-hip.hip           # ROCm/HIP GPU kernels
 src/kv-compact.cpp               # CLI tool (requires llama.cpp)
 tests/test-kv-compact-math.cpp   # 12 math unit tests + 10 benchmarks
-tests/test-kv-compact-api.cpp    # 17 API integration tests
+tests/test-kv-compact-api.cpp    # 23 API integration tests
 docs/ALGORITHM.md                # Algorithm documentation
 docs/                            # Research notes and design docs
 ```
@@ -90,7 +91,14 @@ Targets gfx1151 (RDNA 3.5). Uses unified memory on APUs — no host-device copie
 ### Usage
 
 ```bash
+# Standard transformer
 ./llama-kv-compact -m model.gguf -p "your context..." --compact-ratio 0.2
+
+# Hybrid model (e.g., Qwen 3.5 with DeltaNet + attention every 4th layer)
+./llama-kv-compact -m qwen3.5.gguf -p "..." --compact-ratio 0.2 --attention-interval 4
+
+# Explicit attention layer list
+./llama-kv-compact -m model.gguf -p "..." --compact-ratio 0.2 --attention-layers 3,7,11,15,19,23,27,31,35,39
 ```
 
 ## C API
@@ -98,27 +106,33 @@ Targets gfx1151 (RDNA 3.5). Uses unified memory on APUs — no host-device copie
 ```c
 #include "kv-compact-api.h"
 
-kv_compact_params params = kv_compact_default_params();
+kv_compact_params params = kv_compact_params_default();
 params.target_ratio      = 0.5f;   // keep 50% of tokens
 params.use_diversity     = 1;      // diversity-aware selection
 params.diversity_strength = 0.5f;
 params.n_shared_prefix   = 128;    // preserve shared prompt
 
-kv_compact_result * result = kv_compact(
-    K, V, Q_ref, n_tokens, n_q, n_head_kv, d_k, d_v, &params
-);
+// For hybrid models: filter to attention-only layers
+params.layer_filter      = kv_layer_filter_periodic;
+params.layer_filter_data = (void *)(intptr_t)4;  // every 4th layer
 
-// result->selected_indices[i]  — which tokens were kept
-// result->beta[head][i]        — attention biases
-// result->C_v[head][i*d_v...]  — refitted values
-// result->stats                — quality metrics + timing
+kv_compact_result result = {};
+int rc = kv_compact(K, V, Q_ref, n_tokens, n_q, n_head_kv, d_k, d_v, &params, &result);
 
-kv_compact_free(result);
+// result.selected_indices[i]  — which tokens were kept
+// result.beta[head][i]        — attention biases
+// result.C_v[head][i*d_v...]  — refitted values
+// result.stats                — quality metrics + timing
+
+// Check if a layer should be compacted (for multi-layer loops)
+if (kv_compact_should_compact_layer(&params, layer_idx, n_layers)) { ... }
+
+kv_compact_result_free(&result);
 ```
 
 ## Test results
 
-- **29 tests** (12 math + 17 API) all passing
+- **35 tests** (12 math + 23 API) all passing
 - Value refitting: ~4,000,000x MSE improvement over token eviction at 4x compression
 - Diversity selection: cosine similarity 0.998 → 0.9999
 - Cheap Q_ref: 10x faster (44ms vs 435ms), equivalent quality
