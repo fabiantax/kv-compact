@@ -4,6 +4,11 @@
 // structured per-layer, per-head K/V data (as float32), and writes
 // compacted state buffers back in the same format.
 //
+// The compacted state keeps original K rows at selected positions (C_k ⊂ K)
+// but replaces V with refitted C_v from the least-squares step (paper §3.3).
+// This asymmetry exists because key selection preserves the attention score
+// computation exactly, while value refitting minimizes the output error.
+//
 // State format (per stream):
 //   [n_stream:u32]
 //   per stream:
@@ -349,9 +354,9 @@ KV_COMPACT_UNUSED static uint16_t f32_to_f16(float val) {
 
 // Build a compacted state buffer from original parsed state + compaction results
 //
-// For each layer:
-//   - K: copy original K rows for selected indices only
-//   - V: write C_v (refitted values) for each head at selected positions
+// For each layer (paper Section 3, algorithms.md §9.3):
+//   - K: copy original K rows at selected indices (C_k ⊂ K, exact subset)
+//   - V: write C_v (refitted values from least-squares, paper §3.3)
 //
 // selected_indices: [t] shared across all heads within a layer
 // cv_per_head: [n_head_kv][t * d_v] refitted values per head

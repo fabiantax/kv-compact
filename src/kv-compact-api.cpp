@@ -1,12 +1,17 @@
 // KV Cache Compaction API — implementation
 //
+// Implements "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+// https://arxiv.org/abs/2602.16284
+//
 // Uses attention-matching importance scoring to select which KV positions to
 // keep, then refits the compacted values via least-squares optimization.
 //
+// Pipeline (paper Section 3, algorithms.md §2):
+//   importance scoring → NNLS bias fitting → least-squares value refitting
+//   → state rebuild via llama_state_seq_set_data()
+//
 // All models (pure attention and hybrid SSM+attention) go through the same
-// refitting pipeline: importance scoring → NNLS bias fitting → least-squares
-// value refitting → state rebuild via llama_state_seq_set_data().
-// Hybrid models additionally save/restore recurrent state separately.
+// refitting pipeline. Hybrid models additionally save/restore recurrent state.
 
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
@@ -72,7 +77,10 @@ float kv_compact_suggest_ratio(
 // Importance scoring
 // ============================================================================
 
-// Score importance of each KV position using attention matching.
+// Score importance of each KV position using attention matching (paper §3.1).
+// Per-key importance = max softmax attention weight across all reference queries
+// and all layers/heads (algorithms.md §3.3). Uses K vectors from the last
+// n_ref positions as proxy queries (simplest reference query strategy, paper §4).
 static int score_importance(
     const parsed_kv_state::stream_data & sd,
     int n_head_kv,
@@ -184,12 +192,12 @@ int kv_compact_sequence(
     if (n_ref <= 0) n_ref = std::max(16, T / 4);
     n_ref = std::min(n_ref, T);
 
-    // Step 3: Importance scoring
+    // Step 3: Importance scoring (paper §3.1, algorithms.md §3)
     std::vector<float> global_importance;
     int scored_layers = score_importance(sd, n_head_kv, n_ref, global_importance);
     if (scored_layers == 0) return -1;
 
-    // Step 4: Select top-t positions
+    // Step 4: Select top-t positions (paper §3.1, algorithms.md §3.4)
     if (params.n_keep > 0) {
         for (int i = 0; i < std::min(params.n_keep, T); i++) {
             global_importance[i] = 1e30f;
@@ -213,8 +221,9 @@ int kv_compact_sequence(
     }
 
     // Step 5: Per-layer, per-head NNLS bias + least-squares value refitting
+    //         (paper §3.2-3.3, algorithms.md §4-5)
     //         C_v is fitted with un-biased softmax so it works at inference time
-    //         (betas are not stored in the state format).
+    //         (betas are not stored in the state format — see algorithms.md §12.1).
     const int ref_start_refit = std::max(0, T - n_ref);
 
     std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);

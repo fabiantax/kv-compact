@@ -1,7 +1,16 @@
-// KV Cache Compaction via Attention Matching - Math Utilities
+// KV Cache Compaction via Attention Matching — Math Utilities
 //
-// Pure CPU float32 linear algebra routines used by the compaction algorithm.
-// Extracted for testability.
+// Pure CPU float32 linear algebra routines for the compaction algorithm from:
+//   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+//   https://arxiv.org/abs/2602.16284
+//
+// Implements the three-step compaction pipeline (paper Section 3):
+//   Step 1: Key selection via max softmax attention (Section 3.1)
+//   Step 2: NNLS bias fitting for attention mass preservation (Section 3.2)
+//   Step 3: Least-squares value refitting for output preservation (Section 3.3)
+//
+// See docs/algorithms.md for detailed algorithm descriptions with equations.
+// Header-only, no dependencies — extracted for standalone testing.
 
 #pragma once
 
@@ -47,7 +56,8 @@ KV_COMPACT_UNUSED static void mat_mul_AtB(const float * A, const float * B, floa
     }
 }
 
-// Softmax over rows: input (m x n), output (m x n), in-place safe
+// Softmax over rows: softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))
+// Uses max-shift for numerical stability (paper Section 3.1, algorithms.md §7.1)
 static void softmax_rows(float * data, int m, int n) {
     for (int i = 0; i < m; i++) {
         float * row = data + i * n;
@@ -85,10 +95,15 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
     }
 }
 
-// Solve non-negative least squares via projected gradient descent:
+// Non-negative least squares via projected gradient descent (paper Section 3.2)
 //   min_{w >= 0} ||A*w - b||^2
-// A is (m x n), b is (m), w is (n)
-// Returns solution in w
+//
+// Used for attention mass matching: M @ w ≈ row_sums, where w = exp(beta).
+// M[i,j] = exp(q_i · k_selected_j / √d_k), b[i] = sum_j exp(q_i · k_j / √d_k).
+// Step size: 1/trace(A^T A), a conservative bound on 1/λ_max (algorithms.md §4.4).
+// Floor at 1e-12 prevents log(0) when converting w → beta = log(w) (§7.5).
+//
+// A is (m x n), b is (m), w is (n). Returns solution in w.
 static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200) {
     // Precompute A^T * A and A^T * b
     std::vector<float> AtA(n * n);
@@ -146,10 +161,15 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
     }
 }
 
-// Solve least squares: min ||A*x - b||^2 via normal equations
-// A is (m x n), b is (m x p), x is (n x p)
-// Uses Cholesky-like approach: x = (A^T A)^{-1} A^T b
-// For simplicity, uses pseudo-inverse via regularized normal equations
+// Least squares for value refitting via regularized normal equations (paper Section 3.3)
+//   min ||A*x - b||^2  →  x = (A^T A + λI)^{-1} A^T b
+//
+// Used to find C_v such that softmax(q·K_selected/√d_k) · C_v ≈ original output.
+// A = compacted attention weights [n_q, t], b = original attention output [n_q, d_v].
+// Gaussian elimination with partial pivoting (algorithms.md §5.4).
+// Ridge λ=1e-6 stabilizes ill-conditioned systems without distortion (§5.5).
+//
+// A is (m x n), b is (m x p), x is (n x p).
 static void least_squares_solve(const float * A, const float * b, float * x,
                                 int m, int n, int p, float ridge = 1e-6f) {
     // Compute AtA = A^T * A  (n x n)
@@ -257,10 +277,16 @@ struct refit_head_result {
 };
 
 // Refit a single head's values for a given set of selected key positions.
+// Implements paper Steps 2-3 (algorithms.md §4-5) for one head.
 //
-// Given global key selection (shared across heads), computes:
-//   1. NNLS beta: attention mass biases to approximate full softmax partition
-//   2. C_v: least-squares value refitting to minimize attention output error
+// Given global key selection (shared across heads from Step 1), computes:
+//   1. NNLS beta: attention mass biases to approximate full softmax partition (§4)
+//   2. C_v: least-squares value refitting to minimize attention output error (§5)
+//
+// Design note: use_beta_for_cv=false (default) fits C_v with un-biased softmax
+// because llama.cpp's state format has no mechanism to store per-token attention
+// biases. At inference, the model computes softmax(q·K/√d_k)·V without beta,
+// so C_v must be correct under that distribution. (See algorithms.md §12.1)
 //
 // Parameters:
 //   K_all:          [T, n_embd_k_gqa] keys for all heads concatenated
@@ -380,7 +406,11 @@ struct compacted_layer {
     std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
 };
 
-// Compact a single KV head using the Highest Attention Keys method
+// Compact a single KV head using the Highest Attention Keys method (paper Section 3.1)
+//
+// Full pipeline: key selection → NNLS bias fitting → least-squares value refitting.
+// Key importance = max softmax attention weight across reference queries (§3.3).
+// C_v is fitted with un-biased softmax to match inference behavior (§5.1).
 //
 //   K:       [T, d_k] original keys for this head
 //   V:       [T, d_v] original values for this head
@@ -488,6 +518,14 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
 }
 
 // Compact all KV heads within a single layer using shared key selection
+//
+// Implements the full pipeline from paper Section 3 at layer granularity:
+//   1. Global key selection: max importance across all heads (§3.1, §3.3)
+//   2. Per-head NNLS bias fitting + least-squares value refitting (§4-5)
+//      via refit_head_values()
+//
+// Key positions are shared across heads within a layer because the llama.cpp
+// state format requires consistent cell positions across all heads per layer.
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
 //   V_all:     [T, n_embd_v_gqa] all heads concatenated, row-major
