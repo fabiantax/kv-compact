@@ -43,6 +43,9 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(test-kv-compact-api tests/test-kv-compact-api.cpp)
     target_link_libraries(test-kv-compact-api PRIVATE kv-compact-api)
+
+    add_executable(bench-kv-compact-quality tests/bench-kv-compact-quality.cpp)
+    target_link_libraries(bench-kv-compact-quality PRIVATE kv-compact-api)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
