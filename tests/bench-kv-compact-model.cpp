@@ -121,6 +121,130 @@ static double kl_divergence(const std::vector<float> & p, const std::vector<floa
 }
 
 // ============================================================================
+// Per-layer NNLS beta + LS value refit using shared selected indices
+// ============================================================================
+//
+// Given pre-selected key indices (from layer 0), runs the full 3-step pipeline
+// (Steps 2-3 from the paper) on each layer independently:
+//   - Generate cheap Q_ref from layer's K
+//   - NNLS solve for per-head beta (Section 3.2)
+//   - LS solve for per-head C_v (Section 3.3)
+
+struct per_layer_compact_result {
+    std::vector<std::vector<float>> beta;  // [n_head_kv][t]
+    std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+};
+
+static per_layer_compact_result compact_layer_with_shared_selection(
+        const float * K_layer,  // [T × n_embd_k] all heads concatenated
+        const float * V_layer,  // [T × n_embd_v] all heads concatenated
+        const std::vector<int> & selected,
+        int T, int n_head_kv, int d_k, int d_v,
+        const kv_compact_params & p) {
+
+    const int t = (int)selected.size();
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    // Generate cheap Q_ref from this layer's K
+    int n_q = T / 2;
+    if (n_q > 64) n_q = 64;
+    if (n_q < 4) n_q = 4;
+    if (n_q > T) n_q = T;
+
+    std::vector<float> Q_ref((size_t)n_q * n_embd_k);
+    for (int qi = 0; qi < n_q; qi++) {
+        float frac = (float)(qi + 1) / (float)(n_q + 1);
+        frac = frac * frac;  // bias toward recent tokens
+        int pos = (int)(frac * (T - 1));
+        if (pos >= T) pos = T - 1;
+        if (pos < 0) pos = 0;
+        memcpy(Q_ref.data() + qi * n_embd_k,
+               K_layer + pos * n_embd_k,
+               n_embd_k * sizeof(float));
+    }
+
+    per_layer_compact_result out;
+    out.beta.resize(n_head_kv);
+    out.C_v.resize(n_head_kv);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        out.beta[h].resize(t);
+        out.C_v[h].resize(t * d_v);
+
+        // Compute attention scores: Q_ref[h] @ K[h]^T / sqrt(d_k)
+        std::vector<float> scores(n_q * T);
+        std::vector<float> exp_scores(n_q * T);
+        std::vector<float> row_sums(n_q, 0.0f);
+
+        for (int qi = 0; qi < n_q; qi++) {
+            const float * q = Q_ref.data() + qi * n_embd_k + h * d_k;
+            float max_s = -1e30f;
+            for (int j = 0; j < T; j++) {
+                const float * k = K_layer + j * n_embd_k + h * d_k;
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                scores[qi * T + j] = dot * inv_sqrt_dk;
+                if (scores[qi * T + j] > max_s) max_s = scores[qi * T + j];
+            }
+            for (int j = 0; j < T; j++) {
+                exp_scores[qi * T + j] = expf(scores[qi * T + j] - max_s);
+                row_sums[qi] += exp_scores[qi * T + j];
+            }
+        }
+
+        // Attention weights (softmax)
+        std::vector<float> attn_weights(n_q * T);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < T; j++) {
+                attn_weights[qi * T + j] = exp_scores[qi * T + j] / row_sums[qi];
+            }
+        }
+
+        // NNLS for beta: M * w ≈ row_sums
+        std::vector<float> M(n_q * t);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < t; j++) {
+                M[qi * t + j] = exp_scores[qi * T + selected[j]];
+            }
+        }
+
+        std::vector<float> w(t);
+        nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t, p.nnls_max_iter);
+
+        for (int j = 0; j < t; j++) {
+            out.beta[h][j] = logf(std::max(1e-12f, w[j]));
+        }
+
+        // LS for C_v: X * C_v ≈ Y
+        std::vector<float> X(n_q * t);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < t; j++) {
+                X[qi * t + j] = scores[qi * T + selected[j]] + out.beta[h][j];
+            }
+        }
+        softmax_rows(X.data(), n_q, t);
+
+        // Y = original attention output
+        std::vector<float> Y(n_q * d_v, 0.0f);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int ki = 0; ki < T; ki++) {
+                float w_ij = attn_weights[qi * T + ki];
+                const float * v_row = V_layer + ki * n_embd_v + h * d_v;
+                for (int d = 0; d < d_v; d++)
+                    Y[qi * d_v + d] += w_ij * v_row[d];
+            }
+        }
+
+        least_squares_solve(X.data(), Y.data(), out.C_v[h].data(),
+                           n_q, t, d_v, p.ridge);
+    }
+
+    return out;
+}
+
+// ============================================================================
 // Benchmark: Full-model perplexity and KL divergence
 // ============================================================================
 
@@ -258,24 +382,78 @@ static void bench_model_quality(model_info & mi, common_params & params) {
         std::vector<int> selected(compact_result.selected_indices,
                                    compact_result.selected_indices + t);
 
-        // For each layer, compute C_v (simplified: use original V at selected positions)
-        // For a proper benchmark we'd run full NNLS+LS per layer, but this is representative
+        // Full NNLS beta + LS value refit per layer (not simplified eviction)
         std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
+        std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
+        std::vector<std::vector<std::vector<float>>> beta_dirs(sd.n_layer);
+
         for (uint32_t l = 0; l < sd.n_layer; l++) {
             const auto & ld = sd.layers[l];
-            cv_all[l].resize(mi.n_head_kv);
-            for (int h = 0; h < mi.n_head_kv; h++) {
-                cv_all[l][h].resize(t * actual_d_v);
-                for (int j = 0; j < t; j++) {
-                    const float * v_row = ld.V.data() + selected[j] * n_embd_v + h * actual_d_v;
-                    memcpy(cv_all[l][h].data() + j * actual_d_v, v_row, actual_d_v * sizeof(float));
+
+            if (l == 0) {
+                // Layer 0: use results from kv_compact() directly
+                cv_all[l].resize(mi.n_head_kv);
+                beta_all[l].resize(mi.n_head_kv);
+                beta_dirs[l].resize(mi.n_head_kv);
+                for (int h = 0; h < mi.n_head_kv; h++) {
+                    cv_all[l][h].assign(compact_result.C_v[h],
+                                         compact_result.C_v[h] + t * actual_d_v);
+                    beta_all[l][h].assign(compact_result.beta[h],
+                                           compact_result.beta[h] + t);
+                    // Beta direction: normalized mean of Q_ref (generated from K)
+                    beta_dirs[l][h].resize(actual_d_k);
+                    int n_q_ref = std::min(T / 2, 64);
+                    if (n_q_ref < 4) n_q_ref = 4;
+                    std::fill(beta_dirs[l][h].begin(), beta_dirs[l][h].end(), 0.0f);
+                    for (int qi = 0; qi < n_q_ref; qi++) {
+                        float frac = (float)(qi + 1) / (float)(n_q_ref + 1);
+                        frac = frac * frac;
+                        int pos = std::min((int)(frac * (T - 1)), T - 1);
+                        const float * k = ld.K.data() + pos * n_embd_k + h * actual_d_k;
+                        for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] += k[d];
+                    }
+                    float norm = 0.0f;
+                    for (int d = 0; d < actual_d_k; d++)
+                        norm += beta_dirs[l][h][d] * beta_dirs[l][h][d];
+                    norm = sqrtf(norm + 1e-12f);
+                    for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] /= norm;
+                }
+            } else {
+                // Other layers: run full NNLS + LS with shared selection
+                auto lr = compact_layer_with_shared_selection(
+                    ld.K.data(), ld.V.data(), selected,
+                    T, mi.n_head_kv, actual_d_k, actual_d_v, p);
+
+                cv_all[l] = std::move(lr.C_v);
+                beta_all[l] = std::move(lr.beta);
+
+                // Compute beta direction per head (normalized mean Q_ref)
+                beta_dirs[l].resize(mi.n_head_kv);
+                int n_q_ref = std::min(T / 2, 64);
+                if (n_q_ref < 4) n_q_ref = 4;
+                for (int h = 0; h < mi.n_head_kv; h++) {
+                    beta_dirs[l][h].resize(actual_d_k);
+                    std::fill(beta_dirs[l][h].begin(), beta_dirs[l][h].end(), 0.0f);
+                    for (int qi = 0; qi < n_q_ref; qi++) {
+                        float frac = (float)(qi + 1) / (float)(n_q_ref + 1);
+                        frac = frac * frac;
+                        int pos = std::min((int)(frac * (T - 1)), T - 1);
+                        const float * k = ld.K.data() + pos * n_embd_k + h * actual_d_k;
+                        for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] += k[d];
+                    }
+                    float norm2 = 0.0f;
+                    for (int d = 0; d < actual_d_k; d++)
+                        norm2 += beta_dirs[l][h][d] * beta_dirs[l][h][d];
+                    norm2 = sqrtf(norm2 + 1e-12f);
+                    for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] /= norm2;
                 }
             }
         }
 
         auto compacted_buf = build_compacted_state(kv_state, selected, cv_all,
                                                     mi.n_head_kv, actual_d_k, actual_d_v,
-                                                    mi.n_pos_per_embd);
+                                                    mi.n_pos_per_embd,
+                                                    beta_all, beta_dirs);
 
         double compact_ms = std::chrono::duration<double, std::milli>(
             clock_type::now() - t_start).count();
@@ -421,22 +599,72 @@ static void bench_model_quality(model_info & mi, common_params & params) {
                    &p50, &r50);
 
         std::vector<int> sel50(r50.selected_indices, r50.selected_indices + r50.t);
-        std::vector<std::vector<std::vector<float>>> cv50(ks2.streams[0].n_layer);
-        int n_embd_v = mi.n_head_kv * actual_d_v;
-        for (uint32_t l = 0; l < ks2.streams[0].n_layer; l++) {
-            cv50[l].resize(mi.n_head_kv);
-            for (int h = 0; h < mi.n_head_kv; h++) {
-                cv50[l][h].resize(r50.t * actual_d_v);
-                for (int j = 0; j < r50.t; j++) {
-                    memcpy(cv50[l][h].data() + j * actual_d_v,
-                           ks2.streams[0].layers[l].V.data() + sel50[j] * n_embd_v + h * actual_d_v,
-                           actual_d_v * sizeof(float));
+        const auto & sd2 = ks2.streams[0];
+        int n_embd_k2 = mi.n_head_kv * actual_d_k;
+
+        // Full NNLS beta + LS value refit per layer
+        std::vector<std::vector<std::vector<float>>> cv50(sd2.n_layer);
+        std::vector<std::vector<std::vector<float>>> beta50(sd2.n_layer);
+        std::vector<std::vector<std::vector<float>>> dirs50(sd2.n_layer);
+
+        for (uint32_t l = 0; l < sd2.n_layer; l++) {
+            const auto & ld = sd2.layers[l];
+
+            if (l == 0) {
+                // Use layer 0 results directly
+                cv50[l].resize(mi.n_head_kv);
+                beta50[l].resize(mi.n_head_kv);
+                dirs50[l].resize(mi.n_head_kv);
+                for (int h = 0; h < mi.n_head_kv; h++) {
+                    cv50[l][h].assign(r50.C_v[h], r50.C_v[h] + r50.t * actual_d_v);
+                    beta50[l][h].assign(r50.beta[h], r50.beta[h] + r50.t);
+                    // Beta direction: normalized mean Q_ref
+                    dirs50[l][h].resize(actual_d_k);
+                    int nqr = std::min(n_prompt / 2, 64);
+                    if (nqr < 4) nqr = 4;
+                    std::fill(dirs50[l][h].begin(), dirs50[l][h].end(), 0.0f);
+                    for (int qi = 0; qi < nqr; qi++) {
+                        float frac = (float)(qi + 1) / (float)(nqr + 1);
+                        frac = frac * frac;
+                        int pos = std::min((int)(frac * (n_prompt - 1)), n_prompt - 1);
+                        const float * k = ld.K.data() + pos * n_embd_k2 + h * actual_d_k;
+                        for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] += k[d];
+                    }
+                    float norm = 0.0f;
+                    for (int d = 0; d < actual_d_k; d++) norm += dirs50[l][h][d] * dirs50[l][h][d];
+                    norm = sqrtf(norm + 1e-12f);
+                    for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] /= norm;
+                }
+            } else {
+                auto lr = compact_layer_with_shared_selection(
+                    ld.K.data(), ld.V.data(), sel50,
+                    n_prompt, mi.n_head_kv, actual_d_k, actual_d_v, p50);
+                cv50[l] = std::move(lr.C_v);
+                beta50[l] = std::move(lr.beta);
+
+                dirs50[l].resize(mi.n_head_kv);
+                int nqr = std::min(n_prompt / 2, 64);
+                if (nqr < 4) nqr = 4;
+                for (int h = 0; h < mi.n_head_kv; h++) {
+                    dirs50[l][h].resize(actual_d_k);
+                    std::fill(dirs50[l][h].begin(), dirs50[l][h].end(), 0.0f);
+                    for (int qi = 0; qi < nqr; qi++) {
+                        float frac = (float)(qi + 1) / (float)(nqr + 1);
+                        frac = frac * frac;
+                        int pos = std::min((int)(frac * (n_prompt - 1)), n_prompt - 1);
+                        const float * k = ld.K.data() + pos * n_embd_k2 + h * actual_d_k;
+                        for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] += k[d];
+                    }
+                    float norm = 0.0f;
+                    for (int d = 0; d < actual_d_k; d++) norm += dirs50[l][h][d] * dirs50[l][h][d];
+                    norm = sqrtf(norm + 1e-12f);
+                    for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] /= norm;
                 }
             }
         }
 
         auto cb = build_compacted_state(ks2, sel50, cv50, mi.n_head_kv, actual_d_k, actual_d_v,
-                                         mi.n_pos_per_embd);
+                                         mi.n_pos_per_embd, beta50, dirs50);
 
         llama_memory_seq_rm(mem, 0, -1, -1);
         llama_state_seq_set_data(mi.ctx, cb.data(), cb.size(), 0);
