@@ -261,12 +261,15 @@ static void test_mla_decode_identity_projection() {
 static void test_mla_encode_projects_back() {
     printf("  test_mla_encode_projects_back...");
 
-    // d_c=2, d_rope=1, d_k_nope=2, d_v=2, 1 head
-    // W_uk = I(2x2), W_uv = I(2x2) — identity projections
-    const int d_c = 2, d_rope = 1, d_k_nope = 2, d_v = 2, n_heads = 1;
+    // d_c=4, d_rope=1, d_k_nope=2, d_v=2, 1 head
+    // Orthogonal projections: W_uk picks [0,1], W_uv picks [2,3]
+    // d_c = d_k_nope + d_v = 4 → exactly determined, perfect recovery
+    const int d_c = 4, d_rope = 1, d_k_nope = 2, d_v = 2, n_heads = 1;
 
-    float W_uk[] = {1, 0, 0, 1};
-    float W_uv[] = {1, 0, 0, 1};
+    float W_uk[] = {1, 0, 0, 0,
+                    0, 1, 0, 0};
+    float W_uv[] = {0, 0, 1, 0,
+                    0, 0, 0, 1};
 
     mla_adapter adapter(d_c, d_rope, d_k_nope, d_v, n_heads, W_uk, W_uv);
 
@@ -278,21 +281,28 @@ static void test_mla_encode_projects_back() {
     float V_comp[] = {5, 6,
                       7, 8};
 
-    // With identity W_uv, the LS projection should recover V as latent
-    float cache_k_out[2 * 3] = {}; // [t, d_c+d_rope]
-    float cache_v_out[2 * 2] = {}; // [t, d_c]
+    float cache_k_out[2 * 5] = {}; // [t, d_c+d_rope]
+    float cache_v_out[2 * 4] = {}; // [t, d_c]
 
     adapter.encode(K_comp, V_comp, 2, 0, cache_k_out, cache_v_out);
 
-    // cache_v_out should be close to V_comp (identity projection)
-    assert(approx_eq(cache_v_out[0], 5.0f, 0.1f));
-    assert(approx_eq(cache_v_out[1], 6.0f, 0.1f));
-    assert(approx_eq(cache_v_out[2], 7.0f, 0.1f));
-    assert(approx_eq(cache_v_out[3], 8.0f, 0.1f));
+    // Decode and verify both K and V are recovered exactly
+    float K_rt[2 * 3], V_rt[2 * 2];
+    adapter.decode(cache_k_out, cache_v_out, 2, 0, K_rt, V_rt);
 
-    // cache_k_out should have latent (=V via identity) + rope
-    assert(approx_eq(cache_k_out[2], 10.0f));  // rope preserved
-    assert(approx_eq(cache_k_out[5], 20.0f));  // rope preserved
+    // V should match exactly (orthogonal projections, exactly determined)
+    assert(approx_eq(V_rt[0], 5.0f, 0.01f));
+    assert(approx_eq(V_rt[1], 6.0f, 0.01f));
+    assert(approx_eq(V_rt[2], 7.0f, 0.01f));
+    assert(approx_eq(V_rt[3], 8.0f, 0.01f));
+
+    // K_nope should also match (orthogonal, no interference)
+    assert(approx_eq(K_rt[0], 1.0f, 0.01f));
+    assert(approx_eq(K_rt[1], 2.0f, 0.01f));
+
+    // RoPE preserved exactly
+    assert(approx_eq(K_rt[2], 10.0f));
+    assert(approx_eq(K_rt[5], 20.0f));
 
     printf(" OK\n");
 }
@@ -356,17 +366,20 @@ static void test_mla_round_trip() {
         }
     }
 
-    // The latent round-trip won't be exact (LS projection is lossy when d_v < d_c)
-    // but the V values recovered from the round-tripped latent should match
-    // Verify: decode(encode(decode(original))) ≈ decode(original) in V space
-    float V_rt[3 * 3];
-    adapter.decode(cache_k_rt, cache_v_rt, T, 0, K_dec, V_rt);
+    // Joint LS preserves both K and V through the shared latent.
+    // Verify: decode(encode(K, V)) ≈ (K, V) for both K_nope and V.
+    float K_rt[3 * 5], V_rt[3 * 3];
+    adapter.decode(cache_k_rt, cache_v_rt, T, 0, K_rt, V_rt);
 
     float v_err = max_abs_diff(V_dec, V_rt, T * d_v);
-    // With well-conditioned 3→4→3 projections, error should be small
-    assert(v_err < 1.0f);  // relaxed — LS on underdetermined system
+    float k_err = max_abs_diff(K_dec, K_rt, T * (d_k_nope + d_rope));
 
-    printf(" OK (V round-trip error: %.6f)\n", v_err);
+    // With d_c=4 ≥ d_v+d_k_nope=3+3=6 this is underdetermined, so
+    // some error is expected, but should be bounded.
+    assert(v_err < 1.0f);
+    assert(k_err < 1.0f);
+
+    printf(" OK (V err: %.6f, K err: %.6f)\n", v_err, k_err);
 }
 
 // ============================================================================
@@ -425,6 +438,123 @@ static void test_mla_multi_head() {
     assert(approx_eq(V1[1], 4.0f));  // latent[3]
 
     printf(" OK\n");
+}
+
+// ============================================================================
+// MLA adapter — joint K+V encode preserves both through shared latent
+// ============================================================================
+
+static void test_mla_joint_encode_preserves_kv() {
+    printf("  test_mla_joint_encode_preserves_kv...");
+
+    // d_c=4 exactly equals d_k_nope + d_v = 2+2, with orthogonal projections.
+    // This means the LS system is exactly determined and both K_nope and V
+    // should be perfectly recoverable.
+    const int d_c = 4, d_rope = 1, d_k_nope = 2, d_v = 2, T = 3;
+
+    // W_uk picks dims [0,1], W_uv picks dims [2,3] — orthogonal
+    float W_uk[2 * 4] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0
+    };
+    float W_uv[2 * 4] = {
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+
+    mla_adapter adapter(d_c, d_rope, d_k_nope, d_v, 1, W_uk, W_uv);
+
+    // Arbitrary K and V in working space
+    const int d_k_full = d_k_nope + d_rope; // 3
+    float K[3 * 3] = {
+        1.0f, 2.0f, 10.0f,   // K_nope=[1,2], rope=[10]
+        3.0f, 4.0f, 20.0f,
+        5.0f, 6.0f, 30.0f
+    };
+    float V[3 * 2] = {
+        7.0f, 8.0f,
+        9.0f, 10.0f,
+        11.0f, 12.0f
+    };
+
+    float cache_k_out[3 * 5] = {};  // [T, d_c + d_rope]
+    float cache_v_out[3 * 4] = {};  // [T, d_c]
+    adapter.encode(K, V, T, 0, cache_k_out, cache_v_out);
+
+    // Decode and verify both K and V are perfectly recovered
+    float K_rt[3 * 3], V_rt[3 * 2];
+    adapter.decode(cache_k_out, cache_v_out, T, 0, K_rt, V_rt);
+
+    float k_err = max_abs_diff(K, K_rt, T * d_k_full);
+    float v_err = max_abs_diff(V, V_rt, T * d_v);
+
+    // With orthogonal projections and d_c = d_k_nope + d_v,
+    // the joint LS should recover both exactly (up to float precision)
+    assert(k_err < 0.01f);
+    assert(v_err < 0.01f);
+
+    printf(" OK (K err: %.6f, V err: %.6f)\n", k_err, v_err);
+}
+
+// ============================================================================
+// MLA adapter — V-only encode would corrupt K (regression guard)
+// ============================================================================
+
+static void test_mla_encode_k_not_corrupted() {
+    printf("  test_mla_encode_k_not_corrupted...");
+
+    // Non-orthogonal projections: W_uk and W_uv overlap in latent space.
+    // The joint LS must balance both objectives. Verify K_nope is reasonable.
+    const int d_c = 3, d_rope = 1, d_k_nope = 2, d_v = 2, T = 2;
+
+    float W_uk[2 * 3] = {
+        1.0f, 0.5f, 0.0f,
+        0.0f, 1.0f, 0.5f
+    };
+    float W_uv[2 * 3] = {
+        0.5f, 0.0f, 1.0f,
+        0.0f, 0.5f, 1.0f
+    };
+
+    mla_adapter adapter(d_c, d_rope, d_k_nope, d_v, 1, W_uk, W_uv);
+
+    // Create cache, decode to get ground truth K and V
+    float cache_k[2 * 4] = {
+        1.0f, 2.0f, 3.0f, 10.0f,  // latent=[1,2,3], rope=[10]
+        4.0f, 5.0f, 6.0f, 20.0f
+    };
+    float cache_v[2 * 3] = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f
+    };
+
+    const int d_k_full = d_k_nope + d_rope;
+    float K_orig[2 * 3], V_orig[2 * 2];
+    adapter.decode(cache_k, cache_v, T, 0, K_orig, V_orig);
+
+    // Encode back (round-trip)
+    float cache_k_rt[2 * 4] = {};
+    float cache_v_rt[2 * 3] = {};
+    adapter.encode(K_orig, V_orig, T, 0, cache_k_rt, cache_v_rt);
+
+    // Decode the round-tripped cache
+    float K_rt[2 * 3], V_rt[2 * 2];
+    adapter.decode(cache_k_rt, cache_v_rt, T, 0, K_rt, V_rt);
+
+    float k_err = max_abs_diff(K_orig, K_rt, T * d_k_full);
+    float v_err = max_abs_diff(V_orig, V_rt, T * d_v);
+
+    // Both should be reasonable (d_c=3 < d_k_nope+d_v=4 means underdetermined,
+    // but the joint LS distributes error across both objectives)
+    assert(k_err < 2.0f);
+    assert(v_err < 2.0f);
+
+    // Key invariant: K error should not be dramatically worse than V error.
+    // A V-only projection would give k_err >> v_err. Joint LS balances them.
+    float ratio = (v_err > 1e-8f) ? k_err / v_err : 0.0f;
+    assert(ratio < 10.0f);  // K shouldn't be 10x worse than V
+
+    printf(" OK (K err: %.4f, V err: %.4f, ratio: %.2f)\n", k_err, v_err, ratio);
 }
 
 // ============================================================================
@@ -758,6 +888,8 @@ int main() {
     test_mla_encode_projects_back();
     test_mla_round_trip();
     test_mla_multi_head();
+    test_mla_joint_encode_preserves_kv();
+    test_mla_encode_k_not_corrupted();
 
     printf("\nLayer classifiers:\n");
     test_uniform_classifier();

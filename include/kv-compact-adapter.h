@@ -260,49 +260,52 @@ struct mla_adapter final : kv_adapter {
         const int d_k_full = d_k_nope_ + d_rope_;
         const int cache_k_stride = d_c_ + d_rope_;
 
-        // Project V back to latent space: min ||V_compacted - C_latent @ W_uv^T||²
-        // This is: C_latent = V_compacted @ pinv(W_uv^T) = V_compacted @ W_uv @ inv(W_uv^T W_uv)
-        // Using least_squares_solve: A=[t, d_v], X=[t, d_c], B=W_uv_head^T=[d_v, d_c]
-        // We solve: W_uv_head @ C_latent^T = V_compacted^T
-        // Equivalently: C_latent = least_squares(W_uv_head^T, V_compacted^T)^T
+        // MLA challenge: K_nope and V share the same latent c_kv.
+        // After compaction we have refitted C_v and selected K (with original K_nope).
+        // We need a latent that reconstructs both reasonably:
         //
-        // More directly: for each token i, solve min||V_i - W_uv_head @ c_i|| for c_i
-        // This is: W_uv_head^T has shape [d_c, d_v], so c_i = (W_uv_head W_uv_head^T)^-1 W_uv_head V_i
+        //   min ||C_v - c @ W_uv^T||² + ||K_nope - c @ W_uk^T||²
         //
-        // Batch formulation: solve min ||V_compacted - C_latent @ W_uv_head^T||_F
-        //   where V_compacted is [t, d_v], C_latent is [t, d_c], W_uv_head^T is [d_c, d_v]
-        //   Transpose: W_uv_head @ C_latent^T = V_compacted^T
-        //   i.e., A=[d_v, d_c] X=[d_c, t] = B=[d_v, t]
-        //   → least_squares_solve(W_uv_head_transposed, V_compacted_transposed, C_latent_transposed, d_v, d_c, t)
+        // This is a joint least-squares: stack the two objectives.
         //
-        // We use the existing least_squares_solve(A, B, X, m, n, rhs)
-        // which solves min||AX - B|| with A[m,n], X[n,rhs], B[m,rhs]
+        //   A = [W_uv; W_uk]   [(d_v + d_k_nope), d_c]
+        //   b = [V_i; K_nope_i] [(d_v + d_k_nope)]
+        //   solve: min ||A @ c - b||²
+        //
+        // Batch formulation (all tokens at once):
+        //   A [(d_v+d_k_nope), d_c]  X [d_c, t]  = B [(d_v+d_k_nope), t]
+        //   least_squares_solve(A, B, X, m=d_v+d_k_nope, n=d_c, rhs=t)
 
         const float * W_uv_head = W_uv_ + head * d_v_ * d_c_;
+        const float * W_uk_head = W_uk_ + head * d_k_nope_ * d_c_;
 
-        // Build W_uv_head^T: [d_c, d_v]
-        std::vector<float> Wt(d_c_ * d_v_);
+        const int m = d_v_ + d_k_nope_;
+
+        // Build stacked A = [W_uv; W_uk] — shape [m, d_c]
+        std::vector<float> A(m * d_c_);
         for (int r = 0; r < d_v_; r++) {
-            for (int c = 0; c < d_c_; c++) {
-                Wt[c * d_v_ + r] = W_uv_head[r * d_c_ + c];
-            }
+            memcpy(A.data() + r * d_c_, W_uv_head + r * d_c_, d_c_ * sizeof(float));
+        }
+        for (int r = 0; r < d_k_nope_; r++) {
+            memcpy(A.data() + (d_v_ + r) * d_c_, W_uk_head + r * d_c_, d_c_ * sizeof(float));
         }
 
-        // V_compacted^T: [d_v, t]
-        std::vector<float> Vt(d_v_ * t);
+        // Build stacked B = [V^T; K_nope^T] — shape [m, t]
+        std::vector<float> B(m * t);
         for (int i = 0; i < t; i++) {
             for (int j = 0; j < d_v_; j++) {
-                Vt[j * t + i] = V_compacted[i * d_v_ + j];
+                B[j * t + i] = V_compacted[i * d_v_ + j];
+            }
+            for (int j = 0; j < d_k_nope_; j++) {
+                B[(d_v_ + j) * t + i] = K_compacted[i * d_k_full + j];
             }
         }
 
-        // Solve Wt @ C_latent_t = Vt  → C_latent_t is [d_c, t]
-        // least_squares_solve(A, B, X, m, n, rhs): min||AX-B|| A[m,n] X[n,rhs] B[m,rhs]
-        // Here A = Wt^T = W_uv_head [d_v, d_c], B = Vt [d_v, t], X = C_latent_t [d_c, t]
+        // Solve: A @ C_latent^T = B
         std::vector<float> C_latent_t(d_c_ * t);
-        least_squares_solve(W_uv_head, Vt.data(), C_latent_t.data(), d_v_, d_c_, t);
+        least_squares_solve(A.data(), B.data(), C_latent_t.data(), m, d_c_, t);
 
-        // Transpose C_latent_t → C_latent [t, d_c]
+        // Transpose C_latent_t [d_c, t] → C_latent [t, d_c]
         std::vector<float> C_latent(t * d_c_);
         for (int i = 0; i < t; i++) {
             for (int c = 0; c < d_c_; c++) {
@@ -314,13 +317,13 @@ struct mla_adapter final : kv_adapter {
         for (int i = 0; i < t; i++) {
             memcpy(cache_k_out + i * cache_k_stride, C_latent.data() + i * d_c_,
                    d_c_ * sizeof(float));
-            // Copy RoPE key directly from compacted K
+            // RoPE key preserved directly from compacted K
             memcpy(cache_k_out + i * cache_k_stride + d_c_,
                    K_compacted + i * d_k_full + d_k_nope_,
                    d_rope_ * sizeof(float));
         }
 
-        // Write cache_v_out: [t, d_c] = same latent
+        // Write cache_v_out: [t, d_c] = same latent (K and V share it)
         memcpy(cache_v_out, C_latent.data(), t * d_c_ * sizeof(float));
     }
 };
