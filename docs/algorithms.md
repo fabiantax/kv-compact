@@ -525,35 +525,51 @@ this approach on output quality.
 1. **No beta injection during generation:** The POC computes beta but cannot
    apply it during `llama_decode`. Requires attention graph modification or a
    bias hook in `ggml_flash_attn_ext`.
+   - Status: **NOT IMPLEMENTED** — betas computed but discarded.
+   - Code: `refit_head_values()` in kv-compact-math.h (use_beta_for_cv=false).
 
-2. **C_v not written back:** Compacted values are computed but not written to
-   the KV cache tensors. Requires `llama_state_seq_set_data` or direct tensor
-   modification.
+2. ~~**C_v not written back:**~~ **RESOLVED.** `build_compacted_state()` in
+   kv-compact-state.h writes refitted C_v values into the state buffer.
+   `kv_compact_sequence()` in kv-compact-api.cpp restores the compacted state
+   via `llama_state_seq_set_data()`.
 
-3. **Single-head demonstration:** The POC runs compaction on layer 0, head 0
-   only. Production requires iterating all layers and heads.
+3. ~~**Single-head demonstration:**~~ **RESOLVED.** `compact_layer_all_heads()`
+   iterates all KV heads with shared key selection. `kv_compact_sequence()`
+   processes all layers and all heads.
 
 4. **Simplified reference queries:** Uses K vectors from the last positions as
    query proxies instead of true repeat-prefill (running the context through
    the model twice).
+   - Status: **NOT IMPLEMENTED** — uses simplest proxy strategy.
+   - Code: `score_importance()` in kv-compact-api.cpp (ref_start = T - n_ref).
 
 5. **Quantized KV types skipped:** Only F32 and F16 are supported. Quantized
    types need dequantize-compact-requantize.
+   - Status: **NOT IMPLEMENTED** — unsupported types filled with zeros.
+   - Code: `convert_to_f32()` in kv-compact-state.h.
 
-### Algorithmic extensions from the paper
+### Algorithmic extensions from the paper (all NOT IMPLEMENTED)
 
-1. **OMP key selection:** Orthogonal Matching Pursuit selects keys iteratively
-   by greedy residual reduction. Higher quality than Highest Attention but
-   ~100x slower (minutes vs seconds).
+1. **OMP key selection (paper §5.2):** Orthogonal Matching Pursuit selects keys
+   iteratively by greedy residual reduction. Higher quality than Highest
+   Attention but ~100x slower (minutes vs seconds).
+   - Code location: `compact_head_highest_attn()`, `compact_layer_all_heads()`
+     in kv-compact-math.h use max-attention scoring instead.
 
-2. **Non-uniform per-head budgets:** Sensitivity varies across heads.
-   Pre-computed sensitivity curves allow allocating more budget to critical
-   heads and less to redundant ones.
+2. **Non-uniform per-head budgets (paper §6.2):** Sensitivity varies across
+   heads. Pre-computed sensitivity curves allow allocating more budget to
+   critical heads and less to redundant ones.
+   - Code location: `compact_layer_all_heads()` in kv-compact-math.h applies
+     uniform `t` across all heads.
 
-3. **Iterative compaction:** The algorithm can be applied multiple times as
-   context grows. Paper demonstrates 6 consecutive compressions on AIME
-   without quality loss.
+3. **Iterative compaction (paper §6.1):** The algorithm can be applied multiple
+   times as context grows. Paper demonstrates 6 consecutive compressions on
+   AIME without quality loss.
+   - Code location: `kv_compact_sequence()` in kv-compact-api.cpp can be
+     called repeatedly by the caller, but no built-in scheduling exists.
 
-4. **Direct key optimization:** Removing the constraint that C_k must be a
-   subset of original keys could yield better results but makes the
+4. **Direct key optimization (paper §5.5):** Removing the constraint that C_k
+   must be a subset of original keys could yield better results but makes the
    optimization non-convex.
+   - Code location: key selection in `compact_head_highest_attn()` always picks
+     a subset of original K rows.

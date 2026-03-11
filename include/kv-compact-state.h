@@ -252,6 +252,8 @@ private:
     }
 
     // Convert raw data to float32 (supports F32 and F16)
+    // NOT IMPLEMENTED: quantized KV types (Q8_0, Q4_0, etc.). These would need
+    // dequantize → compact → requantize. Currently fills zeros for unsupported types.
     static void convert_to_f32(const uint8_t * src, int32_t type, float * dst, size_t n) {
         if (type == KV_COMPACT_GGML_TYPE_F32) {
             memcpy(dst, src, n * sizeof(float));

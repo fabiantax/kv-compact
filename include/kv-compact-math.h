@@ -288,6 +288,11 @@ struct refit_head_result {
 // biases. At inference, the model computes softmax(q·K/√d_k)·V without beta,
 // so C_v must be correct under that distribution. (See algorithms.md §12.1)
 //
+// NOT IMPLEMENTED (paper §4.1, algorithms.md §12.1): beta injection during
+// inference. Would require a bias hook in ggml_flash_attn_ext or attention
+// graph modification. If implemented, use_beta_for_cv=true becomes correct
+// and C_v quality improves since beta compensates for missing attention mass.
+//
 // Parameters:
 //   K_all:          [T, n_embd_k_gqa] keys for all heads concatenated
 //   V_all:          [T, n_embd_v_gqa] values for all heads concatenated
@@ -412,6 +417,13 @@ struct compacted_layer {
 // Key importance = max softmax attention weight across reference queries (§3.3).
 // C_v is fitted with un-biased softmax to match inference behavior (§5.1).
 //
+// NOT IMPLEMENTED (paper ideas):
+//   - OMP key selection (paper §5.2, algorithms.md §12.2): Orthogonal Matching Pursuit
+//     selects keys by iterative greedy residual reduction. Higher quality but ~100x slower.
+//   - Direct key optimization (paper §5.5, algorithms.md §12.4): allowing C_k to be
+//     arbitrary vectors (not a subset of original K) could improve results but makes
+//     optimization non-convex.
+//
 //   K:       [T, d_k] original keys for this head
 //   V:       [T, d_v] original values for this head
 //   Q_ref:   [n_q, d_k] reference queries
@@ -526,6 +538,12 @@ KV_COMPACT_UNUSED static compacted_head compact_head_highest_attn(
 //
 // Key positions are shared across heads within a layer because the llama.cpp
 // state format requires consistent cell positions across all heads per layer.
+//
+// NOT IMPLEMENTED (paper ideas):
+//   - Non-uniform per-head budgets (paper §6.2, algorithms.md §12.2): head sensitivity
+//     varies — pre-computed sensitivity curves could allocate more budget to critical
+//     heads and less to redundant ones. Currently all heads share the same t.
+//   - OMP key selection (paper §5.2): see compact_head_highest_attn comments.
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
 //   V_all:     [T, n_embd_v_gqa] all heads concatenated, row-major

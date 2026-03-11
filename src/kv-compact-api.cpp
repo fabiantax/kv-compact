@@ -12,6 +12,16 @@
 //
 // All models (pure attention and hybrid SSM+attention) go through the same
 // refitting pipeline. Hybrid models additionally save/restore recurrent state.
+//
+// NOT IMPLEMENTED (paper ideas — see algorithms.md §12 for full list):
+//   - Iterative compaction (paper §6.1): apply compaction multiple times as
+//     context grows. Paper shows 6 consecutive compressions without quality loss.
+//     Callers can invoke kv_compact_sequence() repeatedly, but no built-in
+//     trigger or scheduling logic exists yet.
+//   - Beta injection during inference (paper §4.1): betas are computed but
+//     discarded — llama.cpp has no attention bias hook. See refit_head_values().
+//   - Non-uniform per-head budgets (paper §6.2): all heads use same target t.
+//   - OMP key selection (paper §5.2): uses simpler max-attention scoring instead.
 
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
@@ -81,6 +91,11 @@ float kv_compact_suggest_ratio(
 // Per-key importance = max softmax attention weight across all reference queries
 // and all layers/heads (algorithms.md §3.3). Uses K vectors from the last
 // n_ref positions as proxy queries (simplest reference query strategy, paper §4).
+//
+// NOT IMPLEMENTED (paper §7.2, algorithms.md §12.4): better reference queries.
+// Current approach uses trailing K vectors as query proxies. The paper suggests
+// true repeat-prefill (running context through the model twice) or learned
+// representative query sets for higher-quality importance estimates.
 static int score_importance(
     const parsed_kv_state::stream_data & sd,
     int n_head_kv,
