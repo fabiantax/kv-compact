@@ -59,6 +59,7 @@ if(KV_COMPACT_BUILD_TOOL)
     else()
         # Fetch from GitHub
         include(FetchContent)
+        set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
         FetchContent_Declare(
             llama_cpp
             GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
@@ -81,6 +82,15 @@ if(KV_COMPACT_BUILD_TOOL)
     add_executable(test-kv-compact-e2e tests/test-kv-compact-e2e.cpp)
     target_link_libraries(test-kv-compact-e2e PRIVATE
         kv-compact-math
+        llama
+        common
+        ggml
+    )
+
+    # Real-model quality benchmark
+    add_executable(bench-kv-compact-model tests/bench-kv-compact-model.cpp)
+    target_link_libraries(bench-kv-compact-model PRIVATE
+        kv-compact-api
         llama
         common
         ggml
