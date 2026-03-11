@@ -1,0 +1,43 @@
+@implements IDisposable
+
+<span @ref="textElement">@displayText</span>
+
+@code {
+    [Parameter]
+    public string Text { get; set; } = string.Empty;
+
+    private ElementReference textElement;
+    private string displayText = string.Empty;
+    private System.Timers.Timer? _updateTimer;
+
+    protected override void OnParametersSet()
+    {
+        if (Text != displayText)
+        {
+            _updateTimer?.Stop();
+            _updateTimer = new System.Timers.Timer(30); // 30ms for smooth typing effect
+            _updateTimer.Elapsed += OnTimerElapsed;
+            _updateTimer.AutoReset = true;
+            _updateTimer.Start();
+        }
+    }
+
+    private async void OnTimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
+    {
+        if (displayText.Length < Text.Length)
+        {
+            displayText = Text.Substring(0, displayText.Length + 1);
+            await InvokeAsync(StateHasChanged);
+        }
+        else
+        {
+            _updateTimer?.Stop();
+        }
+    }
+
+    public void Dispose()
+    {
+        _updateTimer?.Stop();
+        _updateTimer?.Dispose();
+    }
+}
