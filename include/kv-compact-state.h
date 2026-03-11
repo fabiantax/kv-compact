@@ -221,6 +221,67 @@ struct parsed_kv_state {
         return true;
     }
 
+    // ---- Layer type detection for hybrid architectures ----
+
+    // Check if a layer has valid KV cache data suitable for compaction.
+    // Returns false for layers that:
+    //   - Have zero-sized K or V data
+    //   - Have K/V dimensions that don't divide evenly by n_head_kv
+    //   - Have mismatched K and V cell counts
+    //
+    // For hybrid models (e.g., Qwen 3.5 with DeltaNet + attention), non-attention
+    // layers may have no KV data or have differently-structured state.
+    bool is_compactable_layer(int stream, int layer, int n_head_kv) const {
+        if (stream < 0 || stream >= (int)n_stream) return false;
+        const auto & sd = streams[stream];
+        if (layer < 0 || layer >= (int)sd.n_layer) return false;
+        const auto & ld = sd.layers[layer];
+
+        // Must have K and V data
+        if (ld.K.empty() || ld.V.empty()) return false;
+
+        // K/V dimensions must divide evenly by n_head_kv
+        int n_embd_k = ld.n_embd_k_gqa();
+        int n_embd_v = ld.n_embd_v_gqa_computed();
+        if (n_head_kv <= 0) return false;
+        if (n_embd_k % n_head_kv != 0) return false;
+        if (n_embd_v % n_head_kv != 0) return false;
+
+        // Head dimensions must be > 0
+        if (n_embd_k / n_head_kv == 0) return false;
+        if (n_embd_v / n_head_kv == 0) return false;
+
+        return true;
+    }
+
+    // Detect which layers are compactable and return a list of their indices.
+    // Useful for auto-detecting attention layers in hybrid architectures.
+    std::vector<int> get_compactable_layers(int stream, int n_head_kv) const {
+        std::vector<int> result;
+        if (stream < 0 || stream >= (int)n_stream) return result;
+        const auto & sd = streams[stream];
+        for (int l = 0; l < (int)sd.n_layer; l++) {
+            if (is_compactable_layer(stream, l, n_head_kv)) {
+                result.push_back(l);
+            }
+        }
+        return result;
+    }
+
+    // Check if a model appears to be hybrid (not all layers have the same K/V geometry).
+    // Returns true if any layer has different K dimensions than layer 0.
+    bool is_hybrid_model(int stream = 0) const {
+        if (stream < 0 || stream >= (int)n_stream) return false;
+        const auto & sd = streams[stream];
+        if (sd.n_layer <= 1) return false;
+
+        uint64_t ref_k_size = sd.layers[0].k_size_row;
+        for (uint32_t l = 1; l < sd.n_layer; l++) {
+            if (sd.layers[l].k_size_row != ref_k_size) return true;
+        }
+        return false;
+    }
+
     // ---- Extract per-head data ----
 
     // Get K for a specific head: output [cell_count, d_k]

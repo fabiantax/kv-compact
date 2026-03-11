@@ -598,6 +598,131 @@ static void test_double_free_safe() {
 }
 
 // ============================================================================
+// Layer filter tests (A1: Hybrid layer awareness)
+// ============================================================================
+
+static void test_layer_filter_all() {
+    printf("  test_layer_filter_all...");
+    // Default filter: all layers pass
+    for (int l = 0; l < 40; l++) {
+        assert(kv_layer_filter_all(l, 40, NULL) != 0);
+    }
+    printf(" OK\n");
+}
+
+static void test_layer_filter_periodic() {
+    printf("  test_layer_filter_periodic...");
+    // Qwen 3.5 pattern: attention every 4th layer (layers 3,7,11,...,39)
+    void * interval = (void *)(intptr_t)4;
+    int count = 0;
+    for (int l = 0; l < 40; l++) {
+        int result = kv_layer_filter_periodic(l, 40, interval);
+        if (result) count++;
+        // Layers 3,7,11,15,19,23,27,31,35,39 should pass
+        bool expected = ((l + 1) % 4 == 0);
+        assert((result != 0) == expected);
+    }
+    assert(count == 10);  // 40/4 = 10 attention layers
+    printf(" OK\n");
+}
+
+static void test_layer_filter_explicit() {
+    printf("  test_layer_filter_explicit...");
+    // Explicit list of attention layers
+    int layers[] = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39};
+    kv_layer_list list = { layers, 10 };
+
+    int count = 0;
+    for (int l = 0; l < 40; l++) {
+        int result = kv_layer_filter_explicit(l, 40, &list);
+        if (result) count++;
+    }
+    assert(count == 10);
+
+    // Non-listed layers should be filtered out
+    assert(kv_layer_filter_explicit(0, 40, &list) == 0);
+    assert(kv_layer_filter_explicit(1, 40, &list) == 0);
+    assert(kv_layer_filter_explicit(2, 40, &list) == 0);
+    assert(kv_layer_filter_explicit(3, 40, &list) != 0);
+    assert(kv_layer_filter_explicit(4, 40, &list) == 0);
+    assert(kv_layer_filter_explicit(39, 40, &list) != 0);
+
+    printf(" OK\n");
+}
+
+static void test_layer_filter_count() {
+    printf("  test_layer_filter_count...");
+
+    // Count with NULL filter = all layers
+    assert(kv_compact_count_layers(NULL, NULL, 40) == 40);
+
+    // Count with periodic filter
+    void * interval = (void *)(intptr_t)4;
+    assert(kv_compact_count_layers(kv_layer_filter_periodic, interval, 40) == 10);
+
+    // Count with explicit filter
+    int layers[] = {0, 5, 10};
+    kv_layer_list list = { layers, 3 };
+    assert(kv_compact_count_layers(kv_layer_filter_explicit, &list, 20) == 3);
+
+    printf(" OK\n");
+}
+
+static void test_layer_filter_should_compact() {
+    printf("  test_layer_filter_should_compact...");
+
+    // NULL params = compact all
+    assert(kv_compact_should_compact_layer(NULL, 5, 40) == 1);
+
+    // Params with no filter = compact all
+    kv_compact_params p = kv_compact_params_default();
+    assert(kv_compact_should_compact_layer(&p, 5, 40) == 1);
+
+    // Params with periodic filter
+    p.layer_filter = kv_layer_filter_periodic;
+    p.layer_filter_data = (void *)(intptr_t)4;
+    assert(kv_compact_should_compact_layer(&p, 3, 40) == 1);  // layer 3: (3+1)%4==0 → yes
+    assert(kv_compact_should_compact_layer(&p, 0, 40) == 0);  // layer 0: (0+1)%4!=0 → no
+    assert(kv_compact_should_compact_layer(&p, 7, 40) == 1);  // layer 7: (7+1)%4==0 → yes
+
+    printf(" OK\n");
+}
+
+static void test_layer_filter_in_compaction() {
+    printf("  test_layer_filter_in_compaction...\n");
+    // Test that layer_filter field in params doesn't break single-layer compaction
+    // (kv_compact operates on a single layer — the filter is for caller use)
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 5000);
+    gen_data(V.data(), T * n_embd_v, 5100);
+    gen_data(Q.data(), n_q * n_embd_k, 5200);
+
+    // With filter set (doesn't affect single-layer API, just stored for caller use)
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.layer_filter = kv_layer_filter_periodic;
+    p.layer_filter_data = (void *)(intptr_t)4;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+    assert(result.t == 32);
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    assert(result.stats.avg_cosine_sim > 0.8f);
+
+    printf("    cos=%.6f (filter in params doesn't break single-layer API)\n",
+           result.stats.avg_cosine_sim);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -642,6 +767,14 @@ int main() {
 
     printf("\n=== Safety ===\n");
     test_double_free_safe();
+
+    printf("\n=== Layer filter (A1: Hybrid layer awareness) ===\n");
+    test_layer_filter_all();
+    test_layer_filter_periodic();
+    test_layer_filter_explicit();
+    test_layer_filter_count();
+    test_layer_filter_should_compact();
+    test_layer_filter_in_compaction();
 
     printf("\nAll tests passed!\n");
     return 0;

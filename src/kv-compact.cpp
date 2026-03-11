@@ -29,6 +29,7 @@
 #include <fstream>
 #endif
 
+#include "kv-compact-api.h"
 #include "kv-compact-math.h"
 #include "kv-compact-state.h"
 
@@ -165,6 +166,8 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --no-writeback    skip write-back (demo mode: compute quality metrics only)\n");
     LOG("  --no-eviction     skip token eviction baseline\n");
     LOG("  --sensitivity-budget  weight key selection by per-head sensitivity\n");
+    LOG("  --attention-interval N  for hybrid models: attention every Nth layer (e.g., 4 for Qwen 3.5)\n");
+    LOG("  --attention-layers L    comma-separated list of attention layer indices\n");
     LOG("\n");
 }
 
@@ -177,6 +180,8 @@ int main(int argc, char ** argv) {
     bool  do_writeback  = true;
     bool  do_eviction   = true;
     bool  sensitivity_budget = false;  // per-head sensitivity-weighted budget
+    int   attention_interval = 0;      // hybrid models: attention every N layers (0=all)
+    std::vector<int> attention_layers; // explicit list of attention layer indices
 
     // Parse standard params
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
@@ -195,6 +200,19 @@ int main(int argc, char ** argv) {
             do_eviction = false;
         } else if (strcmp(argv[i], "--sensitivity-budget") == 0) {
             sensitivity_budget = true;
+        } else if (strcmp(argv[i], "--attention-interval") == 0 && i + 1 < argc) {
+            attention_interval = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--attention-layers") == 0 && i + 1 < argc) {
+            // Parse comma-separated list: "3,7,11,15,19,23,27,31,35,39"
+            std::string list_str = argv[++i];
+            size_t pos = 0;
+            while (pos < list_str.size()) {
+                size_t comma = list_str.find(',', pos);
+                if (comma == std::string::npos) comma = list_str.size();
+                attention_layers.push_back(std::stoi(list_str.substr(pos, comma - pos)));
+                pos = comma + 1;
+            }
+            std::sort(attention_layers.begin(), attention_layers.end());
         }
     }
 
@@ -390,6 +408,46 @@ int main(int argc, char ** argv) {
     LOG_INF("Dimensions: n_embd_k_gqa=%d, n_embd_v_gqa=%d, d_k=%d, d_v=%d (from state)\n",
             n_embd_k_gqa, n_embd_v_gqa, d_k, d_v);
 
+    // ---- Set up layer filter for hybrid architectures ----
+    kv_layer_filter_fn layer_filter = NULL;
+    void * layer_filter_data = NULL;
+    kv_layer_list explicit_layer_list = {};
+
+    if (!attention_layers.empty()) {
+        // Explicit layer list provided via --attention-layers
+        explicit_layer_list.layers = attention_layers.data();
+        explicit_layer_list.n_layers = (int)attention_layers.size();
+        layer_filter = kv_layer_filter_explicit;
+        layer_filter_data = &explicit_layer_list;
+        LOG_INF("Layer filter: explicit list of %d attention layers\n",
+                explicit_layer_list.n_layers);
+    } else if (attention_interval > 0) {
+        // Periodic filter via --attention-interval
+        layer_filter = kv_layer_filter_periodic;
+        layer_filter_data = (void *)(intptr_t)attention_interval;
+        int n_attn = kv_compact_count_layers(layer_filter, layer_filter_data, sd.n_layer);
+        LOG_INF("Layer filter: every %d layers → %d / %u attention layers\n",
+                attention_interval, n_attn, sd.n_layer);
+    } else if (kv_state.is_hybrid_model()) {
+        // Auto-detect: model has varying K dimensions across layers
+        auto compactable = kv_state.get_compactable_layers(0, n_head_kv);
+        if ((int)compactable.size() < (int)sd.n_layer) {
+            attention_layers = compactable;
+            explicit_layer_list.layers = attention_layers.data();
+            explicit_layer_list.n_layers = (int)attention_layers.size();
+            layer_filter = kv_layer_filter_explicit;
+            layer_filter_data = &explicit_layer_list;
+            LOG_INF("Layer filter: auto-detected hybrid model, %d / %u compactable layers\n",
+                    explicit_layer_list.n_layers, sd.n_layer);
+        }
+    }
+
+    int n_compact_layers = layer_filter
+        ? kv_compact_count_layers(layer_filter, layer_filter_data, sd.n_layer)
+        : (int)sd.n_layer;
+    LOG_INF("Compacting %d / %u layers (%d skipped)\n",
+            n_compact_layers, sd.n_layer, (int)sd.n_layer - n_compact_layers);
+
     // Reference queries: use K from last quarter of context (all heads)
     const int ref_start = (int)sd.cell_count - n_ref_queries;
     // Q_ref_all: [n_ref_queries, n_embd_k_gqa]
@@ -432,7 +490,13 @@ int main(int argc, char ** argv) {
         all_sensitivities.reserve((size_t)sd.n_layer * n_head_kv);
     }
 
+    int layers_scored = 0;
     for (uint32_t l = 0; l < sd.n_layer; l++) {
+        // Skip non-attention layers (hybrid architecture support)
+        if (layer_filter && !layer_filter(l, sd.n_layer, layer_filter_data)) {
+            continue;
+        }
+
         const auto & ld = sd.layers[l];
         lh_cache[l].resize(n_head_kv);
 
@@ -489,8 +553,10 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
-            LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
+        layers_scored++;
+        if (layers_scored % 8 == 0 || l + 1 == sd.n_layer) {
+            LOG_INF("  Scored %d / %d attention layers (layer %u / %u)\n",
+                    layers_scored, n_compact_layers, l + 1, sd.n_layer);
         }
     }
 
@@ -535,10 +601,24 @@ int main(int argc, char ** argv) {
     prof.begin("NNLS + least-squares");
     std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
 
+    int layers_compacted = 0;
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
         cv_all[l].resize(n_head_kv);
         beta_all[l].resize(n_head_kv);
+
+        // Skip non-attention layers: passthrough original V values
+        if (layer_filter && !layer_filter(l, sd.n_layer, layer_filter_data)) {
+            for (int h = 0; h < n_head_kv; h++) {
+                beta_all[l][h].assign(t, 0.0f);
+                cv_all[l][h].resize(t * d_v);
+                for (int j = 0; j < t; j++) {
+                    const float * src = ld.V.data() + shared_selected[j] * n_embd_v_gqa + h * d_v;
+                    memcpy(cv_all[l][h].data() + j * d_v, src, d_v * sizeof(float));
+                }
+            }
+            continue;
+        }
 
         for (int h = 0; h < n_head_kv; h++) {
             const auto & hc = lh_cache[l][h];
@@ -587,8 +667,10 @@ int main(int argc, char ** argv) {
             least_squares_solve(X.data(), Y.data(), cv.data(), n_ref_queries, t, d_v);
         }
 
-        if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
-            LOG_INF("  Compacted %u / %u layers\n", l + 1, sd.n_layer);
+        layers_compacted++;
+        if (layers_compacted % 8 == 0 || l + 1 == sd.n_layer) {
+            LOG_INF("  Compacted %d / %d attention layers (layer %u / %u)\n",
+                    layers_compacted, n_compact_layers, l + 1, sd.n_layer);
         }
     }
 
@@ -606,6 +688,15 @@ int main(int argc, char ** argv) {
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
         beta_dirs[l].resize(n_head_kv);
+
+        // Skip non-attention layers: zero beta direction (beta=0, so direction is irrelevant)
+        if (layer_filter && !layer_filter(l, sd.n_layer, layer_filter_data)) {
+            for (int h = 0; h < n_head_kv; h++) {
+                beta_dirs[l][h].assign(d_k, 0.0f);
+            }
+            continue;
+        }
+
         for (int h = 0; h < n_head_kv; h++) {
             beta_dirs[l][h].resize(d_k);
             // Extract Q_ref for this head
@@ -619,7 +710,8 @@ int main(int argc, char ** argv) {
                                    beta_dirs[l][h].data());
         }
     }
-    LOG_INF("Computed beta directions for %u layers × %d heads\n", sd.n_layer, n_head_kv);
+    LOG_INF("Computed beta directions for %d / %u layers × %d heads\n",
+            n_compact_layers, sd.n_layer, n_head_kv);
     {
         size_t dir_mem = (size_t)sd.n_layer * n_head_kv * d_k * sizeof(float);
         prof.end(dir_mem);
@@ -631,9 +723,30 @@ int main(int argc, char ** argv) {
     LOG_INF("\n--- Phase 5: Quality metrics ---\n");
     prof.begin("Quality metrics");
 
-    // Evaluate on 3 representative layers
-    int eval_layers[] = { 0, (int)sd.n_layer / 2, (int)sd.n_layer - 1 };
-    for (int li = 0; li < 3; li++) {
+    // Evaluate on up to 3 representative attention layers
+    std::vector<int> candidate_layers;
+    if (layer_filter) {
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            if (layer_filter(l, sd.n_layer, layer_filter_data)) {
+                candidate_layers.push_back(l);
+            }
+        }
+    } else {
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            candidate_layers.push_back(l);
+        }
+    }
+    // Pick first, middle, last from the attention layers
+    int eval_layers[3];
+    int n_eval_layers = 0;
+    if (!candidate_layers.empty()) {
+        eval_layers[n_eval_layers++] = candidate_layers.front();
+        if (candidate_layers.size() > 2)
+            eval_layers[n_eval_layers++] = candidate_layers[candidate_layers.size() / 2];
+        if (candidate_layers.size() > 1)
+            eval_layers[n_eval_layers++] = candidate_layers.back();
+    }
+    for (int li = 0; li < n_eval_layers; li++) {
         int l = eval_layers[li];
         if (l < 0 || l >= (int)sd.n_layer) continue;
 

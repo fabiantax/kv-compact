@@ -255,6 +255,8 @@ kv_compact_params kv_compact_params_default(void) {
     p.diversity_strength = 0.5f;
     p.n_shared_prefix = 0;
     p.use_cheap_qref = 0;
+    p.layer_filter = NULL;
+    p.layer_filter_data = NULL;
     return p;
 }
 

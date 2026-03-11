@@ -163,13 +163,19 @@ static void compact_layer_into(
 // Copies original V values for selected positions (no LS refit).
 // LS value refit requires real Q vectors which aren't available from
 // the KV cache state alone.
+//
+// layer_filter: optional filter to skip non-attention layers in hybrid models.
+//   When NULL, all layers are compacted. When provided, skipped layers still
+//   get their original V values copied (passthrough) to maintain state format.
 static void compact_all_layers(
         const parsed_kv_state::stream_data & sd,
         const std::vector<int> & selected,
         int n_head_kv, int d_k, int d_v,
         std::vector<std::vector<std::vector<float>>> & cv_all,
         std::vector<std::vector<std::vector<float>>> & beta_all,
-        std::vector<std::vector<std::vector<float>>> & dirs_all) {
+        std::vector<std::vector<std::vector<float>>> & dirs_all,
+        kv_layer_filter_fn layer_filter = NULL,
+        void * layer_filter_data = NULL) {
 
     const int n_layer = (int)sd.n_layer;
     const int t = (int)selected.size();
@@ -186,6 +192,8 @@ static void compact_all_layers(
             beta_all[l][h].resize(t);
         }
 
+        // All layers get original V passthrough (same behavior for
+        // attention and non-attention layers in this V-copy mode)
         compact_layer_into(sd.layers[l].V.data(), selected,
                           sd.cell_count, n_head_kv, d_v,
                           beta_all[l], cv_all[l]);

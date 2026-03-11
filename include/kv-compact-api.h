@@ -35,6 +35,58 @@ extern "C" {
 #endif
 
 // ============================================================================
+// Layer filter — determines which layers have compactable KV caches
+// ============================================================================
+
+// Callback to decide whether a layer should be compacted.
+// Returns non-zero (true) if the layer should be compacted, 0 to skip.
+//
+// For standard transformers: return true for all layers.
+// For hybrid architectures (e.g., Qwen 3.5 with 30 DeltaNet + 10 attention):
+//   return true only for softmax attention layers that have KV caches.
+//
+// layer_idx: 0-based layer index
+// n_layers:  total number of layers in the model
+// user_data: opaque pointer passed through from params
+typedef int (*kv_layer_filter_fn)(int layer_idx, int n_layers, void * user_data);
+
+// Built-in filter: compact all layers (default behavior)
+static inline int kv_layer_filter_all(int layer_idx, int n_layers, void * user_data) {
+    (void)layer_idx; (void)n_layers; (void)user_data;
+    return 1;
+}
+
+// Built-in filter: compact every Nth layer (for hybrid models with periodic attention)
+// Pass the attention interval as user_data: (void *)(intptr_t)interval
+// Example: Qwen 3.5 has full_attention_interval=4, so attention layers are 3,7,11,...
+//   filter_fn = kv_layer_filter_periodic
+//   filter_user_data = (void *)(intptr_t)4
+static inline int kv_layer_filter_periodic(int layer_idx, int n_layers, void * user_data) {
+    (void)n_layers;
+    int interval = (int)(intptr_t)user_data;
+    if (interval <= 0) return 1;
+    return ((layer_idx + 1) % interval == 0) ? 1 : 0;
+}
+
+// Built-in filter: compact only layers listed in an explicit array
+// user_data must point to a kv_layer_list struct
+typedef struct kv_layer_list {
+    const int * layers;   // sorted array of layer indices to compact
+    int         n_layers; // number of entries in the array
+} kv_layer_list;
+
+static inline int kv_layer_filter_explicit(int layer_idx, int n_layers, void * user_data) {
+    (void)n_layers;
+    const kv_layer_list * list = (const kv_layer_list *)user_data;
+    if (!list || !list->layers) return 1;
+    for (int i = 0; i < list->n_layers; i++) {
+        if (list->layers[i] == layer_idx) return 1;
+        if (list->layers[i] > layer_idx) break;  // sorted, early exit
+    }
+    return 0;
+}
+
+// ============================================================================
 // Parameters
 // ============================================================================
 
@@ -59,6 +111,13 @@ typedef struct kv_compact_params {
     int    use_cheap_qref;     // use K-vector proxy for Q_ref (0=disabled, default: 0)
                                // when enabled, Q_ref_all can be NULL and reference
                                // queries are generated from K vectors automatically.
+
+    // Layer filter for hybrid architectures (e.g., Qwen 3.5 DeltaNet + attention)
+    // When non-NULL, only layers where filter returns non-zero are compacted.
+    // Layers that are filtered out are passed through unchanged.
+    // Default: NULL (compact all layers — equivalent to kv_layer_filter_all)
+    kv_layer_filter_fn  layer_filter;
+    void *              layer_filter_data;
 } kv_compact_params;
 
 // ============================================================================
@@ -144,6 +203,24 @@ int kv_compact_multi_round(
 
 // Free all memory allocated by kv_compact()
 void kv_compact_result_free(kv_compact_result * result);
+
+// Count how many layers pass the filter (utility for callers doing multi-layer compaction)
+static inline int kv_compact_count_layers(
+        kv_layer_filter_fn filter, void * filter_data, int n_layers) {
+    if (!filter) return n_layers;
+    int count = 0;
+    for (int l = 0; l < n_layers; l++) {
+        if (filter(l, n_layers, filter_data)) count++;
+    }
+    return count;
+}
+
+// Check if a specific layer should be compacted
+static inline int kv_compact_should_compact_layer(
+        const kv_compact_params * params, int layer_idx, int n_layers) {
+    if (!params || !params->layer_filter) return 1;
+    return params->layer_filter(layer_idx, n_layers, params->layer_filter_data);
+}
 
 #ifdef __cplusplus
 }
