@@ -2611,6 +2611,150 @@ static void test_sinkhorn_via_config() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// Streaming compaction tests (Phase 1)
+// ============================================================================
+
+static void test_streaming_config_validation() {
+    printf("  test_streaming_config_validation...");
+
+    streaming_config cfg;
+
+    // Default config should be valid
+    assert(cfg.is_valid());
+
+    // Invalid: budget <= 0
+    streaming_config cfg1;
+    cfg1.budget = 0;
+    assert(!cfg1.is_valid());
+
+    // Invalid: trigger <= budget
+    streaming_config cfg2;
+    cfg2.budget = 1000;
+    cfg2.trigger = 500;
+    assert(!cfg2.is_valid());
+
+    // Invalid: negative pin_prefix
+    streaming_config cfg3;
+    cfg3.pin_prefix = -1;
+    assert(!cfg3.is_valid());
+
+    // Invalid: pin + recent >= budget
+    streaming_config cfg4;
+    cfg4.budget = 1000;
+    cfg4.trigger = 2000;
+    cfg4.pin_prefix = 600;
+    cfg4.recent_window = 500;
+    assert(!cfg4.is_valid());
+
+    printf(" OK\n");
+}
+
+static void test_streaming_config_helpers() {
+    printf("  test_streaming_config_helpers...");
+
+    streaming_config cfg;
+    cfg.budget = 4096;
+    cfg.trigger = 1024;  // Lower trigger for testing
+    cfg.pin_prefix = 256;
+    cfg.recent_window = 512;
+
+    // Test target_size()
+    assert(cfg.target_size() == 4096 - 256 - 512);  // 3328
+
+    // Test compactable_size() at various cache sizes
+    assert(cfg.compactable_size(100) == 0);      // Below trigger
+    assert(cfg.compactable_size(500) == 0);      // 500 - 256 - (512-0) < trigger
+    assert(cfg.compactable_size(1500) == 732);   // Above trigger: max(256, 1500-512) - 256 = 732
+    assert(cfg.compactable_size(3000) == 2232);  // 3000 - 256 - 512 = 2232
+
+    printf(" OK\n");
+}
+
+static void test_streaming_compactor_init() {
+    printf("  test_streaming_compactor_init...");
+
+    streaming_config cfg;
+    cfg.budget = 1024;
+    cfg.trigger = 2048;
+    cfg.pin_prefix = 128;
+    cfg.recent_window = 256;
+
+    streaming_compactor compactor(cfg);
+
+    // Initial state
+    assert(compactor.size() == 0);
+    assert(compactor.round() == 0);
+    assert(!compactor.needs_compaction());
+
+    // Add tokens below trigger
+    compactor.add_tokens(1000);
+    assert(compactor.size() == 1000);
+    assert(!compactor.needs_compaction());
+
+    // Add tokens above trigger
+    compactor.add_tokens(1500);
+    assert(compactor.size() == 2500);
+    assert(compactor.needs_compaction());
+
+    printf(" OK\n");
+}
+
+static void test_streaming_compactor_basic_workflow() {
+    printf("  test_streaming_compactor_basic_workflow...");
+
+    streaming_config cfg;
+    cfg.budget = 512;
+    cfg.trigger = 1024;
+    cfg.pin_prefix = 64;
+    cfg.recent_window = 128;
+    cfg.select_mode = KEY_SELECT_MAX_ATTN;
+    cfg.fit_mode = BETA_FIT_NNLS;
+
+    streaming_compactor compactor(cfg);
+
+    // Initialize with 2 layers, 2 heads, d_k=64, d_v=64
+    const int n_layers = 2;
+    const int n_heads_kv = 2;
+    const int d_k = 64;
+    const int d_v = 64;
+
+    compactor.init(n_layers, n_heads_kv, d_k, d_v);
+
+    // Verify initialization
+    assert(compactor.get_state(0, 0).is_empty());
+    assert(compactor.get_state(0, 1).is_empty());
+    assert(compactor.get_state(1, 0).is_empty());
+
+    // Add tokens to reach trigger
+    compactor.add_tokens(1100);
+    assert(compactor.needs_compaction());
+    assert(compactor.size() == 1100);
+
+    // Test position mapping
+    std::vector<int> mapping = compactor.position_mapping(1100);
+    assert(mapping.size() == 1100);
+
+    // Pinned zone should map 1-to-1
+    for (int i = 0; i < 64; i++) {
+        assert(mapping[i] == i);
+    }
+
+    // Recent zone should map to compacted range
+    int recent_start = 1100 - 128;
+    for (int i = recent_start; i < 1100; i++) {
+        assert(mapping[i] >= 64);  // After pinned zone
+    }
+
+    // Reset
+    compactor.reset();
+    assert(compactor.size() == 0);
+    assert(compactor.round() == 0);
+    assert(!compactor.needs_compaction());
+
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -2723,6 +2867,12 @@ int main() {
     printf("\n=== Config struct ===\n");
     test_compaction_config_defaults();
     test_sinkhorn_via_config();
+
+    printf("\n=== Streaming compaction (Phase 1) ===\n");
+    test_streaming_config_validation();
+    test_streaming_config_helpers();
+    test_streaming_compactor_init();
+    test_streaming_compactor_basic_workflow();
 
     printf("\nAll tests passed!\n");
     return 0;

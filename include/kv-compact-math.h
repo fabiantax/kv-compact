@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 // Key selection strategy for compaction (Paper Step 1, Section 3.1)
@@ -359,6 +360,487 @@ struct compaction_config {
     beta_fit_mode   fit_mode     = BETA_FIT_NNLS;        // Step 2: beta fitting
     int             n_alt_rounds = 2;        // Sec 10: alternating minimization rounds
     const float *   head_sensitivity = nullptr; // Sec 18: per-head weights (nullptr = auto)
+};
+
+// ============================================================================
+// Streaming compaction (Phase 1) - plan.md
+// ============================================================================
+//
+// For 200K+ context agentic workloads, we compact incrementally in chunks
+// rather than all at once. This divides a 200K token cache into ~25 rounds
+// of 8K→4K compaction, each taking <100ms.
+//
+// Zone architecture: [pinned_prefix] || [compactable] || [recent_window]
+//   - pinned_prefix:   System prompt, tool boundaries (never touched)
+//   - compactable:     Middle zone subject to compaction
+//   - recent_window:   Last N tokens for direct attention (never touched)
+//
+// When current_size >= trigger:
+//   1. Split cache into zones
+//   2. Compact compactable zone: T_compact → (budget - pin_prefix - recent_window)
+//   3. Use reference queries from recent window (free, already in cache)
+//   4. Write back: [pinned] + [compacted] + [recent]
+//   5. Adjust RoPE for new positions
+//
+// Ref: XStreamVGGT (arXiv:2601.01204, 2026), Deep Forcing (arXiv:2512.05081, 2025)
+
+// Forward declaration (defined later, used by streaming_compactor)
+struct compacted_layer;
+
+struct streaming_config {
+    int budget = 4096;                    // Max tokens to retain after compaction
+    int trigger = 8192;                   // Compact when cache hits this size
+    int pin_prefix = 256;                 // First N tokens are pinned (system prompt)
+    int recent_window = 512;              // Last N tokens are never compacted
+
+    // Algorithm selection (inherited from compaction_config)
+    key_select_mode select_mode = KEY_SELECT_MAX_ATTN;
+    beta_fit_mode   fit_mode    = BETA_FIT_NNLS;
+    int n_alt_rounds = 2;
+
+    // Advanced options (from 2026 papers)
+    float attention_threshold = 0.9f;     // TCA-Attention: min attention to keep token
+    float drift_threshold = 0.1f;         // Deep Forcing: trigger if attention drifts
+    int reanchor_interval = 5;            // Re-compute beta from scratch every N rounds
+    bool use_layer_adaptive = true;       // TCA-Attention: per-layer budget scaling
+
+    // Validate configuration
+    bool is_valid() const {
+        return budget > 0 && trigger > budget &&
+               pin_prefix >= 0 && recent_window >= 0 &&
+               pin_prefix + recent_window < budget &&
+               attention_threshold > 0 && attention_threshold < 1;
+    }
+
+    // Compute compactable zone size given current cache size
+    int compactable_size(int current_size) const {
+        if (current_size <= trigger) return 0;
+        int recent_start = std::max(pin_prefix, current_size - recent_window);
+        return recent_start - pin_prefix;
+    }
+
+    // Compute target compacted size
+    int target_size() const {
+        return budget - pin_prefix - recent_window;
+    }
+};
+
+// Forward declarations for streaming compaction (defined later, used below)
+struct compacted_layer;
+static compacted_layer compact_layer_all_heads(
+        const float * K_all, const float * V_all, const float * Q_ref_all,
+        int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
+        const compaction_config & cfg);
+
+// Per-head compacted state for streaming compaction
+//
+// Stores the accumulated compacted KV cache for a single head across
+// multiple compaction rounds. After each round:
+//   - C_k: compacted keys [budget * d_k]
+//   - C_v: compacted values [budget * d_v]
+//   - beta: attention biases [budget]
+//   - n_compacted: actual number of slots used (≤ budget)
+struct streaming_head_state {
+    std::vector<float> C_k;     // [budget * d_k] compacted keys
+    std::vector<float> C_v;     // [budget * d_v] compacted values
+    std::vector<float> beta;    // [budget] attention biases
+    int n_compacted = 0;        // actual slots used
+
+    // Reset state (e.g., when starting a new sequence)
+    void clear() {
+        C_k.clear();
+        C_v.clear();
+        beta.clear();
+        n_compacted = 0;
+    }
+
+    // Reserve capacity for budget
+    void reserve(int budget, int d_k, int d_v) {
+        C_k.reserve(budget * d_k);
+        C_v.reserve(budget * d_v);
+        beta.reserve(budget);
+    }
+
+    // Check if state has been initialized
+    bool is_empty() const { return n_compacted == 0; }
+};
+
+// Streaming compaction engine for 200K+ context workloads
+//
+// Manages incremental KV cache compaction across multiple rounds.
+// Each round compacts a chunk when the cache exceeds the trigger threshold.
+//
+// Usage:
+//   streaming_compactor compactor(cfg);
+//   while (generating) {
+//       add_tokens(new_K, new_V, ...);
+//       if (compactor.needs_compaction()) {
+//           compact(K, V, ...);
+//       }
+//   }
+//
+// State management:
+//   - Per-layer per-head state accumulated across rounds
+//   - Pin zones preserved across compactions
+//   - Recent window merged with compacted state
+class streaming_compactor {
+    const streaming_config cfg;
+    int current_size = 0;               // Current cache size (tokens)
+    int round_number = 0;               // Compaction round counter
+
+    // Accumulated compacted state: [layer][head]
+    std::vector<std::vector<streaming_head_state>> layer_heads;
+
+    // Cache of selected indices from last compaction (for position mapping)
+    mutable std::vector<int> selected_indices_cache;
+
+public:
+    explicit streaming_compactor(const streaming_config & config)
+        : cfg(config) {
+        if (!cfg.is_valid()) {
+            throw std::invalid_argument("Invalid streaming_config");
+        }
+    }
+
+    // Initialize layer/head structure
+    void init(int n_layers, int n_heads_kv, int d_k, int d_v) {
+        layer_heads.clear();
+        layer_heads.reserve(n_layers);
+        for (int l = 0; l < n_layers; l++) {
+            std::vector<streaming_head_state> heads;
+            heads.reserve(n_heads_kv);
+            for (int h = 0; h < n_heads_kv; h++) {
+                streaming_head_state state;
+                state.reserve(cfg.budget, d_k, d_v);
+                heads.push_back(std::move(state));
+            }
+            layer_heads.push_back(std::move(heads));
+        }
+    }
+
+    // Check if compaction should trigger
+    bool needs_compaction() const {
+        return current_size >= cfg.trigger;
+    }
+
+    // Get current cache size
+    int size() const { return current_size; }
+
+    // Get current round number
+    int round() const { return round_number; }
+
+    // Add new tokens (without compacting)
+    void add_tokens(int n_tokens) {
+        current_size += n_tokens;
+    }
+
+    // Merge new tokens into compacted state (for streaming scenarios)
+    //
+    // When new tokens arrive after compaction, append them to the recent window.
+    // This extends the cache without immediately compacting.
+    //
+    // K_new: [n_new * n_embd_k_gqa] new keys to append
+    // V_new: [n_new * n_embd_v_gqa] new values to append
+    // layer_idx: which layer to update
+    // n_heads_kv, d_k, d_v: dimensions
+    void merge_new_tokens(
+        const float * K_new,
+        const float * V_new,
+        int n_new,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v) {
+
+        if (n_new <= 0) return;
+        if (layer_idx >= (int)layer_heads.size()) return;
+
+        const int n_embd_k_gqa = n_heads_kv * d_k;
+        const int n_embd_v_gqa = n_heads_kv * d_v;
+
+        // For each head, append new tokens to the recent window
+        for (int h = 0; h < n_heads_kv; h++) {
+            auto & state = layer_heads[layer_idx][h];
+
+            // Extend buffers to accommodate new tokens
+            int old_size = state.n_compacted;
+            int new_size = old_size + n_new;
+
+            // Don't exceed budget
+            if (new_size > cfg.budget) {
+                new_size = cfg.budget;
+                n_new = new_size - old_size;
+                if (n_new <= 0) break;
+            }
+
+            // Resize buffers
+            state.C_k.resize((old_size + n_new) * d_k);
+            state.C_v.resize((old_size + n_new) * d_v);
+            state.beta.resize(old_size + n_new);
+
+            // Copy new K/V for this head (GQA format)
+            for (int i = 0; i < n_new; i++) {
+                // Copy key
+                memcpy(state.C_k.data() + (old_size + i) * d_k,
+                       K_new + i * n_embd_k_gqa + h * d_k,
+                       d_k * sizeof(float));
+                // Copy value
+                memcpy(state.C_v.data() + (old_size + i) * d_v,
+                       V_new + i * n_embd_v_gqa + h * d_v,
+                       d_v * sizeof(float));
+                // New tokens get zero beta (no attention bias yet)
+                state.beta[old_size + i] = 0.0f;
+            }
+
+            state.n_compacted = new_size;
+        }
+
+        current_size += n_new;
+    }
+
+    // Reset state (e.g., for new sequence)
+    void reset() {
+        current_size = 0;
+        round_number = 0;
+        for (auto & layer : layer_heads) {
+            for (auto & head : layer) {
+                head.clear();
+            }
+        }
+    }
+
+    // Get compacted state for a specific layer/head
+    const streaming_head_state & get_state(int layer, int head) const {
+        return layer_heads.at(layer).at(head);
+    }
+
+    // Get mutable state for a specific layer/head (for write-back)
+    streaming_head_state & get_state(int layer, int head) {
+        return layer_heads.at(layer).at(head);
+    }
+
+    // Get merged K/V for a layer (for write-back to llama.cpp)
+    //
+    // Returns the compacted K/V for all heads in GQA format, ready for
+    // writing back to llama.cpp state buffer.
+    //
+    // output_K: [n_compacted * n_embd_k_gqa] output buffer for merged keys
+    // output_V: [n_compacted * n_embd_v_gqa] output buffer for merged values
+    // layer_idx: which layer to export
+    // n_heads_kv, d_k, d_v: dimensions
+    void get_merged_layer(
+        float * output_K,
+        float * output_V,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v) const {
+
+        if (layer_idx >= (int)layer_heads.size()) return;
+
+        const int n_embd_k_gqa = n_heads_kv * d_k;
+        const int n_embd_v_gqa = n_heads_kv * d_v;
+
+        // For each head, copy compacted state to output
+        for (int h = 0; h < n_heads_kv; h++) {
+            const auto & state = layer_heads[layer_idx][h];
+            int n = state.n_compacted;
+
+            for (int i = 0; i < n; i++) {
+                // Copy key to correct position in GQA output
+                memcpy(output_K + i * n_embd_k_gqa + h * d_k,
+                       state.C_k.data() + i * d_k,
+                       d_k * sizeof(float));
+                // Copy value
+                memcpy(output_V + i * n_embd_v_gqa + h * d_v,
+                       state.C_v.data() + i * d_v,
+                       d_v * sizeof(float));
+            }
+        }
+    }
+
+    // Perform one round of compaction on a single layer
+    //
+    // K_all: [current_size * n_embd_k_gqa] all keys in cache (GQA interleaved)
+    // V_all: [current_size * n_embd_v_gqa] all values in cache (GQA interleaved)
+    // Q_ref: [n_ref * n_embd_k_gqa] reference queries (from recent window)
+    // layer_idx: which layer we're compacting
+    //
+    // Returns: true if compaction occurred, false otherwise
+    //
+    // Note: This is the skeleton implementation. The full integration with
+    // compact_layer_all_heads is implemented in phase1-2-1 (chunk-based key selection).
+    bool compact_layer(
+        const float * K_all,
+        const float * V_all,
+        const float * Q_ref,
+        int n_ref,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v);
+
+    // Internal implementation (defined after compact_layer_all_heads)
+    bool compact_layer_impl(
+        const float * K_all,
+        const float * V_all,
+        const float * Q_ref,
+        int n_ref,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v);
+
+    // Compute position mapping after compaction
+    //
+    // Returns a vector mapping old positions to new positions:
+    //   - Pinned tokens: [0, pin_prefix) → [0, pin_prefix)
+    //   - Compacted tokens: only selected indices map to [pin_prefix, pin_prefix + target_t)
+    //   - Recent tokens: [recent_start, current_size) → [pin_prefix + target_t, budget)
+    //
+    // Note: Non-selected compactable tokens map to -1 (evicted)
+    std::vector<int> position_mapping(int old_size) const {
+        std::vector<int> mapping(old_size, -1);
+        if (old_size == 0) return mapping;
+
+        int pin_end = cfg.pin_prefix;
+        int recent_start = std::max(pin_end, old_size - (int)cfg.recent_window);
+        int target_t = cfg.target_size();
+
+        // Pinned zone: 1-to-1 mapping
+        for (int i = 0; i < pin_end && i < old_size; i++) {
+            mapping[i] = i;
+        }
+
+        // Compacted zone: selected indices map to compacted range
+        if (!selected_indices_cache.empty()) {
+            for (size_t i = 0; i < selected_indices_cache.size(); i++) {
+                int old_pos = selected_indices_cache[i];
+                if (old_pos >= pin_end && old_pos < old_size) {
+                    mapping[old_pos] = pin_end + i;
+                }
+            }
+        }
+
+        // Recent zone: shift down
+        for (int i = recent_start; i < old_size; i++) {
+            mapping[i] = pin_end + target_t + (i - recent_start);
+        }
+
+        return mapping;
+    }
+
+    // Get selected indices from last compaction
+    const std::vector<int>& get_selected_indices() const {
+        return selected_indices_cache;
+    }
+
+    // Adjust RoPE (Rotary Position Embedding) for position consistency
+    //
+    // After compaction, tokens move from old positions to new positions.
+    // RoPE encodings are position-dependent, so we need to adjust the K
+    // embeddings to reflect their new positions.
+    //
+    // Reference: Deep Forcing (arXiv:2512.05081, 2025) - Sec 3.2 describes
+    // adjusting delta_sink for sink tokens after compression.
+    //
+    // K_tokens: [n_tokens * d_k] key embeddings to adjust (per-head, GQA format)
+    // old_positions: [n_tokens] original positions before compaction
+    // new_positions: [n_tokens] new positions after compaction
+    // d_k: key dimension
+    // rope_dim: number of dimensions using RoPE (typically d_k / 2 for RoPE)
+    // rope_freq_base: frequency base for RoPE (default: 10000 for llama)
+    //
+    // Note: This is a simplified implementation. Full RoPE adjustment requires
+    // access to the model's RoPE parameters and is typically handled during
+    // state restore in llama.cpp. For now, this provides the framework.
+    void adjust_rope(
+        float * K_tokens,
+        const int * old_positions,
+        const int * new_positions,
+        int n_tokens,
+        int d_k,
+        int rope_dim = -1,  // -1 = auto (d_k / 2)
+        float rope_freq_base = 10000.0f) const {
+
+        if (rope_dim < 0) rope_dim = d_k / 2;
+
+        // For each token that moved position
+        for (int i = 0; i < n_tokens; i++) {
+            int old_pos = old_positions[i];
+            int new_pos = new_positions[i];
+
+            if (old_pos == new_pos) continue;  // No change
+
+            // Compute position delta: shift from old to new
+            // RoPE uses exp(i * theta * pos), so a position shift multiplies by:
+            //   exp(i * theta * (new_pos - old_pos))
+            //
+            // For simplicity, we apply a phase shift proportional to the delta.
+            // Full implementation would recompute the RoPE rotation matrix.
+
+            float delta = static_cast<float>(new_pos - old_pos);
+
+            // Apply phase shift to RoPE dimensions (first rope_dim dims)
+            // This is a simplified adjustment; full RoPE requires rotation matrices
+            for (int d = 0; d < rope_dim && d < d_k; d++) {
+                float theta = rope_freq_base * powf(rope_freq_base, -2.0f * d / rope_dim);
+                float phase = delta * theta;
+
+                // Apply rotation: complex multiplication by exp(i * phase)
+                // RoPE interleaves cos/sin, so we rotate pairs
+                int idx = i * d_k + d;
+                if (d + 1 < d_k) {
+                    float k_real = K_tokens[idx];
+                    float k_imag = K_tokens[idx + 1];
+                    float cos_p = cosf(phase);
+                    float sin_p = sinf(phase);
+                    K_tokens[idx]     = k_real * cos_p - k_imag * sin_p;
+                    K_tokens[idx + 1] = k_real * sin_p + k_imag * cos_p;
+                }
+            }
+        }
+    }
+
+    // Adjust RoPE for all compacted tokens in a layer
+    //
+    // Uses position_mapping to compute old→new position deltas.
+    //
+    // layer_idx: which layer to adjust
+    // n_heads_kv, d_k: dimensions
+    // rope_config: optional RoPE configuration (dim, freq_base)
+    void adjust_compacted_rope(
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int rope_dim = -1,
+        float rope_freq_base = 10000.0f) {
+
+        if (layer_idx >= (int)layer_heads.size()) return;
+
+        // Build position mapping for the old cache size
+        std::vector<int> mapping = position_mapping(current_size);
+
+        // For each head, adjust RoPE based on position changes
+        for (int h = 0; h < n_heads_kv; h++) {
+            auto & state = layer_heads[layer_idx][h];
+            int n = state.n_compacted;
+
+            // Collect old and new positions for compacted tokens
+            std::vector<int> old_pos, new_pos;
+            for (int i = 0; i < (int)mapping.size(); i++) {
+                if (mapping[i] >= 0 && mapping[i] < current_size) {
+                    old_pos.push_back(i);
+                    new_pos.push_back(mapping[i]);
+                }
+            }
+
+            if (!old_pos.empty()) {
+                adjust_rope(state.C_k.data(), old_pos.data(), new_pos.data(),
+                          old_pos.size(), d_k, rope_dim, rope_freq_base);
+            }
+        }
+    }
 };
 
 // Result of compacting all heads within a single layer
@@ -1495,3 +1977,108 @@ static compacted_layer compact_layer_all_heads(
 
     return result;
 }
+
+// ============================================================================
+// Streaming compaction implementation (defined after compact_layer_all_heads)
+// ============================================================================
+
+bool streaming_compactor::compact_layer(
+        const float * K_all,
+        const float * V_all,
+        const float * Q_ref,
+        int n_ref,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v) {
+    return compact_layer_impl(K_all, V_all, Q_ref, n_ref, layer_idx, n_heads_kv, d_k, d_v);
+}
+
+bool streaming_compactor::compact_layer_impl(
+        const float * K_all,
+        const float * V_all,
+        const float * Q_ref,
+        int n_ref,
+        int layer_idx,
+        int n_heads_kv,
+        int d_k,
+        int d_v) {
+
+    if (!needs_compaction()) return false;
+    if (layer_idx >= (int)layer_heads.size()) return false;
+    if (n_heads_kv != (int)layer_heads[layer_idx].size()) {
+        // Initialize layer if not done yet
+        init(layer_idx + 1, n_heads_kv, d_k, d_v);
+    }
+
+    const int n_embd_k_gqa = n_heads_kv * d_k;
+    const int n_embd_v_gqa = n_heads_kv * d_v;
+
+    // Compute zones
+    int pin_end = cfg.pin_prefix;
+    int recent_start = std::max(pin_end, current_size - (int)cfg.recent_window);
+    int compactable_size = recent_start - pin_end;
+
+    if (compactable_size <= 0) return false;  // Nothing to compact
+
+    // Target compacted size for middle zone
+    int target_t = cfg.target_size();
+    if (target_t >= compactable_size) return false;  // Already small enough
+
+    // Pointers to compactable zone (GQA format)
+    const float * K_compact = K_all + pin_end * n_embd_k_gqa;
+    const float * V_compact = V_all + pin_end * n_embd_v_gqa;
+    int T_compact = compactable_size;
+
+    // Build compaction config from streaming config
+    compaction_config ccfg;
+    ccfg.select_mode = cfg.select_mode;
+    ccfg.fit_mode = cfg.fit_mode;
+    ccfg.n_alt_rounds = cfg.n_alt_rounds;
+    ccfg.head_sensitivity = nullptr;  // TODO: layer-adaptive budgets
+
+    // Call existing compaction on the compactable zone
+    compacted_layer result = compact_layer_all_heads(
+        K_compact, V_compact, Q_ref,
+        T_compact, n_ref, n_heads_kv, d_k, d_v, target_t,
+        ccfg);
+
+    // Store results in layer_heads state
+    for (int h = 0; h < n_heads_kv; h++) {
+        auto & state = layer_heads[layer_idx][h];
+
+        // Allocate if needed
+        if (state.C_k.empty()) state.C_k.resize(cfg.budget * d_k);
+        if (state.C_v.empty()) state.C_v.resize(cfg.budget * d_v);
+        if (state.beta.empty()) state.beta.resize(cfg.budget);
+
+        // Copy compacted values
+        int t = result.t;
+        state.n_compacted = t;
+
+        // Copy C_v for this head
+        memcpy(state.C_v.data(), result.C_v[h].data(), t * d_v * sizeof(float));
+
+        // Copy beta for this head
+        memcpy(state.beta.data(), result.beta[h].data(), t * sizeof(float));
+
+        // Copy C_k if present (token merging mode)
+        if (!result.C_k.empty() && !result.C_k[h].empty()) {
+            memcpy(state.C_k.data(), result.C_k[h].data(), t * d_k * sizeof(float));
+        }
+    }
+
+    // Store selected indices for position mapping
+    // (indices are relative to compactable zone, need to offset by pin_end)
+    selected_indices_cache.clear();
+    selected_indices_cache.reserve(result.selected_indices.size());
+    for (int idx : result.selected_indices) {
+        selected_indices_cache.push_back(pin_end + idx);
+    }
+
+    round_number++;
+    current_size = pin_end + target_t + cfg.recent_window;
+
+    return true;
+}
+

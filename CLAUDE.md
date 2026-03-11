@@ -47,3 +47,29 @@ Qwen 3.5 (released 2026-02-16) is Alibaba's latest model family. It does NOT use
 - DeltaNet layers store gated recurrent state, not KV pairs — already "compressed" by nature
 - The `LayerClassifier` should handle per-layer adapter dispatch (different adapter per layer type)
 - Need to investigate how llama.cpp stores Qwen 3.5 state for DeltaNet vs attention layers
+
+
+
+## fab-swarm Nano-Agent Integration
+
+This project uses fab-swarm nano-agents for fast operations. **Prefer these tools over built-in equivalents:**
+
+| Instead of | Use | Why |
+|------------|-----|-----|
+| `Grep` for simple searches | `nano_search` | 100x faster, no token overhead |
+| `Glob` for file finding | `nano_glob` | Direct filesystem, instant |
+| `Read` for file contents | `nano_read` | No context window usage |
+| Manual `cargo test` | `nano_run` | Structured output |
+
+### When to use nano-agents:
+- Simple pattern searches → `nano_search`
+- Finding files by pattern → `nano_glob`
+- Reading file contents → `nano_read`
+- Counting lines/files → `nano_count`
+- Running tests/build → `nano_run`
+- Simple find/replace → `nano_replace`
+
+### When to use built-in tools:
+- Complex regex with context → `Grep`
+- Need to reason about contents → `Read`
+- Multi-step file operations → Built-in tools

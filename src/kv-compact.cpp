@@ -78,6 +78,12 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --no-writeback    skip write-back (demo mode: compute quality metrics only)\n");
     LOG("  --no-eviction     skip token eviction baseline\n");
     LOG("\n");
+    LOG("Streaming compaction options (Phase 1):\n");
+    LOG("  --pin-prefix N    pin first N tokens (system prompt, default: 256)\n");
+    LOG("  --recent-window N keep last N tokens uncompactable (default: 512)\n");
+    LOG("  --trigger N       compact when cache exceeds N tokens (default: 8192)\n");
+    LOG("  --budget N        target budget after compaction (default: 4096)\n");
+    LOG("\n");
 }
 
 int main(int argc, char ** argv) {
@@ -88,6 +94,12 @@ int main(int argc, char ** argv) {
     int   n_ref_queries = 0;   // 0 = auto (last quarter)
     bool  do_writeback  = true;
     bool  do_eviction   = true;
+
+    // Streaming compaction parameters (Phase 1)
+    int stream_pin_prefix = 256;
+    int stream_recent_window = 512;
+    int stream_trigger = 8192;
+    int stream_budget = 4096;
 
     // Parse standard params
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
@@ -104,11 +116,61 @@ int main(int argc, char ** argv) {
             do_writeback = false;
         } else if (strcmp(argv[i], "--no-eviction") == 0) {
             do_eviction = false;
+        } else if (strcmp(argv[i], "--pin-prefix") == 0 && i + 1 < argc) {
+            stream_pin_prefix = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--recent-window") == 0 && i + 1 < argc) {
+            stream_recent_window = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--trigger") == 0 && i + 1 < argc) {
+            stream_trigger = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) {
+            stream_budget = std::stoi(argv[++i]);
         }
     }
 
     if (compact_ratio <= 0.0f || compact_ratio >= 1.0f) {
         LOG_ERR("compact-ratio must be between 0 and 1 (exclusive)\n");
+        return 1;
+    }
+
+    // Validate streaming parameters
+    if (stream_pin_prefix < 0) {
+        LOG_ERR("pin-prefix must be non-negative\n");
+        return 1;
+    }
+    if (stream_recent_window < 0) {
+        LOG_ERR("recent-window must be non-negative\n");
+        return 1;
+    }
+    if (stream_trigger <= stream_budget) {
+        LOG_ERR("trigger must be greater than budget\n");
+        return 1;
+    }
+    if (stream_pin_prefix + stream_recent_window >= stream_budget) {
+        LOG_ERR("pin-prefix + recent-window must be less than budget\n");
+        return 1;
+    }
+
+    // Log streaming config if any streaming flag was used
+    bool use_streaming = (stream_trigger != 8192 || stream_budget != 4096 ||
+                          stream_pin_prefix != 256 || stream_recent_window != 512);
+
+    if (use_streaming) {
+        LOG_INF("Streaming mode ENABLED: budget=%d, trigger=%d, pin=%d, recent=%d\n",
+                stream_budget, stream_trigger, stream_pin_prefix, stream_recent_window);
+    }
+
+    // Construct streaming_config
+    streaming_config stream_cfg;
+    stream_cfg.budget = stream_budget;
+    stream_cfg.trigger = stream_trigger;
+    stream_cfg.pin_prefix = stream_pin_prefix;
+    stream_cfg.recent_window = stream_recent_window;
+    stream_cfg.select_mode = KEY_SELECT_MAX_ATTN;
+    stream_cfg.fit_mode = BETA_FIT_NNLS;
+    stream_cfg.n_alt_rounds = 2;
+
+    if (use_streaming && !stream_cfg.is_valid()) {
+        LOG_ERR("Invalid streaming configuration\n");
         return 1;
     }
 

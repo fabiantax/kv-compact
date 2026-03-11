@@ -90,3 +90,10 @@ via `hybrid_classifier` and applies compaction only to full-attention layers.
 - Value refitting: ~4M× MSE improvement over token eviction at 4x compression
 - Cosine similarity: 0.999999 at 50% compression
 - Benchmarked up to 50x compression at T=4096 with Qwen3.5-0.8B dimensions
+
+## Documentation
+
+- [`docs/timeline.md`](docs/timeline.md) — Development timeline & 5-phase roadmap (Phases 1-5 are TODO)
+- [`docs/improvement-tracker.md`](docs/improvement-tracker.md) — Implementation status matrix
+- [`plan.md`](plan.md) — Detailed streaming compaction roadmap
+- [`docs/attention-matching-paper.md`](docs/attention-matching-paper.md) — Full paper breakdown
