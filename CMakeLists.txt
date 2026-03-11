@@ -87,12 +87,14 @@ if(KV_COMPACT_BUILD_TOOL)
         ggml
     )
 
-    # Real-model quality benchmark
+    # Real-model quality benchmark (thread-parallel per-layer compaction)
+    find_package(Threads REQUIRED)
     add_executable(bench-kv-compact-model tests/bench-kv-compact-model.cpp)
     target_link_libraries(bench-kv-compact-model PRIVATE
         kv-compact-api
         llama
         common
         ggml
+        Threads::Threads
     )
 endif()

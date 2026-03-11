@@ -22,6 +22,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kv-compact-api.h"
@@ -121,127 +122,261 @@ static double kl_divergence(const std::vector<float> & p, const std::vector<floa
 }
 
 // ============================================================================
-// Per-layer NNLS beta + LS value refit using shared selected indices
+// Thread-parallel per-layer NNLS beta + LS value refit
 // ============================================================================
 //
-// Given pre-selected key indices (from layer 0), runs the full 3-step pipeline
-// (Steps 2-3 from the paper) on each layer independently:
-//   - Generate cheap Q_ref from layer's K
-//   - NNLS solve for per-head beta (Section 3.2)
-//   - LS solve for per-head C_v (Section 3.3)
+// Pre-allocates one workspace per thread (zero allocation in hot path),
+// uses mat_mul_ABt for the O(n_q·T·d_k) scoring bottleneck, and distributes
+// layers across hardware threads.
 
-struct per_layer_compact_result {
-    std::vector<std::vector<float>> beta;  // [n_head_kv][t]
-    std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+// Per-thread pre-allocated workspace — sized once, reused across layers.
+struct compact_work_buf {
+    std::vector<float> Q_h;           // [n_q × d_k]    per-head Q_ref slice
+    std::vector<float> K_h;           // [T × d_k]      per-head K slice
+    std::vector<float> V_h;           // [T × d_v]      per-head V slice (for Y computation)
+    std::vector<float> scores;        // [n_q × T]      raw dot-product scores
+    std::vector<float> exp_scores;    // [n_q × T]      exp(score - max)
+    std::vector<float> row_sums;      // [n_q]           partition function targets
+    std::vector<float> attn_weights;  // [n_q × T]       softmax attention weights
+    std::vector<float> M;             // [n_q × t]       NNLS design matrix
+    std::vector<float> w;             // [t]             NNLS output weights
+    std::vector<float> X;             // [n_q × t]       LS design matrix
+    std::vector<float> Y;             // [n_q × d_v]     LS target (original attn output)
+
+    void resize(int n_q, int T, int t, int d_k, int d_v) {
+        Q_h.resize(n_q * d_k);
+        K_h.resize(T * d_k);
+        V_h.resize(T * d_v);
+        scores.resize(n_q * T);
+        exp_scores.resize(n_q * T);
+        row_sums.resize(n_q);
+        attn_weights.resize(n_q * T);
+        M.resize(n_q * t);
+        w.resize(t);
+        X.resize(n_q * t);
+        Y.resize(n_q * d_v);
+    }
 };
 
-static per_layer_compact_result compact_layer_with_shared_selection(
-        const float * K_layer,  // [T × n_embd_k] all heads concatenated
-        const float * V_layer,  // [T × n_embd_v] all heads concatenated
+// Extract per-head slice from interleaved [T × n_head_kv × dim] to contiguous [T × dim]
+static void extract_head_slice(const float * src, float * dst,
+                               int T, int n_embd, int head, int dim) {
+    for (int i = 0; i < T; i++) {
+        memcpy(dst + i * dim, src + i * n_embd + head * dim, dim * sizeof(float));
+    }
+}
+
+// Compute beta direction for a layer/head: normalized mean of cheap Q_ref positions
+static void compute_beta_dir(const float * K_layer, int T, int n_embd_k,
+                             int head, int d_k, float * dir) {
+    int n_q_ref = std::min(T / 2, 64);
+    if (n_q_ref < 4) n_q_ref = 4;
+
+    memset(dir, 0, d_k * sizeof(float));
+    for (int qi = 0; qi < n_q_ref; qi++) {
+        float frac = (float)(qi + 1) / (float)(n_q_ref + 1);
+        frac = frac * frac;
+        int pos = std::min((int)(frac * (T - 1)), T - 1);
+        const float * k = K_layer + pos * n_embd_k + head * d_k;
+        for (int d = 0; d < d_k; d++) dir[d] += k[d];
+    }
+    float norm = 0.0f;
+    for (int d = 0; d < d_k; d++) norm += dir[d] * dir[d];
+    norm = sqrtf(norm + 1e-12f);
+    for (int d = 0; d < d_k; d++) dir[d] /= norm;
+}
+
+// Run NNLS + LS for one layer using a pre-allocated work buffer.
+// Writes directly into cv_out[h] and beta_out[h] (already sized).
+static void compact_layer_into(
+        compact_work_buf & buf,
+        const float * K_layer,
+        const float * V_layer,
         const std::vector<int> & selected,
         int T, int n_head_kv, int d_k, int d_v,
-        const kv_compact_params & p) {
+        const kv_compact_params & p,
+        std::vector<std::vector<float>> & beta_out,
+        std::vector<std::vector<float>> & cv_out) {
 
     const int t = (int)selected.size();
     const int n_embd_k = n_head_kv * d_k;
     const int n_embd_v = n_head_kv * d_v;
     const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
 
-    // Generate cheap Q_ref from this layer's K
-    int n_q = T / 2;
-    if (n_q > 64) n_q = 64;
-    if (n_q < 4) n_q = 4;
-    if (n_q > T) n_q = T;
+    // Determine n_q (same logic as kv_compact API)
+    int n_q = std::min(std::max(T / 2, 4), std::min(T, 64));
 
-    std::vector<float> Q_ref((size_t)n_q * n_embd_k);
+    // Generate cheap Q_ref positions (shared across heads)
+    std::vector<int> qref_pos(n_q);
     for (int qi = 0; qi < n_q; qi++) {
         float frac = (float)(qi + 1) / (float)(n_q + 1);
-        frac = frac * frac;  // bias toward recent tokens
-        int pos = (int)(frac * (T - 1));
-        if (pos >= T) pos = T - 1;
-        if (pos < 0) pos = 0;
-        memcpy(Q_ref.data() + qi * n_embd_k,
-               K_layer + pos * n_embd_k,
-               n_embd_k * sizeof(float));
+        frac = frac * frac;
+        qref_pos[qi] = std::min((int)(frac * (T - 1)), T - 1);
     }
 
-    per_layer_compact_result out;
-    out.beta.resize(n_head_kv);
-    out.C_v.resize(n_head_kv);
+    buf.resize(n_q, T, t, d_k, d_v);
 
     for (int h = 0; h < n_head_kv; h++) {
-        out.beta[h].resize(t);
-        out.C_v[h].resize(t * d_v);
+        // Extract contiguous per-head K: [T × d_k]
+        extract_head_slice(K_layer, buf.K_h.data(), T, n_embd_k, h, d_k);
 
-        // Compute attention scores: Q_ref[h] @ K[h]^T / sqrt(d_k)
-        std::vector<float> scores(n_q * T);
-        std::vector<float> exp_scores(n_q * T);
-        std::vector<float> row_sums(n_q, 0.0f);
-
+        // Build per-head Q_ref: [n_q × d_k] from K at sampled positions
         for (int qi = 0; qi < n_q; qi++) {
-            const float * q = Q_ref.data() + qi * n_embd_k + h * d_k;
+            memcpy(buf.Q_h.data() + qi * d_k,
+                   buf.K_h.data() + qref_pos[qi] * d_k,
+                   d_k * sizeof(float));
+        }
+
+        // Batched scoring: scores = Q_h @ K_h^T (uses optimized mat_mul_ABt)
+        mat_mul_ABt(buf.Q_h.data(), buf.K_h.data(), buf.scores.data(), n_q, T, d_k);
+
+        // Scale by 1/sqrt(d_k), compute exp and row sums for NNLS
+        for (int qi = 0; qi < n_q; qi++) {
+            float * row = buf.scores.data() + qi * T;
             float max_s = -1e30f;
             for (int j = 0; j < T; j++) {
-                const float * k = K_layer + j * n_embd_k + h * d_k;
-                float dot = 0.0f;
-                for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
-                scores[qi * T + j] = dot * inv_sqrt_dk;
-                if (scores[qi * T + j] > max_s) max_s = scores[qi * T + j];
+                row[j] *= inv_sqrt_dk;
+                if (row[j] > max_s) max_s = row[j];
             }
+            float rsum = 0.0f;
+            float * erow = buf.exp_scores.data() + qi * T;
             for (int j = 0; j < T; j++) {
-                exp_scores[qi * T + j] = expf(scores[qi * T + j] - max_s);
-                row_sums[qi] += exp_scores[qi * T + j];
+                erow[j] = expf(row[j] - max_s);
+                rsum += erow[j];
+            }
+            buf.row_sums[qi] = rsum;
+            // Attention weights (softmax) in-place
+            float * arow = buf.attn_weights.data() + qi * T;
+            float inv_rsum = 1.0f / rsum;
+            for (int j = 0; j < T; j++) {
+                arow[j] = erow[j] * inv_rsum;
             }
         }
 
-        // Attention weights (softmax)
-        std::vector<float> attn_weights(n_q * T);
+        // Build NNLS design matrix M: [n_q × t]
         for (int qi = 0; qi < n_q; qi++) {
-            for (int j = 0; j < T; j++) {
-                attn_weights[qi * T + j] = exp_scores[qi * T + j] / row_sums[qi];
-            }
-        }
-
-        // NNLS for beta: M * w ≈ row_sums
-        std::vector<float> M(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
+            const float * erow = buf.exp_scores.data() + qi * T;
+            float * mrow = buf.M.data() + qi * t;
             for (int j = 0; j < t; j++) {
-                M[qi * t + j] = exp_scores[qi * T + selected[j]];
+                mrow[j] = erow[selected[j]];
             }
         }
 
-        std::vector<float> w(t);
-        nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t, p.nnls_max_iter);
+        nnls_solve(buf.M.data(), buf.row_sums.data(), buf.w.data(), n_q, t, p.nnls_max_iter);
 
         for (int j = 0; j < t; j++) {
-            out.beta[h][j] = logf(std::max(1e-12f, w[j]));
+            beta_out[h][j] = logf(std::max(1e-12f, buf.w[j]));
         }
 
-        // LS for C_v: X * C_v ≈ Y
-        std::vector<float> X(n_q * t);
+        // Build LS design matrix X: softmax(scores[selected] + beta)
         for (int qi = 0; qi < n_q; qi++) {
+            const float * srow = buf.scores.data() + qi * T;
+            float * xrow = buf.X.data() + qi * t;
             for (int j = 0; j < t; j++) {
-                X[qi * t + j] = scores[qi * T + selected[j]] + out.beta[h][j];
+                xrow[j] = srow[selected[j]] + beta_out[h][j];
             }
         }
-        softmax_rows(X.data(), n_q, t);
+        softmax_rows(buf.X.data(), n_q, t);
 
-        // Y = original attention output
-        std::vector<float> Y(n_q * d_v, 0.0f);
+        // Y = attn_weights @ V_h  (original attention output for this head)
+        extract_head_slice(V_layer, buf.V_h.data(), T, n_embd_v, h, d_v);
+        memset(buf.Y.data(), 0, n_q * d_v * sizeof(float));
         for (int qi = 0; qi < n_q; qi++) {
+            const float * arow = buf.attn_weights.data() + qi * T;
+            float * yrow = buf.Y.data() + qi * d_v;
             for (int ki = 0; ki < T; ki++) {
-                float w_ij = attn_weights[qi * T + ki];
-                const float * v_row = V_layer + ki * n_embd_v + h * d_v;
-                for (int d = 0; d < d_v; d++)
-                    Y[qi * d_v + d] += w_ij * v_row[d];
+                float w_ij = arow[ki];
+                const float * vr = buf.V_h.data() + ki * d_v;
+                for (int d = 0; d < d_v; d++) {
+                    yrow[d] += w_ij * vr[d];
+                }
             }
         }
 
-        least_squares_solve(X.data(), Y.data(), out.C_v[h].data(),
+        least_squares_solve(buf.X.data(), buf.Y.data(), cv_out[h].data(),
                            n_q, t, d_v, p.ridge);
     }
+}
 
-    return out;
+// Compact all layers in parallel with shared key selection.
+// Layer 0 can optionally use pre-computed results from kv_compact().
+static void compact_all_layers(
+        const parsed_kv_state::stream_data & sd,
+        const std::vector<int> & selected,
+        const kv_compact_result * layer0_result,  // NULL to recompute layer 0
+        int n_head_kv, int d_k, int d_v,
+        const kv_compact_params & p,
+        std::vector<std::vector<std::vector<float>>> & cv_all,
+        std::vector<std::vector<std::vector<float>>> & beta_all,
+        std::vector<std::vector<std::vector<float>>> & dirs_all) {
+
+    const int n_layer = (int)sd.n_layer;
+    const int T = (int)sd.cell_count;
+    const int t = (int)selected.size();
+    const int n_embd_k = n_head_kv * d_k;
+
+    cv_all.resize(n_layer);
+    beta_all.resize(n_layer);
+    dirs_all.resize(n_layer);
+
+    // Pre-size all output arrays (no allocation inside threads)
+    for (int l = 0; l < n_layer; l++) {
+        cv_all[l].resize(n_head_kv);
+        beta_all[l].resize(n_head_kv);
+        dirs_all[l].resize(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            cv_all[l][h].resize(t * d_v);
+            beta_all[l][h].resize(t);
+            dirs_all[l][h].resize(d_k);
+        }
+    }
+
+    // Populate layer 0 from pre-computed results if available
+    int start_layer = 0;
+    if (layer0_result) {
+        start_layer = 1;
+        for (int h = 0; h < n_head_kv; h++) {
+            memcpy(cv_all[0][h].data(), layer0_result->C_v[h], t * d_v * sizeof(float));
+            memcpy(beta_all[0][h].data(), layer0_result->beta[h], t * sizeof(float));
+            compute_beta_dir(sd.layers[0].K.data(), T, n_embd_k, h, d_k,
+                            dirs_all[0][h].data());
+        }
+    }
+
+    int n_work = n_layer - start_layer;
+    if (n_work <= 0) return;
+
+    // Thread pool: one work buffer per thread (zero allocation in hot path)
+    int n_threads = std::min((int)std::thread::hardware_concurrency(), n_work);
+    if (n_threads < 1) n_threads = 1;
+
+    auto worker = [&](int thread_id) {
+        compact_work_buf buf;  // allocated once per thread, reused across layers
+
+        for (int l = start_layer + thread_id; l < n_layer; l += n_threads) {
+            const auto & ld = sd.layers[l];
+
+            compact_layer_into(buf, ld.K.data(), ld.V.data(), selected,
+                              T, n_head_kv, d_k, d_v, p,
+                              beta_all[l], cv_all[l]);
+
+            for (int h = 0; h < n_head_kv; h++) {
+                compute_beta_dir(ld.K.data(), T, n_embd_k, h, d_k,
+                                dirs_all[l][h].data());
+            }
+        }
+    };
+
+    if (n_threads == 1) {
+        worker(0);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
+        for (int i = 0; i < n_threads; i++) {
+            threads.emplace_back(worker, i);
+        }
+        for (auto & th : threads) th.join();
+    }
 }
 
 // ============================================================================
@@ -352,15 +487,9 @@ static void bench_model_quality(model_info & mi, common_params & params) {
     for (float ratio : ratios) {
         auto t_start = clock_type::now();
 
-        // Use the C API for compaction on layer 0 (representative)
-        // For full benchmark, we compact all layers via state manipulation
+        // Use the C API for compaction on layer 0 to get key selection,
+        // then thread-parallel NNLS + LS across all layers
         int T = n_prompt;
-        int n_embd_k = mi.n_head_kv * actual_d_k;
-        int n_embd_v = mi.n_head_kv * actual_d_v;
-
-        // Use kv_compact API on the first layer to get selected indices
-        int n_ref_q = std::min(T / 2, 64);
-        if (n_ref_q < 4) n_ref_q = 4;
 
         kv_compact_params p = kv_compact_params_default();
         p.target_ratio = ratio;
@@ -378,77 +507,15 @@ static void bench_model_quality(model_info & mi, common_params & params) {
 
         int t = compact_result.t;
 
-        // Build compacted state for ALL layers using the shared selection
+        // Build compacted state for ALL layers using shared selection
+        // Thread-parallel NNLS beta + LS value refit per layer
         std::vector<int> selected(compact_result.selected_indices,
                                    compact_result.selected_indices + t);
 
-        // Full NNLS beta + LS value refit per layer (not simplified eviction)
-        std::vector<std::vector<std::vector<float>>> cv_all(sd.n_layer);
-        std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
-        std::vector<std::vector<std::vector<float>>> beta_dirs(sd.n_layer);
-
-        for (uint32_t l = 0; l < sd.n_layer; l++) {
-            const auto & ld = sd.layers[l];
-
-            if (l == 0) {
-                // Layer 0: use results from kv_compact() directly
-                cv_all[l].resize(mi.n_head_kv);
-                beta_all[l].resize(mi.n_head_kv);
-                beta_dirs[l].resize(mi.n_head_kv);
-                for (int h = 0; h < mi.n_head_kv; h++) {
-                    cv_all[l][h].assign(compact_result.C_v[h],
-                                         compact_result.C_v[h] + t * actual_d_v);
-                    beta_all[l][h].assign(compact_result.beta[h],
-                                           compact_result.beta[h] + t);
-                    // Beta direction: normalized mean of Q_ref (generated from K)
-                    beta_dirs[l][h].resize(actual_d_k);
-                    int n_q_ref = std::min(T / 2, 64);
-                    if (n_q_ref < 4) n_q_ref = 4;
-                    std::fill(beta_dirs[l][h].begin(), beta_dirs[l][h].end(), 0.0f);
-                    for (int qi = 0; qi < n_q_ref; qi++) {
-                        float frac = (float)(qi + 1) / (float)(n_q_ref + 1);
-                        frac = frac * frac;
-                        int pos = std::min((int)(frac * (T - 1)), T - 1);
-                        const float * k = ld.K.data() + pos * n_embd_k + h * actual_d_k;
-                        for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] += k[d];
-                    }
-                    float norm = 0.0f;
-                    for (int d = 0; d < actual_d_k; d++)
-                        norm += beta_dirs[l][h][d] * beta_dirs[l][h][d];
-                    norm = sqrtf(norm + 1e-12f);
-                    for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] /= norm;
-                }
-            } else {
-                // Other layers: run full NNLS + LS with shared selection
-                auto lr = compact_layer_with_shared_selection(
-                    ld.K.data(), ld.V.data(), selected,
-                    T, mi.n_head_kv, actual_d_k, actual_d_v, p);
-
-                cv_all[l] = std::move(lr.C_v);
-                beta_all[l] = std::move(lr.beta);
-
-                // Compute beta direction per head (normalized mean Q_ref)
-                beta_dirs[l].resize(mi.n_head_kv);
-                int n_q_ref = std::min(T / 2, 64);
-                if (n_q_ref < 4) n_q_ref = 4;
-                for (int h = 0; h < mi.n_head_kv; h++) {
-                    beta_dirs[l][h].resize(actual_d_k);
-                    std::fill(beta_dirs[l][h].begin(), beta_dirs[l][h].end(), 0.0f);
-                    for (int qi = 0; qi < n_q_ref; qi++) {
-                        float frac = (float)(qi + 1) / (float)(n_q_ref + 1);
-                        frac = frac * frac;
-                        int pos = std::min((int)(frac * (T - 1)), T - 1);
-                        const float * k = ld.K.data() + pos * n_embd_k + h * actual_d_k;
-                        for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] += k[d];
-                    }
-                    float norm2 = 0.0f;
-                    for (int d = 0; d < actual_d_k; d++)
-                        norm2 += beta_dirs[l][h][d] * beta_dirs[l][h][d];
-                    norm2 = sqrtf(norm2 + 1e-12f);
-                    for (int d = 0; d < actual_d_k; d++) beta_dirs[l][h][d] /= norm2;
-                }
-            }
-        }
+        std::vector<std::vector<std::vector<float>>> cv_all, beta_all, beta_dirs;
+        compact_all_layers(sd, selected, &compact_result,
+                          mi.n_head_kv, actual_d_k, actual_d_v, p,
+                          cv_all, beta_all, beta_dirs);
 
         auto compacted_buf = build_compacted_state(kv_state, selected, cv_all,
                                                     mi.n_head_kv, actual_d_k, actual_d_v,
@@ -599,69 +666,11 @@ static void bench_model_quality(model_info & mi, common_params & params) {
                    &p50, &r50);
 
         std::vector<int> sel50(r50.selected_indices, r50.selected_indices + r50.t);
-        const auto & sd2 = ks2.streams[0];
-        int n_embd_k2 = mi.n_head_kv * actual_d_k;
 
-        // Full NNLS beta + LS value refit per layer
-        std::vector<std::vector<std::vector<float>>> cv50(sd2.n_layer);
-        std::vector<std::vector<std::vector<float>>> beta50(sd2.n_layer);
-        std::vector<std::vector<std::vector<float>>> dirs50(sd2.n_layer);
-
-        for (uint32_t l = 0; l < sd2.n_layer; l++) {
-            const auto & ld = sd2.layers[l];
-
-            if (l == 0) {
-                // Use layer 0 results directly
-                cv50[l].resize(mi.n_head_kv);
-                beta50[l].resize(mi.n_head_kv);
-                dirs50[l].resize(mi.n_head_kv);
-                for (int h = 0; h < mi.n_head_kv; h++) {
-                    cv50[l][h].assign(r50.C_v[h], r50.C_v[h] + r50.t * actual_d_v);
-                    beta50[l][h].assign(r50.beta[h], r50.beta[h] + r50.t);
-                    // Beta direction: normalized mean Q_ref
-                    dirs50[l][h].resize(actual_d_k);
-                    int nqr = std::min(n_prompt / 2, 64);
-                    if (nqr < 4) nqr = 4;
-                    std::fill(dirs50[l][h].begin(), dirs50[l][h].end(), 0.0f);
-                    for (int qi = 0; qi < nqr; qi++) {
-                        float frac = (float)(qi + 1) / (float)(nqr + 1);
-                        frac = frac * frac;
-                        int pos = std::min((int)(frac * (n_prompt - 1)), n_prompt - 1);
-                        const float * k = ld.K.data() + pos * n_embd_k2 + h * actual_d_k;
-                        for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] += k[d];
-                    }
-                    float norm = 0.0f;
-                    for (int d = 0; d < actual_d_k; d++) norm += dirs50[l][h][d] * dirs50[l][h][d];
-                    norm = sqrtf(norm + 1e-12f);
-                    for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] /= norm;
-                }
-            } else {
-                auto lr = compact_layer_with_shared_selection(
-                    ld.K.data(), ld.V.data(), sel50,
-                    n_prompt, mi.n_head_kv, actual_d_k, actual_d_v, p50);
-                cv50[l] = std::move(lr.C_v);
-                beta50[l] = std::move(lr.beta);
-
-                dirs50[l].resize(mi.n_head_kv);
-                int nqr = std::min(n_prompt / 2, 64);
-                if (nqr < 4) nqr = 4;
-                for (int h = 0; h < mi.n_head_kv; h++) {
-                    dirs50[l][h].resize(actual_d_k);
-                    std::fill(dirs50[l][h].begin(), dirs50[l][h].end(), 0.0f);
-                    for (int qi = 0; qi < nqr; qi++) {
-                        float frac = (float)(qi + 1) / (float)(nqr + 1);
-                        frac = frac * frac;
-                        int pos = std::min((int)(frac * (n_prompt - 1)), n_prompt - 1);
-                        const float * k = ld.K.data() + pos * n_embd_k2 + h * actual_d_k;
-                        for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] += k[d];
-                    }
-                    float norm = 0.0f;
-                    for (int d = 0; d < actual_d_k; d++) norm += dirs50[l][h][d] * dirs50[l][h][d];
-                    norm = sqrtf(norm + 1e-12f);
-                    for (int d = 0; d < actual_d_k; d++) dirs50[l][h][d] /= norm;
-                }
-            }
-        }
+        std::vector<std::vector<std::vector<float>>> cv50, beta50, dirs50;
+        compact_all_layers(ks2.streams[0], sel50, &r50,
+                          mi.n_head_kv, actual_d_k, actual_d_v, p50,
+                          cv50, beta50, dirs50);
 
         auto cb = build_compacted_state(ks2, sel50, cv50, mi.n_head_kv, actual_d_k, actual_d_v,
                                          mi.n_pos_per_embd, beta50, dirs50);
