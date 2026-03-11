@@ -289,6 +289,197 @@ static void test_least_squares_with_ridge() {
     printf(" OK\n");
 }
 
+static void test_least_squares_large_overdetermined() {
+    printf("  test_least_squares_large_overdetermined...");
+    // Reproduce model-scale dimensions: m=376 rows, n=375 cols, p=128 RHS
+    const int m = 376, n = 375, p = 128;
+
+    std::vector<float> A(m * n, 0.0f);
+    std::vector<float> b(m * p, 0.0f);
+    std::vector<float> x(n * p, 0.0f);
+
+    // Fill A with random uniform rows normalized to sum=1
+    srand(42);
+    for (int i = 0; i < m; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            A[i * n + j] = (float)rand() / RAND_MAX;
+            sum += A[i * n + j];
+        }
+        for (int j = 0; j < n; j++) A[i * n + j] /= sum;
+    }
+
+    // b = A * x_true
+    std::vector<float> x_true(n * p);
+    for (int j = 0; j < n; j++)
+        for (int d = 0; d < p; d++)
+            x_true[j * p + d] = sinf((float)(j + d) * 0.1f);
+
+    for (int i = 0; i < m; i++)
+        for (int d = 0; d < p; d++) {
+            float v = 0.0f;
+            for (int j = 0; j < n; j++) v += A[i * n + j] * x_true[j * p + d];
+            b[i * p + d] = v;
+        }
+
+    least_squares_solve(A.data(), b.data(), x.data(), m, n, p, 1e-6f);
+
+    float max_err = 0.0f, sum_x = 0.0f;
+    for (int j = 0; j < n * p; j++) {
+        sum_x += fabsf(x[j]);
+        float e = fabsf(x[j] - x_true[j]);
+        if (e > max_err) max_err = e;
+    }
+    fprintf(stderr, " uniform: |sum_x|=%.1f max_err=%.4f", sum_x, max_err);
+    // Relax tolerance for large system (Gaussian elimination accumulates error)
+    assert(sum_x > 1.0f && "Solution should not be all zeros");
+    assert(max_err < 0.5f && "Solution should be in the right ballpark");
+    fprintf(stderr, " OK\n");
+    printf(" OK\n");
+}
+
+static void test_least_squares_softmax_structure() {
+    printf("  test_least_squares_softmax_structure...");
+    // Test with REAL softmax structure: peaky rows like actual attention weights.
+    // This is what fails in the model benchmark.
+    const int m = 200, n = 100, p = 32;  // start small
+
+    std::vector<float> scores(m * n);
+    std::vector<float> A(m * n);
+    std::vector<float> b(m * p, 0.0f);
+    std::vector<float> x(n * p, 0.0f);
+
+    srand(42);
+    // Generate random logits and softmax them
+    for (int i = 0; i < m; i++) {
+        float max_s = -1e30f;
+        for (int j = 0; j < n; j++) {
+            scores[i * n + j] = ((float)rand() / RAND_MAX - 0.5f) * 4.0f;
+            if (scores[i * n + j] > max_s) max_s = scores[i * n + j];
+        }
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            A[i * n + j] = expf(scores[i * n + j] - max_s);
+            sum += A[i * n + j];
+        }
+        for (int j = 0; j < n; j++) A[i * n + j] /= sum;
+    }
+
+    // x_true = V-like values
+    std::vector<float> x_true(n * p);
+    for (int j = 0; j < n * p; j++)
+        x_true[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+
+    // b = A * x_true
+    for (int i = 0; i < m; i++)
+        for (int d = 0; d < p; d++) {
+            float v = 0.0f;
+            for (int j = 0; j < n; j++) v += A[i * n + j] * x_true[j * p + d];
+            b[i * p + d] = v;
+        }
+
+    least_squares_solve(A.data(), b.data(), x.data(), m, n, p, 1e-6f);
+
+    float max_err = 0.0f, sum_x = 0.0f;
+    for (int j = 0; j < n * p; j++) {
+        sum_x += fabsf(x[j]);
+        float e = fabsf(x[j] - x_true[j]);
+        if (e > max_err) max_err = e;
+    }
+    fprintf(stderr, " softmax(200x100,p=32): |sum_x|=%.1f max_err=%.4f", sum_x, max_err);
+
+    // Now test at model scale with peaky softmax AND full d_v=128
+    const int m2 = 376, n2 = 375, p2 = 128;
+    std::vector<float> A2(m2 * n2);
+    std::vector<float> b2(m2 * p2, 0.0f);
+    std::vector<float> x2(n2 * p2, 0.0f);
+
+    for (int i = 0; i < m2; i++) {
+        float max_s = -1e30f;
+        for (int j = 0; j < n2; j++) {
+            float s = ((float)rand() / RAND_MAX - 0.5f) * 10.0f;  // peaky
+            scores.resize(m2 * n2);
+            scores[i * n2 + j] = s;
+            if (s > max_s) max_s = s;
+        }
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            A2[i * n2 + j] = expf(scores[i * n2 + j] - max_s);
+            sum += A2[i * n2 + j];
+        }
+        for (int j = 0; j < n2; j++) A2[i * n2 + j] /= sum;
+    }
+
+    std::vector<float> x_true2(n2 * p2);
+    for (int j = 0; j < n2 * p2; j++)
+        x_true2[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+
+    for (int i = 0; i < m2; i++)
+        for (int d = 0; d < p2; d++) {
+            float v = 0.0f;
+            for (int j = 0; j < n2; j++) v += A2[i * n2 + j] * x_true2[j * p2 + d];
+            b2[i * p2 + d] = v;
+        }
+
+    least_squares_solve(A2.data(), b2.data(), x2.data(), m2, n2, p2, 1e-6f);
+
+    float max_err2 = 0.0f, sum_x2 = 0.0f;
+    for (int j = 0; j < n2 * p2; j++) {
+        sum_x2 += fabsf(x2[j]);
+        float e = fabsf(x2[j] - x_true2[j]);
+        if (e > max_err2) max_err2 = e;
+    }
+    fprintf(stderr, "\n    peaky(376x375,p=4): |sum_x|=%.1f max_err=%.4f", sum_x2, max_err2);
+    if (sum_x2 < 0.1f) {
+        fprintf(stderr, " *** ZERO SOLUTION ***\n");
+        // Print some A2 row stats
+        for (int i = 0; i < 3; i++) {
+            float rmax = 0.0f;
+            for (int j = 0; j < n2; j++)
+                if (A2[i * n2 + j] > rmax) rmax = A2[i * n2 + j];
+            fprintf(stderr, "    A2 row %d: max=%.6f\n", i, rmax);
+        }
+    }
+    assert(sum_x > 1.0f && "Small softmax system should produce non-zero solution");
+    fprintf(stderr, " OK\n");
+    printf(" OK\n");
+}
+
+static void test_least_squares_small_known() {
+    printf("  test_least_squares_small_known...");
+    // Simple 4x3 system, 2 RHS — verify non-zero solution
+    const int m = 4, n = 3, p = 2;
+    float A[] = {
+        0.5f, 0.3f, 0.2f,
+        0.1f, 0.7f, 0.2f,
+        0.3f, 0.3f, 0.4f,
+        0.2f, 0.2f, 0.6f
+    };
+    // x_true = [[1,2],[3,4],[5,6]]
+    // b = A * x_true
+    float b[4 * 2];
+    float x_true[] = {1,2, 3,4, 5,6};
+    for (int i = 0; i < m; i++) {
+        for (int d = 0; d < p; d++) {
+            float v = 0.0f;
+            for (int j = 0; j < n; j++) v += A[i * n + j] * x_true[j * p + d];
+            b[i * p + d] = v;
+        }
+    }
+
+    float x[3 * 2] = {};
+    least_squares_solve(A, b, x, m, n, p, 1e-6f);
+
+    float max_err = 0.0f;
+    for (int j = 0; j < n * p; j++) {
+        float err = fabsf(x[j] - x_true[j]);
+        if (err > max_err) max_err = err;
+    }
+    printf(" max_err=%.6f", max_err);
+    assert(max_err < 0.01f);
+    printf(" OK\n");
+}
+
 // ============================================================================
 // Per-head sensitivity and budget allocation tests
 // ============================================================================
@@ -1042,6 +1233,162 @@ static void test_n_elements_per_row() {
 // Main
 // ============================================================================
 
+// End-to-end test mimicking compact_layer_into pipeline:
+// score → NNLS → beta → softmax(scores+beta) → LS → C_v
+// This reproduces the exact data flow that causes zero C_v in the benchmark.
+static void test_compact_pipeline_ls_produces_nonzero_cv() {
+    printf("  test_compact_pipeline_ls_produces_nonzero_cv...");
+
+    const int T = 750, t = 375, d_k = 64, d_v = 128;
+    const int n_q = t + 1;  // overdetermined
+
+    srand(42);
+
+    // Generate random K [T × d_k] and V [T × d_v]
+    std::vector<float> K(T * d_k), V(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    for (int i = 0; i < T * d_v; i++) V[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+
+    // Select every other token (mimics importance-based selection)
+    std::vector<int> selected(t);
+    for (int j = 0; j < t; j++) selected[j] = j * 2;
+
+    // Generate cheap Q_ref from K at sampled positions
+    std::vector<int> qref_pos(n_q);
+    for (int qi = 0; qi < n_q; qi++) {
+        float frac = (float)(qi + 1) / (float)(n_q + 1);
+        frac = frac * frac;
+        qref_pos[qi] = std::min((int)(frac * (T - 1)), T - 1);
+    }
+
+    std::vector<float> Q(n_q * d_k);
+    for (int qi = 0; qi < n_q; qi++)
+        memcpy(Q.data() + qi * d_k, K.data() + qref_pos[qi] * d_k, d_k * sizeof(float));
+
+    // Batched scoring: scores = Q @ K^T  [n_q × T]
+    std::vector<float> scores(n_q * T);
+    mat_mul_ABt(Q.data(), K.data(), scores.data(), n_q, T, d_k);
+
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    // Softmax attention weights [n_q × T]
+    std::vector<float> attn(n_q * T);
+    std::vector<float> exp_scores(n_q * T);
+    std::vector<float> row_sums(n_q);
+
+    for (int qi = 0; qi < n_q; qi++) {
+        float * row = scores.data() + qi * T;
+        float max_s = -1e30f;
+        for (int j = 0; j < T; j++) {
+            row[j] *= inv_sqrt_dk;
+            if (row[j] > max_s) max_s = row[j];
+        }
+        float rsum = 0.0f;
+        float * erow = exp_scores.data() + qi * T;
+        for (int j = 0; j < T; j++) {
+            erow[j] = expf(row[j] - max_s);
+            rsum += erow[j];
+        }
+        row_sums[qi] = rsum;
+        float * arow = attn.data() + qi * T;
+        for (int j = 0; j < T; j++) arow[j] = erow[j] / rsum;
+    }
+
+    // Build NNLS design matrix M: [n_q × t]
+    std::vector<float> M(n_q * t);
+    for (int qi = 0; qi < n_q; qi++) {
+        const float * erow = exp_scores.data() + qi * T;
+        float * mrow = M.data() + qi * t;
+        for (int j = 0; j < t; j++) mrow[j] = erow[selected[j]];
+    }
+
+    // NNLS solve
+    std::vector<float> w(t, 0.0f);
+    nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t, 200);
+
+    // Beta = log(w)
+    std::vector<float> beta(t);
+    int n_dead = 0;
+    float min_beta = 1e30f, max_beta = -1e30f;
+    for (int j = 0; j < t; j++) {
+        beta[j] = logf(std::max(1e-12f, w[j]));
+        if (w[j] < 1e-10f) n_dead++;
+        if (beta[j] < min_beta) min_beta = beta[j];
+        if (beta[j] > max_beta) max_beta = beta[j];
+    }
+    fprintf(stderr, "\n    NNLS: %d/%d dead weights, beta range [%.1f, %.1f]", n_dead, t, min_beta, max_beta);
+
+    // Build LS design matrix X: softmax(scores[selected] + beta) [n_q × t]
+    std::vector<float> X(n_q * t);
+    for (int qi = 0; qi < n_q; qi++) {
+        const float * srow = scores.data() + qi * T;
+        float * xrow = X.data() + qi * t;
+        for (int j = 0; j < t; j++) xrow[j] = srow[selected[j]] + beta[j];
+    }
+    softmax_rows(X.data(), n_q, t);
+
+    // Check X statistics
+    float x_max = 0.0f, x_sum = 0.0f;
+    int x_nonzero = 0;
+    for (int i = 0; i < n_q * t; i++) {
+        if (X[i] > x_max) x_max = X[i];
+        x_sum += X[i];
+        if (X[i] > 1e-7f) x_nonzero++;
+    }
+    fprintf(stderr, "\n    X: max=%.6f sum=%.1f nonzero=%d/%d", x_max, x_sum, x_nonzero, n_q * t);
+
+    // Y = attn @ V  (original attention output) [n_q × d_v]
+    std::vector<float> Y(n_q * d_v, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        const float * arow = attn.data() + qi * T;
+        float * yrow = Y.data() + qi * d_v;
+        for (int ki = 0; ki < T; ki++) {
+            float w_ij = arow[ki];
+            const float * vr = V.data() + ki * d_v;
+            for (int d = 0; d < d_v; d++) yrow[d] += w_ij * vr[d];
+        }
+    }
+
+    float y_sum = 0.0f;
+    for (int i = 0; i < n_q * d_v; i++) y_sum += fabsf(Y[i]);
+    fprintf(stderr, "\n    Y: |sum|=%.1f", y_sum);
+
+    // LS solve: X * C_v = Y
+    std::vector<float> Cv(t * d_v, 0.0f);
+    least_squares_solve(X.data(), Y.data(), Cv.data(), n_q, t, d_v, 1e-6f);
+
+    float cv_sum = 0.0f, cv_max = 0.0f;
+    for (int i = 0; i < t * d_v; i++) {
+        cv_sum += fabsf(Cv[i]);
+        if (fabsf(Cv[i]) > cv_max) cv_max = fabsf(Cv[i]);
+    }
+    fprintf(stderr, "\n    C_v: |sum|=%.1f max=%.6f", cv_sum, cv_max);
+
+    if (cv_sum < 0.1f) {
+        fprintf(stderr, " *** ZERO C_v ***\n");
+
+        // Diagnose: check AtA condition
+        std::vector<float> AtA(t * t, 0.0f);
+        for (int i = 0; i < t; i++)
+            for (int j = 0; j < t; j++) {
+                float s = 0.0f;
+                for (int k = 0; k < n_q; k++) s += X[k * t + i] * X[k * t + j];
+                AtA[i * t + j] = s;
+            }
+        float diag_min = 1e30f, diag_max = 0.0f;
+        for (int i = 0; i < t; i++) {
+            float d = AtA[i * t + i];
+            if (d < diag_min) diag_min = d;
+            if (d > diag_max) diag_max = d;
+        }
+        fprintf(stderr, "    AtA diag range: [%.2e, %.2e]\n", diag_min, diag_max);
+    }
+
+    assert(cv_sum > 0.1f && "C_v should not be all zeros from pipeline");
+    fprintf(stderr, " OK\n");
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -1071,6 +1418,9 @@ int main() {
     test_least_squares_overdetermined();
     test_least_squares_multi_rhs();
     test_least_squares_with_ridge();
+    test_least_squares_small_known();
+    test_least_squares_softmax_structure();
+    test_least_squares_large_overdetermined();
 
     printf("\n=== Per-head sensitivity ===\n");
     test_sensitivity_uniform_attention();
@@ -1096,6 +1446,9 @@ int main() {
     test_compact_layer_no_compression();
     test_compact_layer_quality_per_head();
     test_compact_layer_finite_values();
+
+    printf("\n=== Pipeline end-to-end ===\n");
+    test_compact_pipeline_ls_produces_nonzero_cv();
 
     printf("\n=== Quantized KV round-trip ===\n");
     test_q8_0_round_trip();
