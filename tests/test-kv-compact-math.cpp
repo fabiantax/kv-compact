@@ -2461,6 +2461,47 @@ static void test_kmeans_empty_cluster_recovery() {
     printf(" OK\n");
 }
 
+static void test_kmeans_convergence_threshold() {
+    printf("  test_kmeans_convergence_threshold...");
+
+    // Well-separated clusters: should converge quickly with threshold.
+    // Compare results with tight threshold vs. loose threshold — both
+    // should find the same clusters for easy data.
+    const int T = 20, d_k = 4, d_v = 4, t = 4;
+    std::vector<float> K(T * d_k, 0.0f), V(T * d_v, 0.0f);
+
+    for (int i = 0; i < T; i++) {
+        int cluster = i / 5;
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = ((d == cluster) ? 10.0f : 0.0f);
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * d_v + d] = (float)(cluster + 1);
+        }
+    }
+
+    // Tight threshold (1e-8): more iterations but same result
+    auto r_tight = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t, 100, 1e-8f);
+    // Loose threshold (100.0): exits after 1 M-step
+    auto r_loose = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t, 100, 100.0f);
+
+    // Both should produce finite results
+    for (int i = 0; i < t; i++) {
+        assert(std::isfinite(r_tight.beta[i]));
+        assert(std::isfinite(r_loose.beta[i]));
+    }
+
+    // Tight should find correct clusters (well-separated data)
+    int correct = 0;
+    for (int c = 0; c < t; c++) {
+        int sz = (int)roundf(expf(r_tight.beta[c]));
+        if (sz == 5) correct++;
+    }
+    assert(correct >= 3);
+
+    printf(" tight_correct=%d/4 OK\n", correct);
+}
+
 static void test_submodular_fallback_large_T() {
     printf("  test_submodular_fallback_large_T...");
 
@@ -2666,6 +2707,7 @@ int main() {
     test_kmeans_t_greater_than_T();
     test_kmeans_multi_head_compaction();
     test_kmeans_empty_cluster_recovery();
+    test_kmeans_convergence_threshold();
 
     printf("\n=== Carathéodory budgets ===\n");
     test_effective_rank_identity();

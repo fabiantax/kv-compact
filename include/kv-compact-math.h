@@ -2,6 +2,20 @@
 //
 // Pure CPU float32 linear algebra routines used by the compaction algorithm.
 // Extracted for testability.
+//
+// Paper: "KV Cache Compaction via Attention Matching"
+//   Step 1 (Key Selection): select t keys from T (Section 3.1)
+//   Step 2 (Beta Fitting):  fit attention mass biases (Section 3.2)
+//   Step 3 (Value Refitting): least-squares value reconstruction (Section 3.3)
+//
+// Additional algorithms from docs/adjacent-concepts.md:
+//   - Submodular key selection (Sec 21, BumbleBee — COLM 2024)
+//   - Token merging          (Sec 20, ToMe — Bolya et al. 2023)
+//   - K-means centroid keys  (Sec 16, Lloyd's algorithm)
+//   - Sinkhorn beta fitting  (Sec 6,  entropic OT)
+//   - Sensitivity weighting  (Sec 18, RPCholesky / WildCat)
+//   - Alternating min.       (Sec 10, joint beta/C_v refinement)
+//   - Carathéodory budgets   (Sec 22, effective-rank compression floor)
 
 #pragma once
 
@@ -11,12 +25,12 @@
 #include <numeric>
 #include <vector>
 
-// Key selection strategy for compaction
+// Key selection strategy for compaction (Paper Step 1, Section 3.1)
 enum key_select_mode {
-    KEY_SELECT_MAX_ATTN    = 0,  // Original: top-t by max attention weight (fast)
-    KEY_SELECT_SUBMODULAR  = 1,  // Greedy submodular: coverage + diversity (better quality)
-    KEY_SELECT_TOKEN_MERGE = 2,  // Merge similar tokens instead of evicting (preserves info)
-    KEY_SELECT_KMEANS      = 3,  // K-means clustering: centroid keys + averaged values
+    KEY_SELECT_MAX_ATTN    = 0,  // Paper baseline: top-t by max attention weight
+    KEY_SELECT_SUBMODULAR  = 1,  // adjacent-concepts Sec 21: greedy submodular (BumbleBee)
+    KEY_SELECT_TOKEN_MERGE = 2,  // adjacent-concepts Sec 20: pairwise merge (ToMe/D2O)
+    KEY_SELECT_KMEANS      = 3,  // adjacent-concepts Sec 16: Lloyd's centroid keys
 };
 
 // ============================================================================
@@ -148,12 +162,16 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
     }
 }
 
-// Beta fitting strategy for mass matching (Step 2)
+// Beta fitting strategy for mass matching (Paper Step 2, Section 3.2)
 enum beta_fit_mode {
-    BETA_FIT_NNLS     = 0,  // Projected gradient NNLS (original)
-    BETA_FIT_SINKHORN = 1,  // Sinkhorn multiplicative updates (OT-inspired)
+    BETA_FIT_NNLS     = 0,  // Paper baseline: projected gradient NNLS
+    BETA_FIT_SINKHORN = 1,  // adjacent-concepts Sec 6: Sinkhorn (entropic OT)
 };
 
+// Sinkhorn beta fitting (adjacent-concepts.md Sec 6: Optimal Transport)
+//
+// Ref: Cuturi, "Sinkhorn Distances" (NeurIPS 2013)
+//
 // Solve non-negative mass matching via Sinkhorn-like multiplicative updates:
 //   Given M (m x n) with M_ij >= 0 and target b (m) with b_i > 0,
 //   find w (n) with w_j > 0 such that M * w ≈ b.
@@ -320,11 +338,14 @@ struct compacted_head {
 };
 
 // Configuration for compaction pipeline
+//
+// Bundles algorithm choices for Steps 1-3. Each option traces to a section
+// in the paper or adjacent-concepts.md (see enum comments above).
 struct compaction_config {
-    key_select_mode select_mode  = KEY_SELECT_MAX_ATTN;
-    beta_fit_mode   fit_mode     = BETA_FIT_NNLS;
-    int             n_alt_rounds = 2;        // alternating minimization rounds
-    const float *   head_sensitivity = nullptr; // [n_head_kv] or nullptr for auto
+    key_select_mode select_mode  = KEY_SELECT_MAX_ATTN;  // Step 1: key selection
+    beta_fit_mode   fit_mode     = BETA_FIT_NNLS;        // Step 2: beta fitting
+    int             n_alt_rounds = 2;        // Sec 10: alternating minimization rounds
+    const float *   head_sensitivity = nullptr; // Sec 18: per-head weights (nullptr = auto)
 };
 
 // Result of compacting all heads within a single layer
@@ -349,8 +370,12 @@ struct compacted_layer {
 };
 
 // ============================================================================
-// Submodular key selection (BumbleBee-inspired)
+// Submodular key selection (adjacent-concepts.md Sec 21)
 // ============================================================================
+//
+// Ref: Rao et al., "BumbleBee: Dynamic KV-Cache Streaming Submodular
+//      Summarization" (COLM 2024)
+// Theory: Nemhauser-Wolsey-Fisher (1-1/e) approximation guarantee (1978)
 //
 // Selects t keys by greedily maximizing a mixture of:
 //   - Facility location (coverage): each unselected key is "covered" by its
@@ -475,8 +500,11 @@ static std::vector<int> submodular_key_select(
 }
 
 // ============================================================================
-// Token merging (ToMe-inspired)
+// Token merging (adjacent-concepts.md Sec 20)
 // ============================================================================
+//
+// Ref: Bolya et al., "Token Merging" (ICLR 2023)
+// Ref: Wan et al., "D2O: Dynamic Discriminative Operations" (2024)
 //
 // Reduces T tokens to t by iteratively merging the most similar key pairs.
 // Each merge:
@@ -599,18 +627,24 @@ static merged_tokens token_merge(
 }
 
 // ============================================================================
-// K-means clustering of keys
+// K-means clustering of keys (adjacent-concepts.md Sec 16)
 // ============================================================================
+//
+// Ref: Lloyd, "Least Squares Quantization in PCM" (IEEE IT, 1982)
 //
 // Partitions T keys into t clusters using Lloyd's algorithm, producing
 // centroid keys and weighted-average values. Unlike token merging (greedy
 // pairwise), K-means optimizes a global objective (within-cluster variance).
 //
+// Key insight from Sec 16: centroid keys lift the C_k ⊆ K constraint
+// (paper limitation), and cluster mass naturally defines beta = log(n_j).
+//
 // Returns the same merged_tokens struct as token_merge.
 
 static merged_tokens kmeans_compact(
         const float * K, const float * V,
-        int T, int d_k, int d_v, int t, int max_iters = 20) {
+        int T, int d_k, int d_v, int t,
+        int max_iters = 20, float converge_thresh = 1e-6f) {
 
     if (t >= T) {
         merged_tokens result;
@@ -655,7 +689,8 @@ static merged_tokens kmeans_compact(
         }
         if (!changed) break;
 
-        // M-step: recompute centroids
+        // M-step: recompute centroids, track max shift for convergence
+        std::vector<float> old_centroids(centroids);
         std::vector<int> counts(t, 0);
         std::fill(centroids.begin(), centroids.end(), 0.0f);
         for (int i = 0; i < T; i++) {
@@ -665,11 +700,19 @@ static merged_tokens kmeans_compact(
                 centroids[c * d_k + d] += K[i * d_k + d];
             }
         }
+        float max_shift = 0.0f;
         for (int c = 0; c < t; c++) {
             if (counts[c] > 0) {
                 for (int d = 0; d < d_k; d++) {
                     centroids[c * d_k + d] /= (float)counts[c];
                 }
+                // Track centroid shift (squared L2 distance)
+                float shift = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    float diff = centroids[c * d_k + d] - old_centroids[c * d_k + d];
+                    shift += diff * diff;
+                }
+                if (shift > max_shift) max_shift = shift;
             } else {
                 // Reinitialize empty cluster: pick the token farthest from
                 // its assigned centroid (splits the worst-fit cluster)
@@ -690,6 +733,9 @@ static merged_tokens kmeans_compact(
                 memcpy(centroids.data() + c * d_k, K + worst_idx * d_k, d_k * sizeof(float));
             }
         }
+
+        // Early exit if centroids barely moved
+        if (max_shift < converge_thresh) break;
     }
 
     // Build result: centroid K, averaged V, beta = log(cluster_size)
@@ -875,7 +921,9 @@ static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Steps 2-3 alternating minimization: refine beta and C_v jointly
+    // Steps 2-3 alternating minimization (adjacent-concepts.md Sec 10):
+    // Iteratively refine beta (Step 2) and C_v (Step 3) to jointly minimize
+    // ||softmax(s + beta) · C_v - Y||^2. Each round improves the objective.
     std::vector<float> X(n_q * t);
 
     for (int round = 0; round < n_alt_rounds; round++) {
@@ -940,7 +988,10 @@ static compacted_head compact_head_highest_attn(
     return result;
 }
 
-// Compute per-head sensitivity for key selection weighting
+// Sensitivity-weighted key selection (adjacent-concepts.md Sec 18: RPCholesky)
+//
+// Ref: Chen et al., "WildCat" (arXiv:2602.10056, 2025) — adaptive leverage
+//      scores via residual diagonal of the kernel matrix
 //
 // Sensitivity measures how much attention mass falls outside the top-t keys.
 // Heads that spread attention broadly are harder to compress and should have
@@ -981,8 +1032,12 @@ static float compute_head_sensitivity(const float * attn_weights, int n_q, int T
 }
 
 // ============================================================================
-// Carathéodory-informed budget allocation
+// Carathéodory-informed budget allocation (adjacent-concepts.md Sec 22)
 // ============================================================================
+//
+// Ref: Carathéodory, "Über den Variabilitätsbereich der Koeffizienten"
+//      (Math. Annalen, 1907)
+// Ref: Feldman, "Core-Sets: An Updated Survey" (arXiv:2011.09384, 2020)
 //
 // Carathéodory's theorem: any convex combination of T points in R^d can be
 // expressed using at most d+1 points. For attention, the output is a convex
@@ -1307,11 +1362,13 @@ static compacted_layer compact_layer_all_heads(
     result.selected_indices = selected;
     result.head_sensitivity = sensitivity;
 
-    // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
+    // ---- Steps 2-3: Per-head NNLS (beta) and LS (C_v) ----
+    // (Paper Sections 3.2-3.3, with alternating minimization from
+    //  adjacent-concepts.md Sec 10)
     //
-    // With alternating minimization: after the initial NNLS+LS pass,
-    // refine beta via gradient descent on ||softmax(s+beta)·C_v - Y||^2,
-    // then re-solve LS for C_v. Repeat for n_alt_rounds total.
+    // After the initial NNLS+LS pass, refine beta via gradient descent
+    // on ||softmax(s+beta)·C_v - Y||^2, then re-solve LS for C_v.
+    // Repeat for n_alt_rounds total.
 
 
 
