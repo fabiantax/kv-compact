@@ -1299,9 +1299,11 @@ static void test_sensitivity_weighted_selection() {
 
     // Uniform weighting (all sensitivity = 1.0)
     std::vector<float> uniform_sens(n_head_kv, 1.0f);
+    compaction_config cfg_uniform;
+    cfg_uniform.head_sensitivity = uniform_sens.data();
     auto result_uniform = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        uniform_sens.data());
+        cfg_uniform);
 
     // Compute per-head cosine similarity for a test query
     std::vector<float> q_test(n_embd_k);
@@ -1495,14 +1497,18 @@ static void test_alternating_minimization_multi_head() {
             Q[qi * n_embd_k + d] = sinf((float)(qi * n_embd_k + d) * 0.5f);
 
     // 1-pass
+    compaction_config cfg1;
+    cfg1.n_alt_rounds = 1;
     auto r1 = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 1);
+        cfg1);
 
     // 2-pass (default)
+    compaction_config cfg2;
+    cfg2.n_alt_rounds = 2;
     auto r2 = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 2);
+        cfg2);
 
     // Compute per-head MSE
     float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
@@ -1695,14 +1701,18 @@ static void test_submodular_vs_max_attn_quality() {
     }
 
     // Max-attention selection
+    compaction_config cfg_max;
+    cfg_max.select_mode = KEY_SELECT_MAX_ATTN;
     auto r_max = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 2, KEY_SELECT_MAX_ATTN);
+        cfg_max);
 
     // Submodular selection
+    compaction_config cfg_sub;
+    cfg_sub.select_mode = KEY_SELECT_SUBMODULAR;
     auto r_sub = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 2, KEY_SELECT_SUBMODULAR);
+        cfg_sub);
 
     // Check diversity of selection: count unique clusters
     auto count_clusters = [](const std::vector<int> & sel) {
@@ -1893,9 +1903,11 @@ static void test_token_merge_multi_head_compaction() {
     for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
     for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
 
+    compaction_config cfg_merge;
+    cfg_merge.select_mode = KEY_SELECT_TOKEN_MERGE;
     auto result = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 2, KEY_SELECT_TOKEN_MERGE);
+        cfg_merge);
 
     assert((int)result.selected_indices.size() == t);
     assert(result.n_head_kv == n_head_kv);
@@ -2140,9 +2152,11 @@ static void test_sinkhorn_multi_head() {
     for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
     for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
 
+    compaction_config cfg_sink;
+    cfg_sink.fit_mode = BETA_FIT_SINKHORN;
     auto result = compact_layer_all_heads(
         K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t,
-        nullptr, 2, KEY_SELECT_MAX_ATTN, BETA_FIT_SINKHORN);
+        cfg_sink);
 
     assert((int)result.selected_indices.size() == t);
     assert(result.n_head_kv == n_head_kv);
@@ -2359,6 +2373,203 @@ static void test_caratheodory_budget_bounds() {
     printf(" budget=%d OK\n", budgets[0]);
 }
 
+// ============================================================================
+// Additional coverage: edge cases and multi-head paths
+// ============================================================================
+
+static void test_kmeans_no_compression() {
+    printf("  test_kmeans_no_compression...");
+
+    const int T = 5, d_k = 3, d_v = 3, t = 5;
+    std::vector<float> K(T * d_k), V(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i);
+
+    auto merged = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t);
+
+    // t == T: should return original data unchanged
+    assert((int)merged.K.size() == T * d_k);
+    assert((int)merged.V.size() == T * d_v);
+    for (int i = 0; i < T; i++) {
+        assert(merged.representative[i] == i);
+        assert(merged.beta[i] == 0.0f);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_t_greater_than_T() {
+    printf("  test_kmeans_t_greater_than_T...");
+
+    const int T = 4, d_k = 2, d_v = 2, t = 10;
+    std::vector<float> K(T * d_k, 1.0f), V(T * d_v, 2.0f);
+
+    auto merged = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t);
+
+    // Should return T entries (not t)
+    assert((int)merged.representative.size() == T);
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_multi_head_compaction() {
+    printf("  test_kmeans_multi_head_compaction...");
+
+    const int T = 20, n_q = 8, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (int i = 0; i < T * n_embd_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    compaction_config cfg;
+    cfg.select_mode = KEY_SELECT_KMEANS;
+    auto result = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t, cfg);
+
+    assert((int)result.selected_indices.size() == t);
+    assert((int)result.C_k.size() == n_head_kv);
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.C_k[h].size() == t * d_k);
+        assert((int)result.C_v[h].size() == t * d_v);
+        assert((int)result.beta[h].size() == t);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_kmeans_empty_cluster_recovery() {
+    printf("  test_kmeans_empty_cluster_recovery...");
+
+    // All tokens identical → only 1 natural cluster, but request t=3.
+    // K-means must handle t-1 clusters becoming empty.
+    const int T = 10, d_k = 2, d_v = 2, t = 3;
+    std::vector<float> K(T * d_k, 1.0f), V(T * d_v, 2.0f);
+
+    auto merged = kmeans_compact(K.data(), V.data(), T, d_k, d_v, t);
+
+    // Should still produce t entries with finite values
+    assert((int)merged.K.size() == t * d_k);
+    assert((int)merged.V.size() == t * d_v);
+    for (int i = 0; i < t; i++) {
+        assert(std::isfinite(merged.beta[i]));
+        assert(merged.representative[i] >= 0 && merged.representative[i] < T);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_submodular_fallback_large_T() {
+    printf("  test_submodular_fallback_large_T...");
+
+    // T > SUBMODULAR_MAX_T should fall back to top-t by importance
+    const int T = SUBMODULAR_MAX_T + 100, d_k = 4, t = 10;
+    std::vector<float> K(T * d_k), importance(T);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.1f);
+    for (int i = 0; i < T; i++) importance[i] = (float)(T - i);  // descending
+
+    auto selected = submodular_key_select(K.data(), importance.data(), T, d_k, t);
+
+    assert((int)selected.size() == t);
+    // Should select the highest-importance tokens (indices 0..9)
+    std::sort(selected.begin(), selected.end());
+    for (int i = 0; i < t; i++) {
+        assert(selected[i] < t);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_effective_rank_full_rank_large() {
+    printf("  test_effective_rank_full_rank_large...");
+
+    // Build a full-rank V by making each row a distinct basis direction
+    // plus noise. Use a linear congruential generator for deterministic
+    // pseudo-random data that spans all dimensions.
+    const int T = 100, d_v = 8;
+    std::vector<float> V(T * d_v, 0.0f);
+    uint32_t seed = 42;
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_v; d++) {
+            seed = seed * 1103515245 + 12345;
+            V[i * d_v + d] = (float)((int)(seed >> 16) % 1000) / 500.0f - 1.0f;
+        }
+    }
+
+    int r = compute_effective_rank(V.data(), T, d_v);
+    printf(" rank=%d", r);
+    assert(r >= d_v - 1);  // should be close to full rank
+
+    printf(" OK\n");
+}
+
+static void test_effective_rank_zero_matrix() {
+    printf("  test_effective_rank_zero_matrix...");
+
+    const int T = 10, d_v = 4;
+    std::vector<float> V(T * d_v, 0.0f);
+
+    int r = compute_effective_rank(V.data(), T, d_v);
+    assert(r == 1);  // minimum rank
+
+    printf(" OK\n");
+}
+
+static void test_compaction_config_defaults() {
+    printf("  test_compaction_config_defaults...");
+
+    // Verify config struct defaults match original behavior
+    compaction_config cfg;
+    assert(cfg.select_mode == KEY_SELECT_MAX_ATTN);
+    assert(cfg.fit_mode == BETA_FIT_NNLS);
+    assert(cfg.n_alt_rounds == 2);
+    assert(cfg.head_sensitivity == nullptr);
+
+    printf(" OK\n");
+}
+
+static void test_sinkhorn_via_config() {
+    printf("  test_sinkhorn_via_config...");
+
+    // Verify config struct properly selects Sinkhorn mode
+    const int T = 15, n_q = 6, d_k = 4, d_v = 4, t = 5;
+    const int n_head_kv = 1, n_embd_k = d_k, n_embd_v = d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (int i = 0; i < T * n_embd_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    compaction_config cfg_nnls;
+    cfg_nnls.fit_mode = BETA_FIT_NNLS;
+    auto r_nnls = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t, cfg_nnls);
+
+    compaction_config cfg_sink;
+    cfg_sink.fit_mode = BETA_FIT_SINKHORN;
+    auto r_sink = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t, cfg_sink);
+
+    // Both should produce valid, finite results
+    for (int j = 0; j < t; j++) {
+        assert(std::isfinite(r_nnls.beta[0][j]));
+        assert(std::isfinite(r_sink.beta[0][j]));
+    }
+
+    // They should differ (different algorithms)
+    bool any_diff = false;
+    for (int j = 0; j < t; j++) {
+        if (fabsf(r_nnls.beta[0][j] - r_sink.beta[0][j]) > 1e-6f) {
+            any_diff = true;
+            break;
+        }
+    }
+    assert(any_diff);
+
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -2451,12 +2662,25 @@ int main() {
     test_kmeans_finds_clusters();
     test_kmeans_single_head_compaction();
     test_kmeans_vs_token_merge_quality();
+    test_kmeans_no_compression();
+    test_kmeans_t_greater_than_T();
+    test_kmeans_multi_head_compaction();
+    test_kmeans_empty_cluster_recovery();
 
     printf("\n=== Carathéodory budgets ===\n");
     test_effective_rank_identity();
     test_effective_rank_low_rank();
     test_caratheodory_budgets_multi_head();
     test_caratheodory_budget_bounds();
+    test_effective_rank_full_rank_large();
+    test_effective_rank_zero_matrix();
+
+    printf("\n=== Submodular edge cases ===\n");
+    test_submodular_fallback_large_T();
+
+    printf("\n=== Config struct ===\n");
+    test_compaction_config_defaults();
+    test_sinkhorn_via_config();
 
     printf("\nAll tests passed!\n");
     return 0;

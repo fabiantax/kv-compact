@@ -319,6 +319,14 @@ struct compacted_head {
     std::vector<float> C_k;               // merged keys [t * d_k] (empty = use original K at selected_indices)
 };
 
+// Configuration for compaction pipeline
+struct compaction_config {
+    key_select_mode select_mode  = KEY_SELECT_MAX_ATTN;
+    beta_fit_mode   fit_mode     = BETA_FIT_NNLS;
+    int             n_alt_rounds = 2;        // alternating minimization rounds
+    const float *   head_sensitivity = nullptr; // [n_head_kv] or nullptr for auto
+};
+
 // Result of compacting all heads within a single layer
 struct compacted_layer {
     std::vector<int>   selected_indices;  // [t] shared token selection across all heads
@@ -374,6 +382,10 @@ static float key_cosine_sim(const float * a, const float * b, int d) {
 //
 // Returns: sorted indices of selected keys
 //
+// Maximum T for submodular selection before falling back to top-t.
+// T=4096 uses 64MB; beyond this, memory cost dominates any quality gain.
+static constexpr int SUBMODULAR_MAX_T = 4096;
+
 static std::vector<int> submodular_key_select(
         const float * K, const float * importance,
         int T, int d_k, int t, float lambda = 0.7f) {
@@ -384,7 +396,19 @@ static std::vector<int> submodular_key_select(
         return all;
     }
 
-    // Precompute pairwise similarity matrix
+    // Guard: O(T^2) similarity matrix. For T > SUBMODULAR_MAX_T, fall back
+    // to importance-based top-t selection to avoid excessive memory use.
+    if (T > SUBMODULAR_MAX_T) {
+        std::vector<int> indices(T);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                          [&](int a, int b) { return importance[a] > importance[b]; });
+        std::vector<int> result(indices.begin(), indices.begin() + t);
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    // Precompute pairwise similarity matrix (T <= SUBMODULAR_MAX_T)
     // sim[i][j] = cosine(K[i], K[j]) * sqrt(importance[i] * importance[j])
     std::vector<float> sim(T * T);
     for (int i = 0; i < T; i++) {
@@ -646,6 +670,24 @@ static merged_tokens kmeans_compact(
                 for (int d = 0; d < d_k; d++) {
                     centroids[c * d_k + d] /= (float)counts[c];
                 }
+            } else {
+                // Reinitialize empty cluster: pick the token farthest from
+                // its assigned centroid (splits the worst-fit cluster)
+                float worst_dist = -1.0f;
+                int   worst_idx  = 0;
+                for (int i = 0; i < T; i++) {
+                    int ac = assignment[i];
+                    float dist = 0.0f;
+                    for (int d = 0; d < d_k; d++) {
+                        float diff = K[i * d_k + d] - centroids[ac * d_k + d];
+                        dist += diff * diff;
+                    }
+                    if (dist > worst_dist) {
+                        worst_dist = dist;
+                        worst_idx = i;
+                    }
+                }
+                memcpy(centroids.data() + c * d_k, K + worst_idx * d_k, d_k * sizeof(float));
             }
         }
     }
@@ -672,16 +714,35 @@ static merged_tokens kmeans_compact(
                 result.V[c * d_v + d] /= (float)counts[c];
             }
             result.beta[c] = logf((float)counts[c]);
-        } else {
-            result.beta[c] = 0.0f;
-        }
-        // Representative: first token assigned to this cluster
-        result.representative[c] = 0;
-        for (int i = 0; i < T; i++) {
-            if (assignment[i] == c) {
-                result.representative[c] = i;
-                break;
+            // Representative: first token assigned to this cluster
+            result.representative[c] = -1;
+            for (int i = 0; i < T; i++) {
+                if (assignment[i] == c) {
+                    result.representative[c] = i;
+                    break;
+                }
             }
+        } else {
+            // Empty cluster after convergence: centroid is from reinit,
+            // value is zero, beta = -inf (zero weight). Use nearest token.
+            result.beta[c] = -10.0f;  // exp(-10) ≈ 0, negligible weight
+            float best_dist = 1e30f;
+            result.representative[c] = 0;
+            for (int i = 0; i < T; i++) {
+                float dist = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    float diff = K[i * d_k + d] - result.K[c * d_k + d];
+                    dist += diff * diff;
+                }
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    result.representative[c] = i;
+                }
+            }
+            // Use that token's value
+            memcpy(result.V.data() + c * d_v,
+                   V + result.representative[c] * d_v,
+                   d_v * sizeof(float));
         }
     }
 
@@ -940,8 +1001,12 @@ static float compute_head_sensitivity(const float * attn_weights, int n_q, int T
 static int compute_effective_rank(const float * V, int T, int d_v) {
     if (T == 0 || d_v == 0) return 0;
 
-    // Compute V^T V (d_v x d_v) — the Gram matrix of columns
-    int n = std::min(T, d_v);
+    // Compute V^T V (d_v x d_v) — the Gram matrix of columns.
+    // Accumulate trace and Frobenius norm during construction to avoid
+    // a second O(d_v^2) pass.
+    float trace = 0.0f;    // tr(VtV)  = sum of sigma_i^2
+    float trace2 = 0.0f;   // ||VtV||_F^2 = sum of sigma_i^4
+
     std::vector<float> VtV(d_v * d_v, 0.0f);
     for (int i = 0; i < d_v; i++) {
         for (int j = 0; j <= i; j++) {
@@ -951,27 +1016,19 @@ static int compute_effective_rank(const float * V, int T, int d_v) {
             }
             VtV[i * d_v + j] = sum;
             VtV[j * d_v + i] = sum;
+
+            if (i == j) {
+                trace += sum;
+                trace2 += sum * sum;
+            } else {
+                // Off-diagonal: appears twice in Frobenius norm
+                trace2 += 2.0f * sum * sum;
+            }
         }
     }
 
-    // Eigenvalues of V^T V = squared singular values of V
-    // Use power iteration to find top eigenvalues (cheap approximation)
-    // Instead, use trace-based effective rank: rank_eff = tr(VtV)^2 / tr(VtV^2)
-    // which equals (sum sigma_i^2)^2 / sum sigma_i^4
-
-    float trace = 0.0f;    // sum of sigma_i^2
-    float trace2 = 0.0f;   // sum of sigma_i^4
-
-    for (int i = 0; i < d_v; i++) {
-        trace += VtV[i * d_v + i];
-    }
-
-    // tr(VtV^2) = sum_ij VtV[i][j]^2
-    for (int i = 0; i < d_v; i++) {
-        for (int j = 0; j < d_v; j++) {
-            trace2 += VtV[i * d_v + j] * VtV[i * d_v + j];
-        }
-    }
+    // Effective rank = tr(VtV)^2 / ||VtV||_F^2
+    // = (sum sigma_i^2)^2 / (sum sigma_i^4)
 
     if (trace2 < 1e-12f) return 1;
 
@@ -983,6 +1040,15 @@ static int compute_effective_rank(const float * V, int T, int d_v) {
 
 // Compute per-head Carathéodory budget: minimum number of entries needed
 // to exactly represent any convex combination of value vectors.
+//
+// This is a standalone utility — call it before compaction to determine
+// per-head target sizes. The compaction pipeline itself uses a uniform t;
+// use these budgets to decide what t should be, or to identify heads
+// that can be compressed more aggressively.
+//
+// Example usage:
+//   auto budgets = compute_caratheodory_budgets(V_all, T, n_heads, d_v);
+//   int t = *std::max_element(budgets.begin(), budgets.end());
 //
 //   V_all: [T, n_embd_v_gqa] all heads concatenated
 //   T:     number of tokens
@@ -1033,10 +1099,12 @@ static std::vector<int> compute_caratheodory_budgets(
 static compacted_layer compact_layer_all_heads(
         const float * K_all, const float * V_all, const float * Q_ref_all,
         int T, int n_q, int n_head_kv, int d_k, int d_v, int t,
-        const float * head_sensitivity = nullptr,
-        int n_alt_rounds = 2,
-        key_select_mode select_mode = KEY_SELECT_MAX_ATTN,
-        beta_fit_mode   fit_mode    = BETA_FIT_NNLS) {
+        const compaction_config & cfg = {}) {
+
+    const float *       head_sensitivity = cfg.head_sensitivity;
+    const int           n_alt_rounds     = cfg.n_alt_rounds;
+    const key_select_mode select_mode    = cfg.select_mode;
+    const beta_fit_mode   fit_mode       = cfg.fit_mode;
 
     compacted_layer result;
     result.n_head_kv = n_head_kv;
