@@ -1,6 +1,11 @@
 // KV Cache Compaction — C Library API
 //
 // Programmatic interface for KV cache compaction via Attention Matching.
+// Implements the algorithm from:
+//
+//   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+//   https://arxiv.org/abs/2602.16284
+//
 // Designed for integration into serving frameworks that manage KV caches
 // at runtime (e.g., auto-compact when context grows too large).
 //
@@ -34,11 +39,11 @@ extern "C" {
 // ============================================================================
 
 typedef struct kv_compact_params {
-    float  target_ratio;       // fraction of tokens to keep (0.0, 1.0)
+    float  target_ratio;       // fraction of tokens to keep (0.0, 1.0) — compression ratio
     int    target_count;       // explicit target count (overrides ratio if > 0)
-    int    use_sensitivity;    // weight key selection by per-head sensitivity
-    float  ridge;              // ridge regularization for least-squares (default: 1e-6)
-    int    nnls_max_iter;      // max NNLS iterations (default: 200)
+    int    use_sensitivity;    // weight key selection by per-head sensitivity (Section 4)
+    float  ridge;              // ridge regularization for value LS solve (Section 3.3)
+    int    nnls_max_iter;      // max NNLS iterations for beta solve (Section 3.2)
     int    refine_rounds;      // iterative refinement rounds (0=disabled, default: 0)
                                // each round evaluates per-key reconstruction error,
                                // swaps worst selected keys with best unused, then

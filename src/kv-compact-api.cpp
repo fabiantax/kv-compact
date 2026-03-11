@@ -1,7 +1,19 @@
 // KV Cache Compaction — C Library API implementation
 //
+// Implements the compaction pipeline from:
+//   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+//   https://arxiv.org/abs/2602.16284
+//
 // Wraps the header-only math library in a C-compatible interface with
 // memory management and quality metrics computation.
+//
+// Pipeline per call to kv_compact():
+//   1. Key selection (Section 3.1) — score by max attention, select top-t
+//      Optional: diversity penalty, shared prefix preservation
+//   2. Beta solve (Section 3.2, Eq. 4) — NNLS mass matching per head
+//   3. Value refit (Section 3.3, Eq. 6) — least-squares C_v per head
+//   4. Optional: iterative refinement — swap worst keys, re-run steps 2-3
+//   5. Quality metrics — cosine similarity, MSE, agreement rate
 
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
@@ -21,10 +33,15 @@ static double elapsed_ms(clock_type::time_point t0) {
 // Cheap Q_ref generation from K vectors
 // ============================================================================
 
-// Generate proxy reference queries from K vectors. Samples evenly-spaced
-// K rows and treats them as if they were Q vectors. This avoids the cost
-// of a full repeat-prefill pass while providing reasonable attention scores
-// for key selection.
+// Generate proxy reference queries from K vectors (our extension).
+//
+// The paper (Section 2.2) generates Q_ref via "repeat-prefill" — feeding
+// the context a second time and capturing query activations. This is
+// expensive (~40% of compaction time). As a cheaper alternative, we sample
+// K vectors as proxy queries, exploiting the observation that K and Q live
+// in similar subspaces. This sacrifices some quality for ~10x speedup.
+// Samples are quadratically biased toward recent tokens (more likely to be
+// queried during generation).
 static void generate_cheap_qref(const float * K_all, int T, int n_head_kv,
                                  int d_k, int n_q_out,
                                  std::vector<float> & Q_out) {
@@ -51,9 +68,15 @@ static void generate_cheap_qref(const float * K_all, int T, int n_head_kv,
 // Diversity-aware key selection
 // ============================================================================
 
-// Select top-t keys with diversity penalty. Uses a greedy approach:
-// pick highest-importance key, then penalize keys similar to those
-// already selected before picking the next.
+// Select top-t keys with diversity penalty (our extension beyond the paper).
+//
+// The paper's "Highest Attention Keys" (Section 3.1) selects purely by
+// importance score. At extreme compression (>20x), this can select
+// redundant keys that cover the same attention mass. Diversity-aware
+// selection applies a greedy cosine-similarity penalty: after selecting
+// each key, penalize remaining keys that are similar to those already
+// chosen. This reduces wasted budget slots and improves quality at
+// high compression ratios.
 //
 // importance: [T] global importance scores
 // K_all:      [T × n_embd_k] key vectors (for similarity computation)

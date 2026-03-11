@@ -1,11 +1,17 @@
 // KV Cache Compaction — ROCm/HIP Accelerated Kernels
 //
-// GPU-accelerated matrix multiply for attention scoring (the compute hotspot).
-// Falls back to CPU when HIP is not available (via kv-compact-accel.h).
+// GPU-accelerated matrix multiply for the attention scoring hotspot in
+// Step 1 (Section 3.1) of the compaction algorithm from:
+//   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+//   https://arxiv.org/abs/2602.16284
+//
+// The dominant cost is computing Q_ref @ K^T / sqrt(d_k) for all heads,
+// which is an (n_q × d_k) * (T × d_k)^T matmul. On CPU this is O(n_q * T * d_k)
+// per head per layer; GPU acceleration helps when T is large (>1K tokens).
 //
 // Target: AMD Ryzen AI 395 Pro Max with integrated RDNA 3.5 GPU (8060S)
 // The integrated GPU shares system memory, so no explicit D↔H copies needed
-// for unified memory allocations.
+// for unified memory allocations (hipMallocManaged).
 
 #include <hip/hip_runtime.h>
 #include "kv-compact-accel.h"

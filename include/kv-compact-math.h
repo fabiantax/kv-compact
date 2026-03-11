@@ -1,7 +1,32 @@
 // KV Cache Compaction via Attention Matching - Math Utilities
 //
-// Pure CPU float32 linear algebra routines used by the compaction algorithm.
-// Extracted for testability.
+// Pure CPU float32 linear algebra routines implementing the compaction
+// algorithm from:
+//
+//   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
+//   https://arxiv.org/abs/2602.16284
+//
+// The paper's 3-step compaction pipeline is implemented here:
+//   Step 1 — Key Selection (Section 3.1): "Highest Attention Keys" scores
+//            each key by max attention weight across reference queries,
+//            then selects the top-t keys.
+//   Step 2 — Mass Matching / Beta (Section 3.2, Eq. 4): Solves NNLS to find
+//            per-key weights w such that the attention mass (partition
+//            function) over selected keys matches the original:
+//              sum_j exp(q@k_j/sqrt(d)) * w_j ≈ sum_j exp(q@K_j/sqrt(d))
+//            Beta = log(w) are additive biases applied during attention.
+//   Step 3 — Value Refitting / C_v (Section 3.3, Eq. 6): Solves least-squares
+//            to find replacement values C_v such that the attention output
+//            with compacted keys+beta closely matches the original:
+//              softmax(q@C_k/sqrt(d) + beta) @ C_v ≈ softmax(q@K/sqrt(d)) @ V
+//
+// Extensions beyond the paper:
+//   - Lawson-Hanson active-set NNLS solver (replaces projected gradient descent)
+//   - Per-head sensitivity weighting for key selection (Section 4 ablation)
+//   - Beta injection via K-vector modification (our approach for runtime use)
+//   - Multi-head shared key selection with per-head beta/C_v (Section 3.4)
+//
+// Extracted into a header-only library for testability.
 
 #pragma once
 
@@ -83,10 +108,18 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
 //   min_{w >= 0} ||A*w - b||^2
 // A is (m x n), b is (m), w is (n)
 //
-// The Lawson-Hanson algorithm converges in finitely many iterations.
-// It maintains a passive set P (unconstrained variables) and a zero set Z
-// (variables fixed at 0). Each outer iteration moves one variable from Z to P,
-// inner iterations handle infeasible solutions by moving variables back.
+// Used in Step 2 (Section 3.2, Eq. 4) to solve for attention mass weights w_j
+// such that exp(beta_j) = w_j and the partition function is preserved:
+//   M * w ≈ m   where M_ij = exp(q_i @ k_{sel[j]} / sqrt(d))
+//                      m_i  = sum_j exp(q_i @ K_j / sqrt(d))
+//
+// The Lawson-Hanson algorithm (Lawson & Hanson, 1974) converges in finitely
+// many iterations. It maintains a passive set P (unconstrained variables) and
+// a zero set Z (variables fixed at 0). Each outer iteration moves one variable
+// from Z to P, inner iterations handle infeasible solutions by interpolating
+// back to the boundary. This replaces the original projected gradient descent
+// from our initial implementation, providing exact solutions for the small
+// dense NNLS problems encountered here (t ~ 10-500 variables).
 //
 // Returns solution in w
 static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200) {
@@ -223,15 +256,11 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
 
             // Find alpha: step size to boundary
             float alpha = 1.0f;
-            int q_idx = -1;
             for (int i = 0; i < p_count; i++) {
                 int idx = p_indices[i];
                 if (s[idx] <= 0.0f) {
                     float a = w[idx] / (w[idx] - s[idx] + 1e-30f);
-                    if (a < alpha) {
-                        alpha = a;
-                        q_idx = idx;
-                    }
+                    if (a < alpha) alpha = a;
                 }
             }
 
@@ -266,8 +295,13 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
 
 // Solve least squares: min ||A*x - b||^2 via normal equations
 // A is (m x n), b is (m x p), x is (n x p)
-// Uses Cholesky-like approach: x = (A^T A)^{-1} A^T b
-// For simplicity, uses pseudo-inverse via regularized normal equations
+//
+// Used in Step 3 (Section 3.3, Eq. 6) to solve for refitted values C_v:
+//   X * C_v = Y   where X_ij = softmax(q_i @ k_{sel[j]} / sqrt(d) + beta_j)
+//                       Y_i  = softmax(q_i @ K / sqrt(d)) @ V
+//
+// Also used for beta direction computation (see compute_beta_direction).
+// Solves via regularized normal equations: x = (A^T A + ridge*I)^{-1} A^T b
 static void least_squares_solve(const float * A, const float * b, float * x,
                                 int m, int n, int p, float ridge = 1e-6f) {
     // Compute AtA = A^T * A  (n x n)
@@ -370,6 +404,10 @@ static void least_squares_solve(const float * A, const float * b, float * x,
 
 // Compute per-head sensitivity (concentration ratio) from attention weights.
 //
+// Related to Section 4 (Ablation Study) of Zweiger et al., which shows that
+// non-uniform budget allocation across heads improves quality. Heads that
+// concentrate attention on fewer positions are more sensitive to key loss.
+//
 // For each head, the "importance" of position j is max_q(attn_weights[q,j]).
 // Sensitivity = max(importance) / mean(importance).
 // A high ratio means the head concentrates on few positions → more sensitive
@@ -427,13 +465,16 @@ static void accumulate_weighted_importance(
 
 // Compute the optimal direction vector for encoding beta into K vectors.
 //
-// Given reference queries Q_ref [n_q × d_k], finds direction v [d_k] such that
-// Q_ref @ v ≈ 1 (minimizes ||Q_ref @ v - 1||^2 with ridge regularization).
+// This is our approach for runtime beta injection (US-1). The paper applies
+// beta as a separate additive bias in the attention score computation
+// (Section 3.2, Eq. 3): score_ij = q_i @ k_j / sqrt(d) + beta_j
 //
-// After computing v, modified keys k_j' = k_j + beta_j * sqrt(d_k) * v give:
-//   q @ k_j' / sqrt(d_k) = q @ k_j / sqrt(d_k) + beta_j * (q @ v)
-//
-// For queries where q @ v ≈ 1, this exactly reproduces the beta bias.
+// Since modifying the attention kernel is invasive, we instead encode beta
+// directly into the K vectors by finding a direction v such that q @ v ≈ 1
+// for all reference queries, then setting k_j' = k_j + beta_j * sqrt(d_k) * v.
+// This gives: q @ k_j' / sqrt(d_k) = q @ k_j / sqrt(d_k) + beta_j * (q @ v)
+// For queries where q @ v ≈ 1, this exactly reproduces the paper's beta bias
+// without any attention kernel modifications.
 static void compute_beta_direction(const float * Q_ref, int n_q, int d_k,
                                    float * direction, float ridge = 1e-6f) {
     std::vector<float> ones(n_q, 1.0f);
@@ -488,11 +529,19 @@ struct compacted_layer {
     std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
 };
 
-// Compact a single KV head using the Highest Attention Keys method
+// Compact a single KV head using the Highest Attention Keys method.
+//
+// Implements the full 3-step pipeline from Zweiger et al., Section 3:
+//   Step 1 (Section 3.1): Score keys by max attention weight across Q_ref,
+//           select top-t. This is the "Highest Attention Keys" variant
+//           (vs. OMP in Section 3.1.2).
+//   Step 2 (Section 3.2, Eq. 4): NNLS mass matching → beta biases
+//   Step 3 (Section 3.3, Eq. 6): Least-squares value refitting → C_v
 //
 //   K:       [T, d_k] original keys for this head
 //   V:       [T, d_v] original values for this head
-//   Q_ref:   [n_q, d_k] reference queries
+//   Q_ref:   [n_q, d_k] reference queries (Section 2.2 — can be from
+//            repeat-prefill or K-vector proxy)
 //   t:       target compacted size
 //   d_k:     key dimension
 //   d_v:     value dimension
@@ -515,8 +564,8 @@ static compacted_head compact_head_highest_attn(
         return result;
     }
 
-    // Step 1: Compute attention scores Q_ref @ K^T / sqrt(d_k)
-    //   scores: [n_q, T]
+    // ---- Step 1: Key Selection (Section 3.1 — "Highest Attention Keys") ----
+    // Compute attention scores: S_ij = q_i @ k_j / sqrt(d_k)  [Eq. 1]
     const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
     std::vector<float> scores(n_q * T);
     mat_mul_ABt(Q_ref, K, scores.data(), n_q, T, d_k);
@@ -533,7 +582,8 @@ static compacted_head compact_head_highest_attn(
     std::vector<float> attn_weights(scores);
     softmax_rows(attn_weights.data(), n_q, T);
 
-    // Score each key: max attention weight across queries
+    // Score each key by max attention weight across queries (Section 3.1):
+    //   importance(j) = max_i softmax(S)_{i,j}
     std::vector<float> key_scores(T, 0.0f);
     for (int j = 0; j < T; j++) {
         float max_score = 0.0f;
@@ -555,12 +605,12 @@ static compacted_head compact_head_highest_attn(
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
 
-    // Step 2: Solve NNLS for beta (mass matching)
-    //   We want: sum_j exp(q_i * C_k_j / sqrt(d)) * w_j ≈ sum_j exp(q_i * K_j / sqrt(d))
-    //   where C_k are the selected keys and w_j = exp(beta_j)
-    //
-    //   Design matrix M: M_ij = exp(q_i * K_{selected[j]} / sqrt(d))
-    //   Target: m_i = sum_j exp(q_i * K_j / sqrt(d)) = row_sums[i] (already computed)
+    // ---- Step 2: Mass Matching / Beta (Section 3.2, Eq. 4) ----
+    // Solve NNLS: M * w ≈ m  where w_j = exp(beta_j)
+    //   M_ij = exp(q_i @ k_{sel[j]} / sqrt(d))  — design matrix
+    //   m_i  = sum_j exp(q_i @ K_j / sqrt(d))    — target partition function
+    // This preserves the total attention mass (partition function) so that
+    // softmax over selected keys + beta matches the original distribution.
 
     std::vector<float> M(n_q * t);
     for (int i = 0; i < n_q; i++) {
@@ -578,21 +628,18 @@ static compacted_head compact_head_highest_attn(
         result.beta[j] = logf(std::max(1e-12f, w[j]));
     }
 
-    // Step 3: Solve least squares for C_v (value fitting)
-    //   We want: softmax(q * C_k^T + beta) * C_v ≈ softmax(q * K^T) * V
-    //
-    //   X_ij = softmax(q_i * C_k_j + beta_j) (compacted attention weights)
-    //   Y_i  = softmax(q_i * K^T) * V         (original attention output)
-    //   Solve: X * C_v = Y
+    // ---- Step 3: Value Refitting / C_v (Section 3.3, Eq. 6) ----
+    // Solve least squares: X * C_v = Y
+    //   X_ij = softmax(q_i @ k_{sel[j]} / sqrt(d) + beta_j)  — compacted attn weights
+    //   Y_i  = softmax(q_i @ K / sqrt(d)) @ V                — original attn output
+    // This finds replacement values C_v that minimize the output error
+    // between the compacted and original attention computation.
 
     // Compute X: attention weights with compacted keys + bias
     std::vector<float> X(n_q * t);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < t; j++) {
-            X[i * t + j] = scores[i * T + selected[j]] * inv_sqrt_dk + result.beta[j];
-            // Wait, scores was already scaled. Let me recompute properly.
-            // Actually scores[i*T + selected[j]] is already q*K/sqrt(d)
-            // But we already scaled scores by inv_sqrt_dk above, so:
+            // scores[] already contains q@k/sqrt(d), so just add beta
             X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
         }
     }
@@ -615,7 +662,13 @@ static compacted_head compact_head_highest_attn(
     return result;
 }
 
-// Compact all KV heads within a single layer using shared key selection
+// Compact all KV heads within a single layer using shared key selection.
+//
+// Extends the per-head algorithm (Section 3) to multi-head with shared
+// position selection (Section 3.4). All heads share the same selected
+// token positions but have independent beta and C_v values. This is
+// required because llama.cpp stores KV as contiguous rows across heads,
+// so we can only remove entire token positions (not per-head subsets).
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
 //   V_all:     [T, n_embd_v_gqa] all heads concatenated, row-major
@@ -630,6 +683,7 @@ static compacted_head compact_head_highest_attn(
 // Algorithm:
 //   1. For each head, compute attention scores and per-key importance
 //   2. Global key selection: max importance across heads for each position
+//      (each position's score = max over all heads of its importance)
 //   3. Per-head NNLS (beta) and least-squares (C_v) on shared selection
 //
 static compacted_layer compact_layer_all_heads(
@@ -663,7 +717,8 @@ static compacted_layer compact_layer_all_heads(
         return result;
     }
 
-    // ---- Step 1: Global key selection via max importance across heads ----
+    // ---- Step 1: Global key selection (Section 3.1 + Section 3.4) ----
+    // Compute per-head importance, then take max across heads per position
 
     // Compute per-head key importance scores, then take max across heads
     std::vector<float> global_scores(T, 0.0f);
@@ -735,7 +790,8 @@ static compacted_layer compact_layer_all_heads(
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
 
-    // ---- Steps 2-3: Per-head NNLS (beta) and least squares (C_v) ----
+    // ---- Steps 2-3: Per-head NNLS + LS (Section 3.2-3.3) ----
+    // Each head gets its own beta and C_v on the shared key selection
 
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hd = hdata[h];
@@ -743,8 +799,8 @@ static compacted_layer compact_layer_all_heads(
         result.beta[h].resize(t);
         result.C_v[h].resize(t * d_v);
 
-        // Step 2: NNLS for beta
-        // M_ij = exp(q_i * K_{selected[j]} / sqrt(d)) (from precomputed exp_scores)
+        // Step 2: NNLS for beta (Section 3.2, Eq. 4)
+        // M_ij = exp(q_i @ k_{sel[j]} / sqrt(d)), target = partition function
         std::vector<float> M(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
@@ -759,8 +815,8 @@ static compacted_layer compact_layer_all_heads(
             result.beta[h][j] = logf(std::max(1e-12f, w[j]));
         }
 
-        // Step 3: Least squares for C_v
-        // X_ij = softmax(score[qi, selected[j]] + beta[j])
+        // Step 3: Least squares for C_v (Section 3.3, Eq. 6)
+        // X_ij = softmax(score[qi, sel[j]] + beta[j]), Y = original attn output
         std::vector<float> X(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
