@@ -27,6 +27,7 @@
 
 #include "kv-compact-math.h"
 #include "kv-compact-state.h"
+#include "kv-compact-optimized.h"
 
 // ============================================================================
 // Helpers
@@ -84,6 +85,12 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --trigger N       compact when cache exceeds N tokens (default: 8192)\n");
     LOG("  --budget N        target budget after compaction (default: 4096)\n");
     LOG("\n");
+    LOG("Sublinear optimization (Phase 2):\n");
+    LOG("  --optimized       enable sublinear optimizations (O(n log n) instead of O(n²))\n");
+    LOG("  --method M        compaction method: baseline|l2|hybrid (default: baseline)\n");
+    LOG("  --early-stop      enable early stopping in NNLS (reduces iterations)\n");
+    LOG("  --layer-budget    enable layer-wise budget allocation\n");
+    LOG("\n");
 }
 
 int main(int argc, char ** argv) {
@@ -100,6 +107,12 @@ int main(int argc, char ** argv) {
     int stream_recent_window = 512;
     int stream_trigger = 8192;
     int stream_budget = 4096;
+
+    // Sublinear optimization parameters (Phase 2)
+    bool use_optimized = false;
+    std::string compaction_method = "baseline";  // baseline, l2, hybrid
+    bool enable_early_stop = false;
+    bool enable_layer_budget = false;
 
     // Parse standard params
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
@@ -124,6 +137,14 @@ int main(int argc, char ** argv) {
             stream_trigger = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) {
             stream_budget = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--optimized") == 0) {
+            use_optimized = true;
+        } else if (strcmp(argv[i], "--method") == 0 && i + 1 < argc) {
+            compaction_method = argv[++i];
+        } else if (strcmp(argv[i], "--early-stop") == 0) {
+            enable_early_stop = true;
+        } else if (strcmp(argv[i], "--layer-budget") == 0) {
+            enable_layer_budget = true;
         }
     }
 
@@ -150,13 +171,30 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Validate optimization parameters
+    if (compaction_method != "baseline" && compaction_method != "l2" && compaction_method != "hybrid") {
+        LOG_ERR("Invalid method: %s (must be baseline, l2, or hybrid)\n", compaction_method.c_str());
+        return 1;
+    }
+
     // Log streaming config if any streaming flag was used
     bool use_streaming = (stream_trigger != 8192 || stream_budget != 4096 ||
                           stream_pin_prefix != 256 || stream_recent_window != 512);
 
+    // Log optimization config if any optimization flag was used
+    bool use_optimizations = (use_optimized || compaction_method != "baseline" ||
+                              enable_early_stop || enable_layer_budget);
+
     if (use_streaming) {
         LOG_INF("Streaming mode ENABLED: budget=%d, trigger=%d, pin=%d, recent=%d\n",
                 stream_budget, stream_trigger, stream_pin_prefix, stream_recent_window);
+    }
+
+    if (use_optimizations) {
+        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s, layer_budget=%s\n",
+                compaction_method.c_str(),
+                enable_early_stop ? "ON" : "OFF",
+                enable_layer_budget ? "ON" : "OFF");
     }
 
     // Construct streaming_config

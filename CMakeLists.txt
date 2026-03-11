@@ -6,10 +6,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(KV_COMPACT_BUILD_TESTS "Build unit tests" ON)
 option(KV_COMPACT_BUILD_TOOL  "Build CLI tool (requires llama.cpp)" ON)
+option(KV_COMPACT_ENABLE_PROFILING "Enable profiling instrumentation" OFF)
 
 # ---- Header-only math library (no dependencies) ----
 add_library(kv-compact-math INTERFACE)
 target_include_directories(kv-compact-math INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Add profiling flags if enabled
+if(KV_COMPACT_ENABLE_PROFILING)
+    target_compile_definitions(kv-compact-math INTERFACE KV_COMPACT_PROFILING_ENABLED)
+    message(STATUS "Profiling instrumentation enabled")
+endif()
 
 # ---- Unit tests (standalone, no llama.cpp needed) ----
 if(KV_COMPACT_BUILD_TESTS)
@@ -21,6 +28,9 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(test-kv-compact-adapter tests/test-kv-compact-adapter.cpp)
     target_link_libraries(test-kv-compact-adapter PRIVATE kv-compact-math)
+
+    add_executable(bench-optimization tests/bench-optimization.cpp)
+    target_link_libraries(bench-optimization PRIVATE kv-compact-math)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
@@ -53,6 +63,13 @@ if(KV_COMPACT_BUILD_TOOL)
         ggml
     )
 
+    # Ensure console subsystem on Windows
+    if(WIN32)
+        set_target_properties(llama-kv-compact PROPERTIES
+            LINK_FLAGS "/SUBSYSTEM:CONSOLE"
+        )
+    endif()
+
     # E2E test (also needs llama.cpp)
     add_executable(test-kv-compact-e2e tests/test-kv-compact-e2e.cpp)
     target_link_libraries(test-kv-compact-e2e PRIVATE
@@ -61,4 +78,31 @@ if(KV_COMPACT_BUILD_TOOL)
         common
         ggml
     )
+
+    # llama.cpp CLI tool (for speed testing)
+    add_executable(llama-cli ${llama_cpp_SOURCE_DIR}/tools/cli/cli.cpp)
+    target_link_libraries(llama-cli PRIVATE
+        llama
+        common
+        ggml
+    )
+    if(WIN32)
+        set_target_properties(llama-cli PROPERTIES
+            LINK_FLAGS "/SUBSYSTEM:CONSOLE"
+        )
+    endif()
+endif()
+
+# ---- Profiling target ----
+if(KV_COMPACT_BUILD_TESTS AND KV_COMPACT_ENABLE_PROFILING)
+    add_executable(profiled-kv-compact src/kv-compact.cpp)
+    target_compile_definitions(profiled-kv-compact PRIVATE KV_COMPACT_PROFILING_ENABLED)
+    target_link_libraries(profiled-kv-compact PRIVATE
+        kv-compact-math
+        llama
+        common
+        ggml
+    )
+
+    message(STATUS "Profiled executable: profiled-kv-compact")
 endif()
