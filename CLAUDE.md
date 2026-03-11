@@ -1,5 +1,26 @@
 # kv-compact
 
+## Session Handover
+
+See `HANDOVER.md` for full project state, what's done/not done, and recommended
+next steps. See `docs/user-stories.md` for the complete backlog (US-1 through US-18).
+
+### Quick Start
+```bash
+# Test-only build (no model needed)
+cmake -B build -DKV_COMPACT_BUILD_TOOL=OFF && cmake --build build
+./build/test-kv-compact-math && ./build/test-kv-compact-adapter
+```
+
+### Key Files
+- `include/kv-compact-math.h` — Core algorithm (header-only, zero deps)
+- `include/kv-compact-adapter.h` — GQA/MLA/hybrid adapter abstraction
+- `include/kv-compact-state.h` — llama.cpp state parser/writer
+- `plan.md` — 5-phase streaming compaction roadmap
+- `docs/improvement-tracker.md` — Implementation status matrix
+
+---
+
 ## Qwen 3.5
 
 Qwen 3.5 (released 2026-02-16) is Alibaba's latest model family. It does NOT use GQA or MLA — it uses a **Gated DeltaNet + full attention hybrid** architecture.
