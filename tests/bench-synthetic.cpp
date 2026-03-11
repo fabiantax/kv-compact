@@ -335,9 +335,10 @@ int main() {
     };
 
     std::vector<test_case> cases = {
-        { 256,  {128, 64, 32, 16} },     // 2x, 4x, 8x, 16x
-        { 512,  {256, 128, 64, 32} },     // 2x, 4x, 8x, 16x
-        { 1024, {512, 256, 128, 64} },    // 2x, 4x, 8x, 16x
+        { 256,  {128, 64, 32, 16, 8, 5} },      // 2x, 4x, 8x, 16x, 32x, ~50x
+        { 512,  {256, 128, 64, 32, 16, 10} },    // 2x, 4x, 8x, 16x, 32x, ~50x
+        { 1024, {512, 256, 128, 64, 32, 20} },   // 2x, 4x, 8x, 16x, 32x, ~50x
+        { 4096, {2048, 1024, 256, 128, 82} },    // 2x, 4x, 16x, 32x, ~50x
     };
 
     struct mode_spec {
@@ -375,7 +376,11 @@ int main() {
 
         for (int t : tc.targets) {
             for (auto & m : modes) {
-                // Skip submodular for T > SUBMODULAR_MAX_T (falls back anyway)
+                // Skip token_merge for large T (O(T^2) is too slow)
+                if (m.sel == KEY_SELECT_TOKEN_MERGE && tc.T > 512) continue;
+                // Skip submodular for large T (too slow)
+                if (m.sel == KEY_SELECT_SUBMODULAR && tc.T > 1024) continue;
+
                 auto res = run_one(K, V, Q_ref, Q_eval,
                                   tc.T, N_HEAD_KV, D_HEAD, D_HEAD,
                                   t, m.sel, m.fit, m.sel_name, m.fit_name);
