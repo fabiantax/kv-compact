@@ -12,3 +12,4 @@ CMakeUserPresets.json
 .claude/
 .fab-swarm/
 fab-swarm.config.json
+models/
