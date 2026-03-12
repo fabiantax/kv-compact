@@ -311,8 +311,18 @@ int main(int argc, char ** argv) {
     LOG_INF("\n--- Phase 2: Full cache generation (reference) ---\n");
 
     const int n_gen = std::min(params.n_predict > 0 ? params.n_predict : 128, n_ctx - n_tokens);
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
     std::string full_output = generate_tokens(ctx, model, vocab, params, n_tokens, n_gen);
-    LOG_INF("Full output:\n%s\n", full_output.c_str());
+    auto gen_t1 = std::chrono::high_resolution_clock::now();
+    double full_gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+    int full_gen_tokens = 0;
+    { // count generated tokens
+        auto toks = common_tokenize(vocab, full_output, false, false);
+        full_gen_tokens = (int)toks.size();
+    }
+    double full_tgs = (full_gen_tokens > 0 && full_gen_ms > 0) ? (full_gen_tokens * 1000.0 / full_gen_ms) : 0.0;
+    LOG_INF("Full output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+            full_gen_tokens, full_gen_ms, full_tgs, full_output.c_str());
 
     llama_memory_t mem = llama_get_memory(ctx);
 
@@ -356,8 +366,15 @@ int main(int argc, char ** argv) {
         LOG_INF("Eviction: keeping %d / %d tokens\n", n_kept, n_tokens);
 
         llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
+        auto evict_t0 = std::chrono::high_resolution_clock::now();
         evict_output = generate_tokens(ctx, model, vocab, params, pos_max + 1, n_gen);
-        LOG_INF("Eviction output:\n%s\n", evict_output.c_str());
+        auto evict_t1 = std::chrono::high_resolution_clock::now();
+        double evict_gen_ms = std::chrono::duration<double, std::milli>(evict_t1 - evict_t0).count();
+        int evict_gen_tokens = 0;
+        { auto toks = common_tokenize(vocab, evict_output, false, false); evict_gen_tokens = (int)toks.size(); }
+        double evict_tgs = (evict_gen_tokens > 0 && evict_gen_ms > 0) ? (evict_gen_tokens * 1000.0 / evict_gen_ms) : 0.0;
+        LOG_INF("Eviction output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+                evict_gen_tokens, evict_gen_ms, evict_tgs, evict_output.c_str());
     }
 
     // ============================================================
@@ -802,13 +819,28 @@ int main(int argc, char ** argv) {
             llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
             LOG_INF("Generating from pos %d...\n", (int)pos_max + 1);
 
+            auto am_t0 = std::chrono::high_resolution_clock::now();
             std::string am_output = generate_tokens(ctx, model, vocab, params, pos_max + 1, n_gen);
-            LOG_INF("\nAttention Matching output:\n%s\n", am_output.c_str());
+            auto am_t1 = std::chrono::high_resolution_clock::now();
+            double am_gen_ms = std::chrono::duration<double, std::milli>(am_t1 - am_t0).count();
+            int am_gen_tokens = 0;
+            { auto toks = common_tokenize(vocab, am_output, false, false); am_gen_tokens = (int)toks.size(); }
+            double am_tgs = (am_gen_tokens > 0 && am_gen_ms > 0) ? (am_gen_tokens * 1000.0 / am_gen_ms) : 0.0;
+            LOG_INF("\nAttention Matching output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+                    am_gen_tokens, am_gen_ms, am_tgs, am_output.c_str());
 
             // Summary comparison
             LOG_INF("\n=== Summary ===\n");
             LOG_INF("Compression: %d → %d tokens (%.1fx)\n", n_tokens, t, (float)n_tokens / t);
             LOG_INF("Compaction time: %.1f ms\n", compact_ms);
+            LOG_INF("\n--- tg/s comparison ---\n");
+            LOG_INF("  Full cache:          %6.2f tg/s (%d tokens in %.0f ms)\n",
+                    full_tgs, full_gen_tokens, full_gen_ms);
+            LOG_INF("  Attention Matching:  %6.2f tg/s (%d tokens in %.0f ms)\n",
+                    am_tgs, am_gen_tokens, am_gen_ms);
+            if (full_tgs > 0) {
+                LOG_INF("  Speedup:             %.2fx\n", am_tgs / full_tgs);
+            }
             LOG_INF("\nFull cache output (first 200 chars):\n  %.200s\n", full_output.c_str());
             if (do_eviction) {
                 LOG_INF("\nToken eviction output (first 200 chars):\n  %.200s\n", evict_output.c_str());
