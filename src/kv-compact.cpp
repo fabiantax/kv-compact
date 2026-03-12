@@ -114,12 +114,11 @@ int main(int argc, char ** argv) {
     bool enable_early_stop = false;
     bool enable_layer_budget = false;
 
-    // Parse standard params
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
-        return 1;
-    }
+    // Parse custom args FIRST (before common_params_parse which rejects unknowns)
+    // Build a filtered argv for llama.cpp's parser
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
 
-    // Parse custom args
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--compact-ratio") == 0 && i + 1 < argc) {
             compact_ratio = std::stof(argv[++i]);
@@ -145,7 +144,17 @@ int main(int argc, char ** argv) {
             enable_early_stop = true;
         } else if (strcmp(argv[i], "--layer-budget") == 0) {
             enable_layer_budget = true;
+        } else {
+            // Pass through to llama.cpp parser
+            filtered_argv.push_back(argv[i]);
         }
+    }
+
+    int filtered_argc = (int)filtered_argv.size();
+
+    // Parse standard params (llama.cpp args only)
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
+        return 1;
     }
 
     if (compact_ratio <= 0.0f || compact_ratio >= 1.0f) {
