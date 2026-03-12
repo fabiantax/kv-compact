@@ -282,17 +282,23 @@ int main(int argc, char ** argv) {
     // ============================================================
     LOG_INF("\n--- Phase 1: Prefill ---\n");
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    for (int i = 0; i < n_tokens; i++) {
-        common_batch_add(batch, tokens[i], i, {0}, (i == n_tokens - 1));
-    }
+    const int n_batch = llama_n_batch(ctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
-    if (llama_decode(ctx, batch) != 0) {
-        LOG_ERR("Prefill failed\n");
-        llama_batch_free(batch);
-        return 1;
+    // Prefill in chunks of n_batch
+    for (int start = 0; start < n_tokens; start += n_batch) {
+        const int end = std::min(start + n_batch, n_tokens);
+        common_batch_clear(batch);
+        for (int i = start; i < end; i++) {
+            common_batch_add(batch, tokens[i], i, {0}, (i == n_tokens - 1));
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("Prefill failed at token %d\n", start);
+            llama_batch_free(batch);
+            return 1;
+        }
     }
-    LOG_INF("Prefill complete: %d tokens in KV cache\n", n_tokens);
+    LOG_INF("Prefill complete: %d tokens in KV cache (batch size %d)\n", n_tokens, n_batch);
 
     // Save full state
     const size_t state_size = llama_state_seq_get_size(ctx, 0);
