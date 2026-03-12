@@ -401,11 +401,8 @@ int main(int argc, char ** argv) {
     // (because cell positions must be consistent across layers in the state format)
     // Strategy: compute importance per layer, aggregate, then select globally
 
-    LOG_INF("Computing global key importance across %u layers × %d heads...\n",
-            sd.n_layer, n_head_kv);
-
-    // Global importance: max across all layers and heads
-    std::vector<float> global_importance(sd.cell_count, 0.0f);
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    const int T = (int) sd.cell_count;
 
     // Store per-layer precomputed data for reuse in NNLS/LSQ steps
     struct layer_head_cache {
@@ -414,61 +411,150 @@ int main(int argc, char ** argv) {
         std::vector<float> row_sums;     // [n_q]
         std::vector<float> attn_weights; // [n_q, T]
     };
+
+    // ---- Step 1: Key importance scoring and selection ----
+    // Global importance: max across all layers and heads
+    std::vector<float> global_importance(sd.cell_count, 0.0f);
+
+    // Cache only needed for baseline and NNLS/LSQ phases
     std::vector<std::vector<layer_head_cache>> lh_cache(sd.n_layer);
 
-    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
-    const int T = (int) sd.cell_count;
+    if (use_optimized && (compaction_method == "l2" || compaction_method == "hybrid")) {
+        // ---- OPTIMIZED: L2 importance estimation ----
+        LOG_INF("Using L2 importance estimation (method=%s)...\n", compaction_method.c_str());
 
-    for (uint32_t l = 0; l < sd.n_layer; l++) {
-        const auto & ld = sd.layers[l];
-        lh_cache[l].resize(n_head_kv);
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
 
-        for (int h = 0; h < n_head_kv; h++) {
-            auto & hc = lh_cache[l][h];
-            hc.scores.resize(n_ref_queries * T);
-            hc.exp_scores.resize(n_ref_queries * T);
-            hc.row_sums.resize(n_ref_queries);
-            hc.attn_weights.resize(n_ref_queries * T);
+            for (int h = 0; h < n_head_kv; h++) {
+                // Use L2 norm + query dot product for importance
+                auto importance = kvcompact::optimized::FastImportanceEstimator::estimate_importance_l2(
+                    ld.K.data() + h * d_k,  // keys for this head (strided)
+                    ld.K.data() + ref_start * n_embd_k_gqa + h * d_k,  // queries for this head
+                    T, n_ref_queries, d_k
+                );
 
-            // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
-                for (int ki = 0; ki < T; ki++) {
-                    const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
-                    float dot = 0.0f;
+                // NOTE: keys/queries are stored with stride n_embd_k_gqa, not d_k.
+                // Recompute with correct strided access:
+                for (int j = 0; j < T; j++) {
+                    const float * k_row = ld.K.data() + j * n_embd_k_gqa + h * d_k;
+
+                    // L2 norm of key
+                    float key_norm = 0.0f;
                     for (int d = 0; d < d_k; d++) {
-                        dot += q_row[d] * k_row[d];
+                        key_norm += k_row[d] * k_row[d];
                     }
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    key_norm = sqrtf(key_norm);
+
+                    // Mean absolute dot product with reference queries
+                    float query_importance = 0.0f;
+                    for (int qi = 0; qi < n_ref_queries; qi++) {
+                        const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        query_importance += fabsf(dot);
+                    }
+
+                    float imp = key_norm * (query_importance / n_ref_queries);
+                    if (imp > global_importance[j]) {
+                        global_importance[j] = imp;
+                    }
                 }
             }
 
-            // exp and softmax
-            memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
-
-            memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
-
-            // Per-key max attention across queries → global importance
-            for (int j = 0; j < T; j++) {
-                float max_w = 0.0f;
-                for (int qi = 0; qi < n_ref_queries; qi++) {
-                    float w = hc.attn_weights[qi * T + j];
-                    if (w > max_w) max_w = w;
-                }
-                if (max_w > global_importance[j]) {
-                    global_importance[j] = max_w;
-                }
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  L2-scored %u / %u layers\n", l + 1, sd.n_layer);
             }
         }
 
-        if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
-            LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
+        // We still need the attention cache for NNLS/LSQ phases
+        LOG_INF("Computing attention cache for NNLS/LSQ...\n");
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
+            lh_cache[l].resize(n_head_kv);
+
+            for (int h = 0; h < n_head_kv; h++) {
+                auto & hc = lh_cache[l][h];
+                hc.scores.resize(n_ref_queries * T);
+                hc.exp_scores.resize(n_ref_queries * T);
+                hc.row_sums.resize(n_ref_queries);
+                hc.attn_weights.resize(n_ref_queries * T);
+
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
+                }
+
+                memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+
+                memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+            }
+        }
+    } else {
+        // ---- BASELINE: Full attention scoring ----
+        LOG_INF("Computing global key importance across %u layers × %d heads...\n",
+                sd.n_layer, n_head_kv);
+
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
+            lh_cache[l].resize(n_head_kv);
+
+            for (int h = 0; h < n_head_kv; h++) {
+                auto & hc = lh_cache[l][h];
+                hc.scores.resize(n_ref_queries * T);
+                hc.exp_scores.resize(n_ref_queries * T);
+                hc.row_sums.resize(n_ref_queries);
+                hc.attn_weights.resize(n_ref_queries * T);
+
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
+                }
+
+                memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+
+                memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+
+                // Per-key max attention across queries → global importance
+                for (int j = 0; j < T; j++) {
+                    float max_w = 0.0f;
+                    for (int qi = 0; qi < n_ref_queries; qi++) {
+                        float w = hc.attn_weights[qi * T + j];
+                        if (w > max_w) max_w = w;
+                    }
+                    if (max_w > global_importance[j]) {
+                        global_importance[j] = max_w;
+                    }
+                }
+            }
+
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
+            }
         }
     }
 
-    // Select top-t globally
+    // ---- Select top-t globally ----
     {
         std::vector<int> indices(T);
         std::iota(indices.begin(), indices.end(), 0);
@@ -481,35 +567,72 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Selected %d / %d positions globally\n", t, T);
 
-    // Per-layer, per-head NNLS (beta) and least-squares (C_v)
+    // ---- Layer-wise budget allocation (optional) ----
+    std::vector<int> layer_budgets(sd.n_layer, t);  // default: same budget for all layers
+    if (use_optimized && enable_layer_budget) {
+        LOG_INF("Using layer-wise budget allocation...\n");
+        auto sensitivities = kvcompact::optimized::LayerWiseBudgetAllocator::get_default_sensitivities(sd.n_layer);
+        layer_budgets = kvcompact::optimized::LayerWiseBudgetAllocator::allocate_budgets(t, sensitivities, sd.n_layer);
+
+        // Clamp budgets to shared_selected size (can't exceed global selection)
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            layer_budgets[l] = std::min(layer_budgets[l], t);
+            layer_budgets[l] = std::max(layer_budgets[l], 1);
+        }
+
+        LOG_INF("  Budget range: %d - %d (global t=%d)\n",
+                *std::min_element(layer_budgets.begin(), layer_budgets.end()),
+                *std::max_element(layer_budgets.begin(), layer_budgets.end()), t);
+    }
+
+    // ---- Step 2+3: Per-layer, per-head NNLS (beta) and least-squares (C_v) ----
     std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
+    int total_nnls_iters = 0;
+    int total_nnls_calls = 0;
 
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
         cv_all[l].resize(n_head_kv);
         beta_all[l].resize(n_head_kv);
 
+        // Layer budget: use fewer tokens for less sensitive layers
+        const int t_layer = layer_budgets[l];
+
         for (int h = 0; h < n_head_kv; h++) {
             const auto & hc = lh_cache[l][h];
 
             auto & beta = beta_all[l][h];
             auto & cv   = cv_all[l][h];
-            beta.resize(t);
+            beta.resize(t);   // always t for state consistency
             cv.resize(t * d_v);
 
-            // Step 2: NNLS for beta
-            std::vector<float> M(n_ref_queries * t);
+            // Step 2: NNLS for beta (using layer budget for NNLS solve)
+            std::vector<float> M(n_ref_queries * t_layer);
             for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t; j++) {
-                    M[qi * t + j] = hc.exp_scores[qi * T + shared_selected[j]];
+                for (int j = 0; j < t_layer; j++) {
+                    M[qi * t_layer + j] = hc.exp_scores[qi * T + shared_selected[j]];
                 }
             }
 
-            std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t);
+            std::vector<float> w(t_layer);
 
-            for (int j = 0; j < t; j++) {
+            if (use_optimized && enable_early_stop) {
+                // Early-stop NNLS: converge faster
+                int iters = nnls_solve_early_stop(M.data(), hc.row_sums.data(), w.data(),
+                                                   n_ref_queries, t_layer, 200, 1e-4f);
+                total_nnls_iters += iters;
+            } else {
+                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t_layer);
+                total_nnls_iters += 200;
+            }
+            total_nnls_calls++;
+
+            for (int j = 0; j < t_layer; j++) {
                 beta[j] = logf(std::max(1e-12f, w[j]));
+            }
+            // Zero out beta for positions beyond layer budget
+            for (int j = t_layer; j < t; j++) {
+                beta[j] = 0.0f;
             }
 
             // Step 3: Least squares for C_v
@@ -539,6 +662,11 @@ int main(int argc, char ** argv) {
         if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
             LOG_INF("  Compacted %u / %u layers\n", l + 1, sd.n_layer);
         }
+    }
+
+    if (use_optimized && enable_early_stop && total_nnls_calls > 0) {
+        LOG_INF("NNLS early-stop: avg %.1f iters/call (vs 200 max), %d calls\n",
+                (float)total_nnls_iters / total_nnls_calls, total_nnls_calls);
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();

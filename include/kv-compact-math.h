@@ -176,6 +176,71 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
     }
 }
 
+// NNLS with early stopping: stops when gradient norm improvement < tolerance
+// Returns the number of iterations actually used
+static int nnls_solve_early_stop(const float * A, const float * b, float * w,
+                                  int m, int n, int max_iter = 200,
+                                  float tolerance = 1e-4f) {
+    std::vector<float> AtA(n * n);
+    std::vector<float> Atb(n);
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < m; k++) {
+                sum += A[k * n + i] * A[k * n + j];
+            }
+            AtA[i * n + j] = sum;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        float sum = 0.0f;
+        for (int k = 0; k < m; k++) {
+            sum += A[k * n + i] * b[k];
+        }
+        Atb[i] = sum;
+    }
+
+    for (int i = 0; i < n; i++) {
+        w[i] = 1.0f;
+    }
+
+    float trace = 0.0f;
+    for (int i = 0; i < n; i++) {
+        trace += AtA[i * n + i];
+    }
+    float step = 1.0f / (trace + 1e-8f);
+
+    std::vector<float> grad(n);
+    float prev_grad_norm = 1e30f;
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        float grad_norm = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < n; j++) {
+                sum += AtA[i * n + j] * w[j];
+            }
+            grad[i] = sum - Atb[i];
+            grad_norm += grad[i] * grad[i];
+        }
+        grad_norm = sqrtf(grad_norm);
+
+        for (int i = 0; i < n; i++) {
+            w[i] = std::max(1e-12f, w[i] - step * grad[i]);
+        }
+
+        // Early stop: converged when relative improvement is tiny
+        float improvement = (prev_grad_norm - grad_norm) / (prev_grad_norm + 1e-12f);
+        if (iter > 0 && improvement < tolerance) {
+            return iter + 1;
+        }
+        prev_grad_norm = grad_norm;
+    }
+    return max_iter;
+}
+
 // Beta fitting strategy for mass matching (Paper Step 2, Section 3.2)
 enum beta_fit_mode {
     BETA_FIT_NNLS     = 0,  // Paper baseline: projected gradient NNLS

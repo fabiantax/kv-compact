@@ -117,9 +117,9 @@ public:
         const std::vector<size_t>& selected_indices,
         int n_queries,
         int n_tokens,
-        int k,
-        const Config& config = Config()
+        int k
     ) {
+        Config config;
         // Adaptive iteration count: fewer tokens = fewer iterations
         int adaptive_max_iter = config.adaptive_iterations
             ? std::min(config.max_iterations, k * 5)
@@ -214,6 +214,15 @@ public:
 };
 
 /**
+ * Result of hierarchical compaction
+ */
+struct CompactionResult {
+    std::vector<size_t> selected_indices;
+    std::chrono::milliseconds compaction_time{0};
+    double quality_score = 0.0;
+};
+
+/**
  * Hierarchical compaction for sublinear complexity
  * Based on: SubGen, hierarchical clustering
  *
@@ -232,16 +241,14 @@ public:
      * Compress using hierarchical approach
      * Overall complexity: O(n log n) instead of O(n²)
      */
-    template<typename KeyType, typename ValueType>
     static CompactionResult compact_hierarchical(
-        const KeyType* keys,
-        const ValueType* values,
+        const float* keys,
         int n_tokens,
         int n_heads,
         int head_dim,
-        double target_ratio,
-        const Config& config = Config()
+        double target_ratio
     ) {
+        Config config;
         auto start = std::chrono::high_resolution_clock::now();
 
         int target_tokens = static_cast<int>(n_tokens * target_ratio);
@@ -260,11 +267,9 @@ public:
 
         auto end = std::chrono::high_resolution_clock::now();
 
-        // Generate result
         CompactionResult result;
         result.selected_indices = fine_selection;
         result.compaction_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        result.quality_metrics = compute_quality(keys, values, fine_selection, /*...*/);
 
         return result;
     }
