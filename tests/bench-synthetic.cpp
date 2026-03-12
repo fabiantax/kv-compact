@@ -349,12 +349,14 @@ int main() {
     };
 
     std::vector<mode_spec> modes = {
-        { KEY_SELECT_MAX_ATTN,    BETA_FIT_NNLS,     "max_attn",    "nnls"     },
-        { KEY_SELECT_MAX_ATTN,    BETA_FIT_SINKHORN,  "max_attn",    "sinkhorn" },
-        { KEY_SELECT_SUBMODULAR,  BETA_FIT_NNLS,     "submodular",  "nnls"     },
-        { KEY_SELECT_SUBMODULAR,  BETA_FIT_SINKHORN,  "submodular",  "sinkhorn" },
-        { KEY_SELECT_TOKEN_MERGE, BETA_FIT_NNLS,     "token_merge", "nnls"     },
-        { KEY_SELECT_KMEANS,      BETA_FIT_NNLS,     "kmeans",      "nnls"     },
+        { KEY_SELECT_MAX_ATTN,    BETA_FIT_NNLS,        "max_attn",    "nnls"        },
+        { KEY_SELECT_MAX_ATTN,    BETA_FIT_SINKHORN,     "max_attn",    "sinkhorn"    },
+        { KEY_SELECT_MAX_ATTN,    BETA_FIT_CLOSED_FORM,  "max_attn",    "closed_form" },
+        { KEY_SELECT_SUBMODULAR,  BETA_FIT_NNLS,        "submodular",  "nnls"        },
+        { KEY_SELECT_SUBMODULAR,  BETA_FIT_SINKHORN,     "submodular",  "sinkhorn"    },
+        { KEY_SELECT_SUBMODULAR,  BETA_FIT_CLOSED_FORM,  "submodular",  "closed_form" },
+        { KEY_SELECT_TOKEN_MERGE, BETA_FIT_NNLS,        "token_merge", "nnls"        },
+        { KEY_SELECT_KMEANS,      BETA_FIT_NNLS,        "kmeans",      "nnls"        },
     };
 
     // Print header

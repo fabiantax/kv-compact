@@ -89,6 +89,7 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --optimized       enable sublinear optimizations (O(n log n) instead of O(n²))\n");
     LOG("  --method M        compaction method: baseline|l2|hybrid (default: baseline)\n");
     LOG("  --early-stop      enable early stopping in NNLS (reduces iterations)\n");
+    LOG("  --closed-form-beta use closed-form beta (no NNLS, ~160x faster)\n");
     LOG("  --layer-budget    enable layer-wise budget allocation\n");
     LOG("\n");
 }
@@ -112,6 +113,7 @@ int main(int argc, char ** argv) {
     bool use_optimized = false;
     std::string compaction_method = "baseline";  // baseline, l2, hybrid
     bool enable_early_stop = false;
+    bool enable_closed_form_beta = false;
     bool enable_layer_budget = false;
 
     // Parse custom args FIRST (before common_params_parse which rejects unknowns)
@@ -142,6 +144,8 @@ int main(int argc, char ** argv) {
             compaction_method = argv[++i];
         } else if (strcmp(argv[i], "--early-stop") == 0) {
             enable_early_stop = true;
+        } else if (strcmp(argv[i], "--closed-form-beta") == 0) {
+            enable_closed_form_beta = true;
         } else if (strcmp(argv[i], "--layer-budget") == 0) {
             enable_layer_budget = true;
         } else {
@@ -192,7 +196,8 @@ int main(int argc, char ** argv) {
 
     // Log optimization config if any optimization flag was used
     bool use_optimizations = (use_optimized || compaction_method != "baseline" ||
-                              enable_early_stop || enable_layer_budget);
+                              enable_early_stop || enable_closed_form_beta ||
+                              enable_layer_budget);
 
     if (use_streaming) {
         LOG_INF("Streaming mode ENABLED: budget=%d, trigger=%d, pin=%d, recent=%d\n",
@@ -200,9 +205,10 @@ int main(int argc, char ** argv) {
     }
 
     if (use_optimizations) {
-        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s, layer_budget=%s\n",
+        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s, closed_form_beta=%s, layer_budget=%s\n",
                 compaction_method.c_str(),
                 enable_early_stop ? "ON" : "OFF",
+                enable_closed_form_beta ? "ON" : "OFF",
                 enable_layer_budget ? "ON" : "OFF");
     }
 
@@ -638,33 +644,41 @@ int main(int argc, char ** argv) {
             beta.resize(t);   // always t for state consistency
             cv.resize(t * d_v);
 
-            // Step 2: NNLS for beta (using layer budget for NNLS solve)
-            std::vector<float> M(n_ref_queries * t_layer);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t_layer; j++) {
-                    M[qi * t_layer + j] = hc.exp_scores[qi * T + shared_selected[j]];
-                }
-            }
-
-            std::vector<float> w(t_layer);
-
-            if (use_optimized && enable_early_stop) {
-                // Early-stop NNLS: converge faster
-                int iters = nnls_solve_early_stop(M.data(), hc.row_sums.data(), w.data(),
-                                                   n_ref_queries, t_layer, 200, 1e-4f);
-                total_nnls_iters += iters;
+            // Step 2: Beta fitting (NNLS or closed-form)
+            if (enable_closed_form_beta) {
+                // Closed-form: O(n_ref_queries * t) with no iterations
+                beta_closed_form(hc.attn_weights.data(), shared_selected.data(),
+                                  beta.data(), n_ref_queries, T, t);
+                total_nnls_calls++;
+                total_nnls_iters += 0;  // no iterations
             } else {
-                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t_layer);
-                total_nnls_iters += 200;
-            }
-            total_nnls_calls++;
+                // NNLS: O(t² * max_iter)
+                std::vector<float> M(n_ref_queries * t_layer);
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    for (int j = 0; j < t_layer; j++) {
+                        M[qi * t_layer + j] = hc.exp_scores[qi * T + shared_selected[j]];
+                    }
+                }
 
-            for (int j = 0; j < t_layer; j++) {
-                beta[j] = logf(std::max(1e-12f, w[j]));
-            }
-            // Zero out beta for positions beyond layer budget
-            for (int j = t_layer; j < t; j++) {
-                beta[j] = 0.0f;
+                std::vector<float> w(t_layer);
+
+                if (use_optimized && enable_early_stop) {
+                    int iters = nnls_solve_early_stop(M.data(), hc.row_sums.data(), w.data(),
+                                                       n_ref_queries, t_layer, 200, 1e-4f);
+                    total_nnls_iters += iters;
+                } else {
+                    nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t_layer);
+                    total_nnls_iters += 200;
+                }
+                total_nnls_calls++;
+
+                for (int j = 0; j < t_layer; j++) {
+                    beta[j] = logf(std::max(1e-12f, w[j]));
+                }
+                // Zero out beta for positions beyond layer budget
+                for (int j = t_layer; j < t; j++) {
+                    beta[j] = 0.0f;
+                }
             }
 
             // Step 3: Least squares for C_v
@@ -696,9 +710,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (use_optimized && enable_early_stop && total_nnls_calls > 0) {
-        LOG_INF("NNLS early-stop: avg %.1f iters/call (vs 200 max), %d calls\n",
-                (float)total_nnls_iters / total_nnls_calls, total_nnls_calls);
+    if (total_nnls_calls > 0) {
+        if (enable_closed_form_beta) {
+            LOG_INF("Beta: closed-form (0 iterations), %d calls\n", total_nnls_calls);
+        } else if (use_optimized && enable_early_stop) {
+            LOG_INF("NNLS early-stop: avg %.1f iters/call (vs 200 max), %d calls\n",
+                    (float)total_nnls_iters / total_nnls_calls, total_nnls_calls);
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();

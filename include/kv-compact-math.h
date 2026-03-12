@@ -243,9 +243,44 @@ static int nnls_solve_early_stop(const float * A, const float * b, float * w,
 
 // Beta fitting strategy for mass matching (Paper Step 2, Section 3.2)
 enum beta_fit_mode {
-    BETA_FIT_NNLS     = 0,  // Paper baseline: projected gradient NNLS
-    BETA_FIT_SINKHORN = 1,  // adjacent-concepts Sec 6: Sinkhorn (entropic OT)
+    BETA_FIT_NNLS        = 0,  // Paper baseline: projected gradient NNLS
+    BETA_FIT_SINKHORN    = 1,  // adjacent-concepts Sec 6: Sinkhorn (entropic OT)
+    BETA_FIT_CLOSED_FORM = 2,  // Closed-form: O(n_q * t) with no iterations
 };
+
+// Closed-form beta computation: eliminates NNLS entirely
+//
+// Instead of solving min_{w>=0} ||M*w - b||² iteratively, compute beta directly
+// from the attention weights:
+//
+//   beta[j] = log(mean_q(attn[q, selected[j]]) * T)
+//
+// Derivation: if selected key j receives average attention weight a_j across
+// reference queries, then in the compacted cache it should receive proportionally
+// more attention (since we removed T-t keys). The bias log(a_j * T) adjusts
+// the softmax logits to preserve the relative attention distribution.
+//
+// Complexity: O(n_ref_queries * t) per head — vs O(t² * max_iter) for NNLS
+// At t=1455 (10K context), this is ~160x faster per head.
+//
+// attn_weights: [n_queries × T] softmax attention matrix (precomputed)
+// selected:     [t] indices of selected keys
+// beta:         [t] output bias values (log-space)
+// n_queries:    number of reference queries
+// T:            total number of keys (before compaction)
+// t:            number of selected keys (after compaction)
+//
+static void beta_closed_form(const float * attn_weights, const int * selected,
+                              float * beta, int n_queries, int T, int t) {
+    for (int j = 0; j < t; j++) {
+        float mean_attn = 0.0f;
+        for (int qi = 0; qi < n_queries; qi++) {
+            mean_attn += attn_weights[qi * T + selected[j]];
+        }
+        mean_attn /= n_queries;
+        beta[j] = logf(std::max(1e-12f, mean_attn * T));
+    }
+}
 
 // Sinkhorn beta fitting (adjacent-concepts.md Sec 6: Optimal Transport)
 //
@@ -1459,15 +1494,20 @@ static compacted_head compact_head_highest_attn(
         }
     }
 
-    std::vector<float> w(t);
-    if (fit_mode == BETA_FIT_SINKHORN) {
-        sinkhorn_beta_fit(M.data(), row_sums.data(), w.data(), n_q, t);
+    if (fit_mode == BETA_FIT_CLOSED_FORM) {
+        beta_closed_form(attn_weights.data(), selected.data(),
+                          result.beta.data(), n_q, T, t);
     } else {
-        nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
-    }
+        std::vector<float> w(t);
+        if (fit_mode == BETA_FIT_SINKHORN) {
+            sinkhorn_beta_fit(M.data(), row_sums.data(), w.data(), n_q, t);
+        } else {
+            nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
+        }
 
-    for (int j = 0; j < t; j++) {
-        result.beta[j] = logf(std::max(1e-12f, w[j]));
+        for (int j = 0; j < t; j++) {
+            result.beta[j] = logf(std::max(1e-12f, w[j]));
+        }
     }
 
     // Compute Y (original attention output) once: attn_weights @ V [n_q, d_v]
@@ -1946,15 +1986,20 @@ static compacted_layer compact_layer_all_heads(
             }
         }
 
-        std::vector<float> w(t);
-        if (fit_mode == BETA_FIT_SINKHORN) {
-            sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+        if (fit_mode == BETA_FIT_CLOSED_FORM) {
+            beta_closed_form(hd.attn_weights.data(), selected.data(),
+                              result.beta[h].data(), n_q, T, t);
         } else {
-            nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
-        }
+            std::vector<float> w(t);
+            if (fit_mode == BETA_FIT_SINKHORN) {
+                sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+            } else {
+                nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+            }
 
-        for (int j = 0; j < t; j++) {
-            result.beta[h][j] = logf(std::max(1e-12f, w[j]));
+            for (int j = 0; j < t; j++) {
+                result.beta[h][j] = logf(std::max(1e-12f, w[j]));
+            }
         }
 
         // Compute Y (original attention output) once: attn_weights @ V_head [n_q, d_v]

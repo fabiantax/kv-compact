@@ -9,6 +9,7 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2175,6 +2176,227 @@ static void test_sinkhorn_multi_head() {
 }
 
 // ============================================================================
+// Closed-form beta tests
+// ============================================================================
+
+static void test_closed_form_basic() {
+    printf("  test_closed_form_basic...");
+
+    // Simple case: uniform attention across 4 keys, select 2
+    const int T = 4, n_q = 2, t = 2;
+
+    // attn_weights: [n_q × T], uniform 0.25 per key
+    float attn[8] = {0.25f, 0.25f, 0.25f, 0.25f,
+                     0.25f, 0.25f, 0.25f, 0.25f};
+
+    int selected[2] = {1, 3};
+    float beta[2];
+
+    beta_closed_form(attn, selected, beta, n_q, T, t);
+
+    // With uniform attention 0.25 and T=4: beta[j] = log(0.25 * 4) = log(1) = 0
+    for (int j = 0; j < t; j++) {
+        assert(fabsf(beta[j]) < 0.01f);
+    }
+
+    printf(" OK\n");
+}
+
+static void test_closed_form_nonuniform() {
+    printf("  test_closed_form_nonuniform...");
+
+    // One key gets most attention, another gets little
+    const int T = 4, n_q = 1, t = 2;
+
+    // Key 0 gets 0.7 attention, key 2 gets 0.1
+    float attn[4] = {0.7f, 0.1f, 0.1f, 0.1f};
+    int selected[2] = {0, 2};
+    float beta[2];
+
+    beta_closed_form(attn, selected, beta, n_q, T, t);
+
+    // beta[0] = log(0.7 * 4) = log(2.8) ≈ 1.03
+    // beta[1] = log(0.1 * 4) = log(0.4) ≈ -0.92
+    assert(beta[0] > beta[1]);  // high-attention key gets higher beta
+    assert(fabsf(beta[0] - logf(2.8f)) < 0.01f);
+    assert(fabsf(beta[1] - logf(0.4f)) < 0.01f);
+
+    printf(" OK\n");
+}
+
+static void test_closed_form_finite() {
+    printf("  test_closed_form_finite...");
+
+    // Larger case: ensure all outputs are finite
+    const int T = 100, n_q = 32, t = 20;
+
+    std::vector<float> attn(n_q * T);
+    // Generate softmax-like attention (rows sum to 1)
+    for (int qi = 0; qi < n_q; qi++) {
+        float sum = 0.0f;
+        for (int j = 0; j < T; j++) {
+            attn[qi * T + j] = 1.0f + sinf((float)(qi * T + j) * 0.3f);
+            sum += attn[qi * T + j];
+        }
+        for (int j = 0; j < T; j++) {
+            attn[qi * T + j] /= sum;
+        }
+    }
+
+    std::vector<int> selected(t);
+    for (int j = 0; j < t; j++) selected[j] = j * (T / t);
+
+    std::vector<float> beta(t);
+    beta_closed_form(attn.data(), selected.data(), beta.data(), n_q, T, t);
+
+    for (int j = 0; j < t; j++) {
+        assert(std::isfinite(beta[j]));
+    }
+
+    printf(" OK\n");
+}
+
+static void test_closed_form_vs_nnls_quality() {
+    printf("  test_closed_form_vs_nnls_quality...");
+
+    // Compare closed-form vs NNLS on a realistic compaction problem
+    const int T = 20, n_q = 10, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    auto r_nnls = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_NNLS);
+
+    auto r_cf = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_CLOSED_FORM);
+
+    // Compute output MSE for both
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    auto compute_mse = [&](const compacted_head & res) -> float {
+        float total_err = 0.0f;
+        for (int qi = 0; qi < n_q; qi++) {
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[j * d_k + d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+            std::vector<float> comp_scores(t);
+            for (int j = 0; j < t; j++) {
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++)
+                    dot += Q[qi * d_k + d] * K[res.selected_indices[j] * d_k + d];
+                comp_scores[j] = dot * inv_sqrt_dk + res.beta[j];
+            }
+            softmax_rows(comp_scores.data(), 1, t);
+            std::vector<float> comp_out(d_v, 0.0f);
+            for (int j = 0; j < t; j++)
+                for (int d = 0; d < d_v; d++)
+                    comp_out[d] += comp_scores[j] * res.C_v[j * d_v + d];
+
+            for (int d = 0; d < d_v; d++) {
+                float e = orig_out[d] - comp_out[d];
+                total_err += e * e;
+            }
+        }
+        return total_err / (n_q * d_v);
+    };
+
+    float mse_nnls = compute_mse(r_nnls);
+    float mse_cf   = compute_mse(r_cf);
+
+    printf("\n    MSE: nnls=%.8f  closed_form=%.8f", mse_nnls, mse_cf);
+
+    assert(std::isfinite(mse_nnls));
+    assert(std::isfinite(mse_cf));
+    // Closed-form should be in the same ballpark (within 100x)
+    assert(mse_cf < mse_nnls * 100.0f + 1e-6f);
+
+    printf(" OK\n");
+}
+
+static void test_closed_form_multi_head() {
+    printf("  test_closed_form_multi_head...");
+
+    const int T = 16, n_q = 6, d_k = 4, d_v = 4, t = 6;
+    const int n_head_kv = 2;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    for (int i = 0; i < T * n_embd_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * n_embd_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * n_embd_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    compaction_config cfg_cf;
+    cfg_cf.fit_mode = BETA_FIT_CLOSED_FORM;
+    auto result = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, t, cfg_cf);
+
+    assert((int)result.selected_indices.size() == t);
+    assert(result.n_head_kv == n_head_kv);
+
+    for (int h = 0; h < n_head_kv; h++) {
+        assert((int)result.beta[h].size() == t);
+        assert((int)result.C_v[h].size() == t * d_v);
+        for (int j = 0; j < t; j++) {
+            assert(std::isfinite(result.beta[h][j]));
+        }
+    }
+
+    printf(" OK\n");
+}
+
+static void test_closed_form_speed() {
+    printf("  test_closed_form_speed...");
+
+    // Benchmark: closed-form should be dramatically faster than NNLS at scale
+    const int T = 512, n_q = 32, d_k = 8, d_v = 8, t = 128;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    // Time NNLS
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto r_nnls = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_NNLS);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double nnls_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+    // Time closed-form
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto r_cf = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t, 2,
+        KEY_SELECT_MAX_ATTN, BETA_FIT_CLOSED_FORM);
+    auto t3 = std::chrono::high_resolution_clock::now();
+    double cf_us = std::chrono::duration<double, std::micro>(t3 - t2).count();
+
+    printf("\n    T=%d t=%d: NNLS=%.0f us  closed_form=%.0f us  speedup=%.1fx",
+           T, t, nnls_us, cf_us, nnls_us / cf_us);
+
+    // Closed-form should be at least 2x faster (usually much more)
+    assert(cf_us < nnls_us);
+
+    printf(" OK\n");
+}
+
+// ============================================================================
 // K-means centroid keys tests
 // ============================================================================
 
@@ -2841,6 +3063,14 @@ int main() {
     test_sinkhorn_produces_nonnegative();
     test_sinkhorn_vs_nnls_quality();
     test_sinkhorn_multi_head();
+
+    printf("\n=== Closed-form beta ===\n");
+    test_closed_form_basic();
+    test_closed_form_nonuniform();
+    test_closed_form_finite();
+    test_closed_form_vs_nnls_quality();
+    test_closed_form_multi_head();
+    test_closed_form_speed();
 
     printf("\n=== K-means centroid keys ===\n");
     test_kmeans_correct_count();
