@@ -1352,6 +1352,95 @@ static void test_nnls_pgd_with_iters() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// Extreme compression ratio benchmark (50× = 2% retention)
+// ============================================================================
+
+static void test_extreme_compression_ratios() {
+    printf("  test_extreme_compression_ratios...\n");
+
+    // Use a larger T to make extreme ratios meaningful
+    // At T=500, 2% = 10 tokens kept, 5% = 25, 10% = 50, 20% = 100, 50% = 250
+    const int T = 500, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 9000);
+    gen_data(V.data(), T * n_embd_v, 9100);
+    gen_data(Q.data(), n_q * n_embd_k, 9200);
+
+    // Test ratios: 50%, 20%, 10%, 5%, 2% (the paper claims 50× = 2%)
+    float ratios[] = { 0.50f, 0.20f, 0.10f, 0.05f, 0.02f };
+    int n_ratios = 5;
+
+    printf("    %-8s  %-28s  %-28s  %-28s\n",
+           "Ratio", "HighestAttn (skip_beta)", "OMP (skip_beta)", "OMP (+beta)");
+    printf("    %-8s  %-28s  %-28s  %-28s\n",
+           "-----", "------------------------", "------------------------", "------------------------");
+
+    for (int ri = 0; ri < n_ratios; ri++) {
+        float ratio = ratios[ri];
+        int t_expected = (int)(T * ratio);
+        if (t_expected < 2) t_expected = 2;
+
+        // --- HighestAttn (skip_beta=1, default) ---
+        kv_compact_params p_hat = kv_compact_params_default();
+        p_hat.target_ratio = ratio;
+        p_hat.chunk_size = -1;  // no chunking for fair comparison
+        kv_compact_result r_hat = {};
+        int rc = kv_compact(K.data(), V.data(), Q.data(),
+                            T, n_q, n_head_kv, d_k, d_v, &p_hat, &r_hat);
+        assert(rc == 0);
+
+        // --- OMP (skip_beta=1) ---
+        kv_compact_params p_omp = kv_compact_params_default();
+        p_omp.target_ratio = ratio;
+        p_omp.use_omp = 1;
+        p_omp.omp_k_choice = 4;  // fast variant
+        p_omp.omp_refit_interval = 2;
+        p_omp.chunk_size = -1;
+        kv_compact_result r_omp = {};
+        rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p_omp, &r_omp);
+        assert(rc == 0);
+
+        // --- OMP with beta (full AM-OMP) ---
+        kv_compact_params p_omp_beta = kv_compact_params_default();
+        p_omp_beta.target_ratio = ratio;
+        p_omp_beta.use_omp = 1;
+        p_omp_beta.omp_k_choice = 4;
+        p_omp_beta.omp_refit_interval = 2;
+        p_omp_beta.skip_beta = 0;
+        p_omp_beta.chunk_size = -1;
+        kv_compact_result r_omp_beta = {};
+        rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p_omp_beta, &r_omp_beta);
+        assert(rc == 0);
+
+        printf("    %5.1f%%    cos=%.4f mse=%.6f %4.1fms  cos=%.4f mse=%.6f %4.1fms  cos=%.4f mse=%.6f %4.1fms\n",
+               ratio * 100.0f,
+               r_hat.stats.avg_cosine_sim, r_hat.stats.avg_mse, r_hat.stats.elapsed_ms,
+               r_omp.stats.avg_cosine_sim, r_omp.stats.avg_mse, r_omp.stats.elapsed_ms,
+               r_omp_beta.stats.avg_cosine_sim, r_omp_beta.stats.avg_mse, r_omp_beta.stats.elapsed_ms);
+
+        // Quality assertions: even at extreme compression, cos > 0.5 is reasonable
+        // At 50% we expect very high quality, at 2% we allow graceful degradation
+        float min_cos = (ratio >= 0.10f) ? 0.90f : (ratio >= 0.05f) ? 0.80f : 0.50f;
+        assert(r_hat.stats.avg_cosine_sim > min_cos);
+        assert(r_omp.stats.avg_cosine_sim > min_cos);
+        assert(r_omp_beta.stats.avg_cosine_sim > min_cos);
+
+        // Verify token counts
+        assert(r_hat.t == t_expected);
+        assert(r_omp.t == t_expected);
+        assert(r_omp_beta.t == t_expected);
+
+        kv_compact_result_free(&r_hat);
+        kv_compact_result_free(&r_omp);
+        kv_compact_result_free(&r_omp_beta);
+    }
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-api:\n\n");
 
@@ -1413,6 +1502,9 @@ int main() {
     printf("\n=== NNLS solver methods ===\n");
     test_nnls_method_pgd();
     test_nnls_pgd_with_iters();
+
+    printf("\n=== Extreme compression ratios (50x = 2%%) ===\n");
+    test_extreme_compression_ratios();
 
     printf("\n=== Chunked compaction ===\n");
     test_chunked_params_default();
