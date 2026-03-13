@@ -18,6 +18,10 @@
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
 
+// Pull in GPU acceleration (or CPU stubs when KV_COMPACT_HIP is not defined)
+#define KV_COMPACT_ACCEL_IMPL
+#include "kv-compact-accel.h"
+
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -336,23 +340,49 @@ int kv_compact(
     std::vector<std::vector<float>> per_head_imp;
     std::vector<float> sensitivities;
 
+    // Allocate per-head score buffers
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
         hc.scores.resize(n_q_used * T);
         hc.exp_scores.resize(n_q_used * T);
         hc.row_sums.resize(n_q_used);
         hc.attn_weights.resize(n_q_used * T);
+    }
 
-        // Compute scores
-        for (int qi = 0; qi < n_q_used; qi++) {
-            const float * q_row = Q_ref_used + qi * n_embd_k + h * d_k;
-            for (int ki = 0; ki < T; ki++) {
-                const float * k_row = K_all + ki * n_embd_k + h * d_k;
-                float dot = 0.0f;
-                for (int d = 0; d < d_k; d++) dot += q_row[d] * k_row[d];
-                hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+    // Try GPU-accelerated scoring for all heads at once.
+    // Falls through to CPU path if HIP is not compiled in or no device found.
+    bool gpu_scored = false;
+    if (kv_compact_hip_available()) {
+        // Build array of per-head score buffer pointers
+        std::vector<float *> score_ptrs(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            score_ptrs[h] = hcache[0][h].scores.data();
+        }
+        int rc = kv_compact_hip_score_all_heads(
+            Q_ref_used, K_all, score_ptrs.data(),
+            n_q_used, T, n_head_kv, d_k, inv_sqrt_dk);
+        gpu_scored = (rc == 0);
+    }
+
+    if (!gpu_scored) {
+        // CPU fallback: per-head triple-nested loop
+        for (int h = 0; h < n_head_kv; h++) {
+            auto & hc = hcache[0][h];
+            for (int qi = 0; qi < n_q_used; qi++) {
+                const float * q_row = Q_ref_used + qi * n_embd_k + h * d_k;
+                for (int ki = 0; ki < T; ki++) {
+                    const float * k_row = K_all + ki * n_embd_k + h * d_k;
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++) dot += q_row[d] * k_row[d];
+                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                }
             }
         }
+    }
+
+    // Post-process scores: exp, softmax, importance (same for GPU and CPU paths)
+    for (int h = 0; h < n_head_kv; h++) {
+        auto & hc = hcache[0][h];
 
         memcpy(hc.exp_scores.data(), hc.scores.data(), n_q_used * T * sizeof(float));
         exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_q_used, T);

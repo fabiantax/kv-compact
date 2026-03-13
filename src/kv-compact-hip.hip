@@ -82,6 +82,66 @@ __global__ void kernel_mat_mul_ABt_tiled(
 }
 
 // ============================================================================
+// Strided kernel for interleaved multi-head layout
+// ============================================================================
+
+// Per-head matmul on interleaved data:
+//   Q_ref: [n_q × n_embd_k], K_all: [T × n_embd_k]
+//   For head h, Q_h row i starts at Q_ref[i * n_embd_k + h * d_k]
+//   For head h, K_h row j starts at K_all[j * n_embd_k + h * d_k]
+//   scores_out[h * n_q * T + qi * T + ki] = dot(Q_h[qi], K_h[ki]) * scale
+//
+// Grid: (ceil(T/16), ceil(n_q/16), n_head_kv)
+__global__ void kernel_score_all_heads(
+        const float * __restrict__ Q_ref,
+        const float * __restrict__ K_all,
+        float * __restrict__ scores_out,
+        int n_q, int T, int n_head_kv, int d_k,
+        int n_embd_k, float scale) {
+    int ki  = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int qi  = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int h   = blockIdx.z;
+
+    if (qi < n_q && ki < T) {
+        const float * q_row = Q_ref + qi * n_embd_k + h * d_k;
+        const float * k_row = K_all + ki * n_embd_k + h * d_k;
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) {
+            dot += q_row[d] * k_row[d];
+        }
+        scores_out[(size_t)h * n_q * T + qi * T + ki] = dot * scale;
+    }
+}
+
+// ============================================================================
+// Persistent buffer pool
+// ============================================================================
+
+// Avoids per-call hipMallocManaged/hipFree overhead. Buffers grow as needed
+// and are reused across calls. On APU, managed memory is backed by the same
+// physical LPDDR5X so the "allocation" is just a virtual address reservation.
+struct hip_buffer_pool {
+    float * q_buf;       // contiguous Q per-head slice
+    float * k_buf;       // contiguous K per-head slice
+    float * scores_buf;  // all-heads scores output
+    size_t  q_cap;       // allocated capacity in bytes
+    size_t  k_cap;
+    size_t  scores_cap;
+};
+
+static hip_buffer_pool g_pool = {nullptr, nullptr, nullptr, 0, 0, 0};
+
+// Ensure pool buffer is at least `needed` bytes. Only reallocates if current
+// capacity is insufficient.
+static hipError_t pool_ensure(float ** buf, size_t * cap, size_t needed) {
+    if (*cap >= needed) return hipSuccess;
+    if (*buf) hipFree(*buf);
+    hipError_t err = hipMallocManaged(buf, needed);
+    *cap = (err == hipSuccess) ? needed : 0;
+    return err;
+}
+
+// ============================================================================
 // Public API (C-linkage)
 // ============================================================================
 
@@ -120,40 +180,84 @@ int kv_compact_hip_mat_mul_ABt_scaled(
     ensure_hip_init();
     if (!hip_available) return -1;
 
-    float *d_A, *d_B, *d_C;
     size_t size_A = (size_t)m * k * sizeof(float);
     size_t size_B = (size_t)n * k * sizeof(float);
     size_t size_C = (size_t)m * n * sizeof(float);
 
-    // Use hipMallocManaged for unified memory (APU optimization —
-    // avoids explicit copies on integrated GPU with shared memory)
-    hipMallocManaged(&d_A, size_A);
-    hipMallocManaged(&d_B, size_B);
-    hipMallocManaged(&d_C, size_C);
+    // Use persistent pool buffers instead of per-call alloc
+    if (pool_ensure(&g_pool.q_buf, &g_pool.q_cap, size_A) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, size_B) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, size_C) != hipSuccess) return -1;
 
-    memcpy(d_A, A, size_A);
-    memcpy(d_B, B, size_B);
+    memcpy(g_pool.q_buf, A, size_A);
+    memcpy(g_pool.k_buf, B, size_B);
 
     // Use tiled kernel for larger problems, simple kernel for small ones
     if (m >= TILE_SIZE && n >= TILE_SIZE) {
         dim3 block(TILE_SIZE, TILE_SIZE);
         dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
                   (m + TILE_SIZE - 1) / TILE_SIZE);
-        kernel_mat_mul_ABt_tiled<<<grid, block>>>(d_A, d_B, d_C, m, n, k, scale);
+        kernel_mat_mul_ABt_tiled<<<grid, block>>>(
+            g_pool.q_buf, g_pool.k_buf, g_pool.scores_buf, m, n, k, scale);
     } else {
         dim3 block(16, 16);
         dim3 grid((n + 15) / 16, (m + 15) / 16);
-        kernel_mat_mul_ABt<<<grid, block>>>(d_A, d_B, d_C, m, n, k, scale);
+        kernel_mat_mul_ABt<<<grid, block>>>(
+            g_pool.q_buf, g_pool.k_buf, g_pool.scores_buf, m, n, k, scale);
     }
 
     hipDeviceSynchronize();
-    memcpy(C, d_C, size_C);
-
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C);
+    memcpy(C, g_pool.scores_buf, size_C);
 
     return 0;
+}
+
+int kv_compact_hip_score_all_heads(
+        const float * Q_ref, const float * K_all, float ** scores_out,
+        int n_q, int T, int n_head_kv, int d_k, float scale) {
+    ensure_hip_init();
+    if (!hip_available) return -1;
+
+    int n_embd_k = n_head_kv * d_k;
+    size_t q_bytes = (size_t)n_q * n_embd_k * sizeof(float);
+    size_t k_bytes = (size_t)T * n_embd_k * sizeof(float);
+    size_t scores_bytes = (size_t)n_head_kv * n_q * T * sizeof(float);
+
+    // Grow pool buffers if needed (no-op if already large enough)
+    if (pool_ensure(&g_pool.q_buf, &g_pool.q_cap, q_bytes) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, k_bytes) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, scores_bytes) != hipSuccess) return -1;
+
+    // Copy interleaved Q and K into managed memory (zero-copy on APU)
+    memcpy(g_pool.q_buf, Q_ref, q_bytes);
+    memcpy(g_pool.k_buf, K_all, k_bytes);
+
+    // Launch one 3D grid: (T, n_q, n_head_kv)
+    dim3 block(TILE_SIZE, TILE_SIZE, 1);
+    dim3 grid((T + TILE_SIZE - 1) / TILE_SIZE,
+              (n_q + TILE_SIZE - 1) / TILE_SIZE,
+              n_head_kv);
+    kernel_score_all_heads<<<grid, block>>>(
+        g_pool.q_buf, g_pool.k_buf, g_pool.scores_buf,
+        n_q, T, n_head_kv, d_k, n_embd_k, scale);
+
+    hipError_t err = hipDeviceSynchronize();
+    if (err != hipSuccess) return -1;
+
+    // Copy results into caller's per-head score buffers
+    for (int h = 0; h < n_head_kv; h++) {
+        memcpy(scores_out[h],
+               g_pool.scores_buf + (size_t)h * n_q * T,
+               (size_t)n_q * T * sizeof(float));
+    }
+
+    return 0;
+}
+
+void kv_compact_hip_pool_free(void) {
+    if (g_pool.q_buf)      { hipFree(g_pool.q_buf);      g_pool.q_buf = nullptr;      g_pool.q_cap = 0; }
+    if (g_pool.k_buf)      { hipFree(g_pool.k_buf);      g_pool.k_buf = nullptr;      g_pool.k_cap = 0; }
+    if (g_pool.scores_buf) { hipFree(g_pool.scores_buf); g_pool.scores_buf = nullptr; g_pool.scores_cap = 0; }
 }
 
 } // extern "C"
