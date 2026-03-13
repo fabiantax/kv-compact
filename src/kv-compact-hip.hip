@@ -1,31 +1,36 @@
 // KV Cache Compaction — ROCm/HIP Accelerated Kernels
 //
-// GPU-accelerated matrix multiply for the attention scoring hotspot in
-// Step 1 (Section 3.1) of the compaction algorithm from:
+// GPU-accelerated matrix operations for the compaction algorithm from:
 //   "Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)
 //   https://arxiv.org/abs/2602.16284
 //
-// The dominant cost is computing Q_ref @ K^T / sqrt(d_k) for all heads,
-// which is an (n_q × d_k) * (T × d_k)^T matmul. On CPU this is O(n_q * T * d_k)
-// per head per layer; GPU acceleration helps when T is large (>1K tokens).
+// Two acceleration tiers:
+//   1. rocBLAS strided-batched GEMM — processes all heads in a single library
+//      call, leveraging Tensile's auto-tuned kernels for the target GPU.
+//   2. Custom HIP kernels — fallback for small matrices or if rocBLAS init fails.
 //
-// Target: AMD Ryzen AI 395 Pro Max with integrated RDNA 3.5 GPU (8060S)
-// The integrated GPU shares system memory, so no explicit D↔H copies needed
-// for unified memory allocations (hipMallocManaged).
+// The interleaved Q/K/V layout maps directly to strided-batched GEMM strides:
+//   Q_ref[n_q × n_embd_k] → batch of n_head_kv matrices (n_q × d_k), stride = d_k
+//   K_all[T   × n_embd_k] → batch of n_head_kv matrices (T   × d_k), stride = d_k
+//   Row-major (n_q × T) output == column-major (T × n_q) — no reshuffling needed.
+//
+// Target: AMD Ryzen AI 395 Pro Max — 8060S RDNA 3.5 iGPU (gfx1151)
+// APU unified memory: hipMallocManaged() has near-zero overhead.
 
 #include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
 #include "kv-compact-accel.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // ============================================================================
-// HIP Kernels
+// Custom HIP Kernels (fallback for small matrices / rocBLAS unavailable)
 // ============================================================================
 
 // Matrix multiply: C = A * B^T
 // A is (m x k), B is (n x k), C is (m x n)
-// Each thread computes one element of C
 __global__ void kernel_mat_mul_ABt(
         const float * __restrict__ A,
         const float * __restrict__ B,
@@ -43,10 +48,7 @@ __global__ void kernel_mat_mul_ABt(
     }
 }
 
-// Tiled matrix multiply for better cache utilization
-// Uses shared memory tiles for both A and B.
-// Tiles are padded to TILE_SIZE+1 columns to avoid shared memory bank conflicts
-// on RDNA 3.5 (32 banks, 4-byte stride → consecutive columns hit same bank).
+// Tiled matrix multiply with shared memory (bank-conflict-free on RDNA 3.5)
 #define TILE_SIZE 16
 
 __global__ void kernel_mat_mul_ABt_tiled(
@@ -83,17 +85,7 @@ __global__ void kernel_mat_mul_ABt_tiled(
     }
 }
 
-// ============================================================================
-// Strided kernel for interleaved multi-head layout
-// ============================================================================
-
-// Per-head matmul on interleaved data:
-//   Q_ref: [n_q × n_embd_k], K_all: [T × n_embd_k]
-//   For head h, Q_h row i starts at Q_ref[i * n_embd_k + h * d_k]
-//   For head h, K_h row j starts at K_all[j * n_embd_k + h * d_k]
-//   scores_out[h * n_q * T + qi * T + ki] = dot(Q_h[qi], K_h[ki]) * scale
-//
-// Grid: (ceil(T/16), ceil(n_q/16), n_head_kv)
+// Per-head scoring kernel (fallback when rocBLAS unavailable)
 __global__ void kernel_score_all_heads(
         const float * __restrict__ Q_ref,
         const float * __restrict__ K_all,
@@ -115,26 +107,15 @@ __global__ void kernel_score_all_heads(
     }
 }
 
-// ============================================================================
-// Value refit target kernel: Y_h = attn_weights_h @ V_h (interleaved V)
-// ============================================================================
-
-// Computes Y[h][qi * d_v + d] = sum_ki( W[h][qi * T + ki] * V[ki * n_embd_v + h * d_v + d] )
-// for all heads in a single dispatch.
-//
-// W (attn_weights): [n_head_kv][n_q × T] — contiguous per-head blocks
-// V_all:            [T × n_embd_v]         — interleaved, stride = n_embd_v
-// Y_out:            [n_head_kv][n_q × d_v] — contiguous per-head blocks
-//
-// Grid: (ceil(d_v/16), ceil(n_q/16), n_head_kv)
+// Per-head value refit kernel (fallback when rocBLAS unavailable)
 __global__ void kernel_refit_target_all_heads(
-        const float * __restrict__ W,       // [n_head_kv * n_q * T]
-        const float * __restrict__ V_all,   // [T * n_embd_v]
-        float * __restrict__ Y_out,         // [n_head_kv * n_q * d_v]
+        const float * __restrict__ W,
+        const float * __restrict__ V_all,
+        float * __restrict__ Y_out,
         int n_q, int T, int n_head_kv, int d_v, int n_embd_v) {
-    int d   = blockIdx.x * TILE_SIZE + threadIdx.x;  // column in d_v
-    int qi  = blockIdx.y * TILE_SIZE + threadIdx.y;  // row in n_q
-    int h   = blockIdx.z;                            // head
+    int d   = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int qi  = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int h   = blockIdx.z;
 
     if (qi < n_q && d < d_v) {
         const float * w_row = W + (size_t)h * n_q * T + qi * T;
@@ -150,15 +131,12 @@ __global__ void kernel_refit_target_all_heads(
 // Persistent buffer pool
 // ============================================================================
 
-// Avoids per-call hipMallocManaged/hipFree overhead. Buffers grow as needed
-// and are reused across calls. On APU, managed memory is backed by the same
-// physical LPDDR5X so the "allocation" is just a virtual address reservation.
 struct hip_buffer_pool {
     float * q_buf;       // Q or W (attn_weights) input
     float * k_buf;       // K or V input
     float * scores_buf;  // scores or Y output
-    float * aux_buf;     // auxiliary (e.g. W for value refit when q_buf holds Q)
-    size_t  q_cap;       // allocated capacity in bytes
+    float * aux_buf;     // auxiliary (W packing for value refit)
+    size_t  q_cap;
     size_t  k_cap;
     size_t  scores_cap;
     size_t  aux_cap;
@@ -166,8 +144,6 @@ struct hip_buffer_pool {
 
 static hip_buffer_pool g_pool = {nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0};
 
-// Ensure pool buffer is at least `needed` bytes. Only reallocates if current
-// capacity is insufficient.
 static hipError_t pool_ensure(float ** buf, size_t * cap, size_t needed) {
     if (*cap >= needed) return hipSuccess;
     if (*buf) hipFree(*buf);
@@ -175,6 +151,38 @@ static hipError_t pool_ensure(float ** buf, size_t * cap, size_t needed) {
     *cap = (err == hipSuccess) ? needed : 0;
     return err;
 }
+
+// ============================================================================
+// rocBLAS handle (lazy-initialized, lives for process lifetime)
+// ============================================================================
+
+static rocblas_handle g_rocblas_handle = nullptr;
+static bool g_rocblas_available = false;
+
+static void ensure_rocblas_init() {
+    if (g_rocblas_handle) return;  // already initialized (success or fail)
+
+    // Disable rocBLAS's internal hipBLASLt path on gfx11 — it regresses for FP32
+    // batched GEMM. Standard Tensile kernels are faster. Must be set BEFORE
+    // rocblas_create_handle, which reads the env var during initialization.
+    setenv("ROCBLAS_USE_HIPBLASLT", "0", 0);  // don't override if already set
+
+    rocblas_status status = rocblas_create_handle(&g_rocblas_handle);
+    if (status != rocblas_status_success) {
+        fprintf(stderr, "[kv-compact] rocBLAS init failed (status %d), using custom kernels\n", status);
+        g_rocblas_handle = nullptr;
+        g_rocblas_available = false;
+        return;
+    }
+
+    g_rocblas_available = true;
+    fprintf(stderr, "[kv-compact] rocBLAS initialized — strided-batched GEMM enabled\n");
+}
+
+// Minimum total elements (across all heads) to prefer rocBLAS over custom kernels.
+// Below this threshold, kernel launch overhead dominates.
+// Empirically: rocBLAS wins when batch * m * n * k > ~32K elements.
+#define ROCBLAS_MIN_ELEMENTS 32768
 
 // ============================================================================
 // Public API (C-linkage)
@@ -200,6 +208,9 @@ static void ensure_hip_init() {
             props.name, props.multiProcessorCount, props.clockRate / 1000);
 
     hip_available = true;
+
+    // Initialize rocBLAS eagerly so first scoring call isn't slow
+    ensure_rocblas_init();
 }
 
 extern "C" {
@@ -219,7 +230,6 @@ int kv_compact_hip_mat_mul_ABt_scaled(
     size_t size_B = (size_t)n * k * sizeof(float);
     size_t size_C = (size_t)m * n * sizeof(float);
 
-    // Use persistent pool buffers instead of per-call alloc
     if (pool_ensure(&g_pool.q_buf, &g_pool.q_cap, size_A) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, size_B) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, size_C) != hipSuccess) return -1;
@@ -227,7 +237,6 @@ int kv_compact_hip_mat_mul_ABt_scaled(
     memcpy(g_pool.q_buf, A, size_A);
     memcpy(g_pool.k_buf, B, size_B);
 
-    // Use tiled kernel for larger problems, simple kernel for small ones
     if (m >= TILE_SIZE && n >= TILE_SIZE) {
         dim3 block(TILE_SIZE, TILE_SIZE);
         dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
@@ -247,6 +256,19 @@ int kv_compact_hip_mat_mul_ABt_scaled(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-head attention scoring: scores_h = Q_h @ K_h^T * scale
+//
+// rocBLAS path: single strided-batched GEMM over all heads.
+//
+// Row-major → column-major mapping for C = A * B^T:
+//   In col-major terms:  C^T(T × n_q) = K^T(T × d_k) * Q^T(d_k × n_q)
+//   rocblas_sgemm(T, N, T, n_q, d_k, scale, K, n_embd_k, Q, n_embd_k, 0, S, T)
+//
+// The interleaved layout provides natural strides:
+//   stride_K = stride_Q = d_k  (head-to-head offset within a row)
+//   stride_S = n_q * T         (contiguous per-head score blocks)
+// ---------------------------------------------------------------------------
 int kv_compact_hip_score_all_heads(
         const float * Q_ref, const float * K_all, float ** scores_out,
         int n_q, int T, int n_head_kv, int d_k, float scale) {
@@ -258,28 +280,72 @@ int kv_compact_hip_score_all_heads(
     size_t k_bytes = (size_t)T * n_embd_k * sizeof(float);
     size_t scores_bytes = (size_t)n_head_kv * n_q * T * sizeof(float);
 
-    // Grow pool buffers if needed (no-op if already large enough)
     if (pool_ensure(&g_pool.q_buf, &g_pool.q_cap, q_bytes) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, k_bytes) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, scores_bytes) != hipSuccess) return -1;
 
-    // Copy interleaved Q and K into managed memory (zero-copy on APU)
     memcpy(g_pool.q_buf, Q_ref, q_bytes);
     memcpy(g_pool.k_buf, K_all, k_bytes);
 
-    // Launch one 3D grid: (T, n_q, n_head_kv)
-    dim3 block(TILE_SIZE, TILE_SIZE, 1);
-    dim3 grid((T + TILE_SIZE - 1) / TILE_SIZE,
-              (n_q + TILE_SIZE - 1) / TILE_SIZE,
-              n_head_kv);
-    kernel_score_all_heads<<<grid, block>>>(
-        g_pool.q_buf, g_pool.k_buf, g_pool.scores_buf,
-        n_q, T, n_head_kv, d_k, n_embd_k, scale);
+    int64_t total_elements = (int64_t)n_head_kv * n_q * T * d_k;
+    bool use_rocblas = g_rocblas_available && total_elements >= ROCBLAS_MIN_ELEMENTS;
+
+    if (use_rocblas) {
+        // rocBLAS strided-batched GEMM: all heads in one call
+        //
+        // Column-major interpretation of row-major data:
+        //   Q_h row-major (n_q × d_k) → col-major (d_k × n_q), ld = n_embd_k
+        //   K_h row-major (T   × d_k) → col-major (d_k × T),   ld = n_embd_k
+        //
+        // We want scores_h = Q_h * K_h^T (row-major)
+        // ⟹ scores_h^T = K_h * Q_h^T (col-major result)
+        // ⟹ gemm(T, N, T, n_q, d_k, α, K_cm, ld_k, Q_cm, ld_q, β, S_cm, T)
+        //
+        // K_cm is (d_k × T), transposed → (T × d_k): rows of K_h ✓
+        // Q_cm is (d_k × n_q), no transpose → Q_h^T: cols are query rows ✓
+        // S_cm is (T × n_q) = scores_h^T, which in row-major IS scores_h ✓
+        float zero = 0.0f;
+        rocblas_status status = rocblas_sgemm_strided_batched(
+            g_rocblas_handle,
+            rocblas_operation_transpose,    // op(A) = K^T → K rows
+            rocblas_operation_none,         // op(B) = Q^T (already transposed in col-major)
+            T,                             // m: rows of result
+            n_q,                           // n: cols of result
+            d_k,                           // k: inner dimension
+            &scale,                        // alpha
+            g_pool.k_buf,                  // A = K (col-major d_k × T per head)
+            n_embd_k,                      // lda (row stride of interleaved K)
+            (rocblas_stride)d_k,           // stride_a (head-to-head offset)
+            g_pool.q_buf,                  // B = Q (col-major d_k × n_q per head)
+            n_embd_k,                      // ldb (row stride of interleaved Q)
+            (rocblas_stride)d_k,           // stride_b (head-to-head offset)
+            &zero,                         // beta
+            g_pool.scores_buf,             // C = scores (T × n_q per head, col-major)
+            T,                             // ldc
+            (rocblas_stride)n_q * T,       // stride_c (contiguous per-head blocks)
+            n_head_kv);                    // batch_count
+
+        if (status != rocblas_status_success) {
+            fprintf(stderr, "[kv-compact] rocBLAS sgemm_strided_batched failed (status %d), "
+                    "falling back to custom kernel\n", status);
+            use_rocblas = false;
+        }
+    }
+
+    if (!use_rocblas) {
+        // Fallback: custom kernel, one thread per element
+        dim3 block(TILE_SIZE, TILE_SIZE, 1);
+        dim3 grid((T + TILE_SIZE - 1) / TILE_SIZE,
+                  (n_q + TILE_SIZE - 1) / TILE_SIZE,
+                  n_head_kv);
+        kernel_score_all_heads<<<grid, block>>>(
+            g_pool.q_buf, g_pool.k_buf, g_pool.scores_buf,
+            n_q, T, n_head_kv, d_k, n_embd_k, scale);
+    }
 
     hipError_t err = hipDeviceSynchronize();
     if (err != hipSuccess) return -1;
 
-    // Copy results into caller's per-head score buffers
     for (int h = 0; h < n_head_kv; h++) {
         memcpy(scores_out[h],
                g_pool.scores_buf + (size_t)h * n_q * T,
@@ -289,6 +355,20 @@ int kv_compact_hip_score_all_heads(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-head value refit target: Y_h = W_h @ V_h
+//
+// rocBLAS path: single strided-batched GEMM.
+//
+// Row-major → column-major mapping for C = W * V (where V is interleaved):
+//   Y_h^T(d_v × n_q) = V_h^T(d_v × T) * W_h^T(T × n_q)
+//   rocblas_sgemm(N, N, d_v, n_q, T, 1.0, V_cm, n_embd_v, W_cm, T, 0, Y_cm, d_v)
+//
+// Strides:
+//   stride_V = d_v           (interleaved V heads)
+//   stride_W = n_q * T       (contiguous W blocks, already packed)
+//   stride_Y = n_q * d_v     (contiguous output blocks)
+// ---------------------------------------------------------------------------
 int kv_compact_hip_refit_target_all_heads(
         const float * const * W_per_head,
         const float * V_all,
@@ -302,34 +382,76 @@ int kv_compact_hip_refit_target_all_heads(
     size_t v_bytes = (size_t)T * n_embd_v * sizeof(float);
     size_t y_bytes = (size_t)n_head_kv * n_q * d_v * sizeof(float);
 
-    // Grow pool buffers as needed
     if (pool_ensure(&g_pool.aux_buf, &g_pool.aux_cap, w_bytes) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, v_bytes) != hipSuccess) return -1;
     if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, y_bytes) != hipSuccess) return -1;
 
-    // Pack per-head W arrays into contiguous buffer
+    // Pack per-head W arrays into contiguous buffer for batched GEMM
     for (int h = 0; h < n_head_kv; h++) {
         memcpy(g_pool.aux_buf + (size_t)h * n_q * T,
                W_per_head[h],
                (size_t)n_q * T * sizeof(float));
     }
 
-    // Copy interleaved V (zero-copy on APU)
     memcpy(g_pool.k_buf, V_all, v_bytes);
 
-    // Launch one 3D grid: (d_v, n_q, n_head_kv)
-    dim3 block(TILE_SIZE, TILE_SIZE, 1);
-    dim3 grid((d_v + TILE_SIZE - 1) / TILE_SIZE,
-              (n_q + TILE_SIZE - 1) / TILE_SIZE,
-              n_head_kv);
-    kernel_refit_target_all_heads<<<grid, block>>>(
-        g_pool.aux_buf, g_pool.k_buf, g_pool.scores_buf,
-        n_q, T, n_head_kv, d_v, n_embd_v);
+    int64_t total_elements = (int64_t)n_head_kv * n_q * T * d_v;
+    bool use_rocblas = g_rocblas_available && total_elements >= ROCBLAS_MIN_ELEMENTS;
+
+    if (use_rocblas) {
+        // rocBLAS strided-batched GEMM: all heads in one call
+        //
+        // We want Y_h = W_h * V_h (row-major), so:
+        //   Y_h^T = V_h^T * W_h^T (col-major)
+        //
+        // V_h row-major (T × d_v) → col-major (d_v × T), ld = n_embd_v
+        // W_h row-major (n_q × T) → col-major (T × n_q), ld = T
+        // Y_h row-major (n_q × d_v) → col-major (d_v × n_q), ld = d_v
+        //
+        // gemm(N, N, d_v, n_q, T):
+        //   op(A) = V_cm (d_v × T), op(B) = W_cm (T × n_q) → C = (d_v × n_q)
+        float one = 1.0f, zero = 0.0f;
+        rocblas_status status = rocblas_sgemm_strided_batched(
+            g_rocblas_handle,
+            rocblas_operation_none,         // op(A) = V^T (already in col-major)
+            rocblas_operation_none,         // op(B) = W^T (already in col-major)
+            d_v,                           // m: rows of result
+            n_q,                           // n: cols of result
+            T,                             // k: inner dimension
+            &one,                          // alpha
+            g_pool.k_buf,                  // A = V (col-major d_v × T per head)
+            n_embd_v,                      // lda (row stride of interleaved V)
+            (rocblas_stride)d_v,           // stride_a (head-to-head offset)
+            g_pool.aux_buf,                // B = W (col-major T × n_q per head)
+            T,                             // ldb
+            (rocblas_stride)n_q * T,       // stride_b (contiguous W blocks)
+            &zero,                         // beta
+            g_pool.scores_buf,             // C = Y (d_v × n_q per head, col-major)
+            d_v,                           // ldc
+            (rocblas_stride)n_q * d_v,     // stride_c
+            n_head_kv);                    // batch_count
+
+        if (status != rocblas_status_success) {
+            fprintf(stderr, "[kv-compact] rocBLAS value refit failed (status %d), "
+                    "falling back to custom kernel\n", status);
+            use_rocblas = false;
+        }
+    }
+
+    if (!use_rocblas) {
+        // Fallback: custom kernel
+        dim3 block(TILE_SIZE, TILE_SIZE, 1);
+        dim3 grid((d_v + TILE_SIZE - 1) / TILE_SIZE,
+                  (n_q + TILE_SIZE - 1) / TILE_SIZE,
+                  n_head_kv);
+        kernel_refit_target_all_heads<<<grid, block>>>(
+            g_pool.aux_buf, g_pool.k_buf, g_pool.scores_buf,
+            n_q, T, n_head_kv, d_v, n_embd_v);
+    }
 
     hipError_t err = hipDeviceSynchronize();
     if (err != hipSuccess) return -1;
 
-    // Copy results into caller's per-head Y buffers
     for (int h = 0; h < n_head_kv; h++) {
         memcpy(Y_out[h],
                g_pool.scores_buf + (size_t)h * n_q * d_v,
@@ -344,6 +466,12 @@ void kv_compact_hip_pool_free(void) {
     if (g_pool.k_buf)      { hipFree(g_pool.k_buf);      g_pool.k_buf = nullptr;      g_pool.k_cap = 0; }
     if (g_pool.scores_buf) { hipFree(g_pool.scores_buf); g_pool.scores_buf = nullptr; g_pool.scores_cap = 0; }
     if (g_pool.aux_buf)    { hipFree(g_pool.aux_buf);    g_pool.aux_buf = nullptr;    g_pool.aux_cap = 0; }
+
+    if (g_rocblas_handle) {
+        rocblas_destroy_handle(g_rocblas_handle);
+        g_rocblas_handle = nullptr;
+        g_rocblas_available = false;
+    }
 }
 
 } // extern "C"

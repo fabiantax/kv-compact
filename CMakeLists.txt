@@ -16,11 +16,14 @@ target_include_directories(kv-compact-math INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}
 if(KV_COMPACT_HIP)
     enable_language(HIP)
     find_package(hip REQUIRED)
+    find_package(rocblas REQUIRED)
     add_library(kv-compact-hip STATIC src/kv-compact-hip.hip)
     target_include_directories(kv-compact-hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(kv-compact-hip PUBLIC KV_COMPACT_HIP)
+    target_link_libraries(kv-compact-hip PUBLIC roc::rocblas)
     set_target_properties(kv-compact-hip PROPERTIES HIP_ARCHITECTURES "gfx1151")
     message(STATUS "ROCm/HIP acceleration enabled (target: gfx1151 / RDNA 3.5)")
+    message(STATUS "  rocBLAS: strided-batched GEMM for multi-head scoring + value refit")
 endif()
 
 # ---- C library API (standalone, no llama.cpp needed) ----
