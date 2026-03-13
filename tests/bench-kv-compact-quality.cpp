@@ -124,8 +124,8 @@ static void bench_perplexity_preservation() {
     std::vector<float> W_vocab(d_v * vocab_size);
     gen_vocab_proj(W_vocab.data(), d_v, vocab_size, 42);
 
-    int T_sizes[] = {128, 256, 512};
-    float ratios[] = {0.8f, 0.5f, 0.2f, 0.1f};
+    int T_sizes[] = {128, 256, 512, 1024};
+    float ratios[] = {0.5f, 0.2f, 0.1f};
 
     printf("  %-6s  %-8s  %12s  %12s  %12s\n",
            "T", "ratio", "ppl_orig", "ppl_compact", "ppl_ratio");
@@ -441,7 +441,7 @@ static void bench_throughput_scaling() {
     const int n_embd_v = n_head_kv * d_v;
     const int n_q = 64;
 
-    int T_sizes[] = {64, 128, 256, 512, 1024, 2048};
+    int T_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096};
     float ratios[] = {0.5f, 0.2f};
 
     printf("  %-6s  %-8s  %8s  %12s  %14s\n",
@@ -459,16 +459,16 @@ static void bench_throughput_scaling() {
             kv_compact_params p = kv_compact_params_default();
             p.target_ratio = ratio;
 
-            // Warmup
-            {
+            // Warmup (skip for large T to save time)
+            if (T <= 2048) {
                 kv_compact_result warmup = {};
                 kv_compact(K.data(), V.data(), Q.data(),
                            T, n_q, n_head_kv, d_k, d_v, &p, &warmup);
                 kv_compact_result_free(&warmup);
             }
 
-            // Timed run (average of 3)
-            const int n_runs = 3;
+            // Timed run (fewer runs for large T)
+            const int n_runs = (T <= 2048) ? 3 : 1;
             double total_ms = 0.0;
             int final_t = 0;
 
