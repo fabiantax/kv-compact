@@ -230,7 +230,7 @@ static void bench_model_quality(model_info & mi, common_params & params) {
     int n_all = (int)all_tokens.size();
 
     // ---- Step 1: Full prefill to get reference logits ----
-    printf("  [1/4] Full prefill (%d tokens)...\n", n_all);
+    printf("  [1/5] Full prefill (%d tokens)...\n", n_all);
 
     llama_memory_t mem = llama_get_memory(mi.ctx);
     llama_memory_seq_rm(mem, 0, -1, -1);
@@ -266,7 +266,7 @@ static void bench_model_quality(model_info & mi, common_params & params) {
     printf("  Reference perplexity: %.4f (over %d continuation tokens)\n\n", ref_ppl, n_cont);
 
     // ---- Step 2: Save state ----
-    printf("  [2/4] Saving KV state...\n");
+    printf("  [2/5] Saving KV state...\n");
 
     // Clear and re-prefill just the prompt portion for compaction
     llama_memory_seq_rm(mem, 0, -1, -1);
@@ -295,15 +295,15 @@ static void bench_model_quality(model_info & mi, common_params & params) {
     int actual_d_v = sd.layers[0].n_embd_v_gqa_computed() / mi.n_head_kv;
 
     // ---- Step 3: Compact at multiple ratios and measure quality ----
-    printf("  [3/4] Compacting and evaluating...\n\n");
+    printf("  [3/5] Compacting and evaluating...\n\n");
 
     float ratios[] = {0.8f, 0.5f, 0.3f, 0.2f};
 
-    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %10s\n",
-           "ratio", "t/T", "ppl", "ppl_ratio", "avg_KL", "max_KL", "time_ms");
-    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %10s\n",
+    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %7s  %7s  %10s\n",
+           "ratio", "t/T", "ppl", "ppl_ratio", "avg_KL", "max_KL", "top1%", "top5%", "time_ms");
+    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %7s  %7s  %10s\n",
            "--------", "--------", "------------", "------------",
-           "------------", "------------", "----------");
+           "------------", "------------", "-------", "-------", "----------");
 
     for (float ratio : ratios) {
         auto t_start = clock_type::now();
@@ -369,6 +369,7 @@ static void bench_model_quality(model_info & mi, common_params & params) {
 
         double comp_log_prob = 0.0;
         double sum_kl = 0.0, max_kl = 0.0;
+        int top1_match = 0, top5_match = 0;
 
         // Decode all continuation tokens at once, starting from pos_max + 1
         llama_batch eval_batch = llama_batch_init(n_cont, 0, 1);
@@ -400,25 +401,192 @@ static void bench_model_quality(model_info & mi, common_params & params) {
             // Compare against reference (ref_probs[i] predicted all_tokens[n_prompt+i])
             // We need ref_probs[i+1] which predicted all_tokens[n_prompt+i+1]
             if (i + 1 < n_cont) {
-                double kl = kl_divergence(ref_probs[i + 1], comp_probs);
+                const auto & ref = ref_probs[i + 1];
+                double kl = kl_divergence(ref, comp_probs);
                 sum_kl += kl;
                 if (kl > max_kl) max_kl = kl;
+
+                // Top-1 and top-5 token agreement
+                auto argmax = [](const std::vector<float> & v) {
+                    return (int)std::distance(v.begin(), std::max_element(v.begin(), v.end()));
+                };
+                if (argmax(ref) == argmax(comp_probs)) top1_match++;
+
+                // Top-5: check if reference argmax appears in compacted top-5
+                std::vector<int> top5_idx(n_vocab);
+                std::iota(top5_idx.begin(), top5_idx.end(), 0);
+                std::partial_sort(top5_idx.begin(), top5_idx.begin() + 5, top5_idx.end(),
+                    [&comp_probs](int a, int b) { return comp_probs[a] > comp_probs[b]; });
+                int ref_top = argmax(ref);
+                for (int k = 0; k < 5; k++) {
+                    if (top5_idx[k] == ref_top) { top5_match++; break; }
+                }
             }
         }
 
         double comp_ppl = exp(-comp_log_prob / n_eval);
         double ppl_ratio = comp_ppl / ref_ppl;
         double avg_kl = sum_kl / n_eval;
+        double top1_pct = 100.0 * top1_match / n_eval;
+        double top5_pct = 100.0 * top5_match / n_eval;
 
-        printf("  %-8.0f%%  %4d/%-3d  %12.4f  %12.4f  %12.6f  %12.6f  %10.1f\n",
-               ratio * 100, t, T, comp_ppl, ppl_ratio, avg_kl, max_kl, compact_ms);
+        printf("  %-8.0f%%  %4d/%-3d  %12.4f  %12.4f  %12.6f  %12.6f  %6.1f%%  %6.1f%%  %10.1f\n",
+               ratio * 100, t, T, comp_ppl, ppl_ratio, avg_kl, max_kl, top1_pct, top5_pct, compact_ms);
 
         llama_batch_free(eval_batch);
         kv_compact_result_free(&compact_result);
     }
 
-    // ---- Step 4: Generation comparison ----
-    printf("\n  [4/4] Generation comparison...\n\n");
+    // ---- Step 4: Needle-in-a-Haystack retrieval ----
+    printf("\n  [4/5] Needle-in-a-Haystack retrieval test...\n\n");
+    {
+        // Insert a distinctive fact ("needle") in the middle of a padded prompt,
+        // compact, then check if the model can retrieve it.
+        const char * needle = "The secret code is BLUE-FALCON-42.";
+        const char * haystack_before =
+            "The history of mathematics spans many centuries. Ancient civilizations "
+            "developed counting systems and basic arithmetic. The Egyptians used a "
+            "base-10 system and the Babylonians used base-60. Greek mathematicians "
+            "like Euclid and Archimedes made foundational contributions to geometry. "
+            "During the Islamic Golden Age, algebra was formalized by al-Khwarizmi. "
+            "The Renaissance brought advances in trigonometry and calculus. Newton "
+            "and Leibniz independently developed calculus in the 17th century. "
+            "Modern mathematics includes fields like topology, abstract algebra, "
+            "and mathematical logic. Set theory, developed by Cantor, provides "
+            "the foundation for much of modern mathematics. ";
+        const char * haystack_after =
+            "Computer science emerged in the 20th century with contributions from "
+            "Turing, Church, and von Neumann. Programming languages evolved from "
+            "machine code to assembly to high-level languages like Fortran and C. "
+            "The development of the internet transformed global communication. "
+            "Database systems organize and retrieve information efficiently. "
+            "Operating systems manage hardware resources for applications. "
+            "Artificial neural networks were inspired by biological neurons. "
+            "Cryptography ensures secure communication over public channels. "
+            "Software engineering applies systematic methods to development. "
+            "Cloud computing provides on-demand computational resources. ";
+        const char * question = " What is the secret code mentioned above?";
+
+        std::string niah_prompt = std::string(haystack_before) + needle + " " +
+                                   std::string(haystack_after) + question;
+
+        std::vector<llama_token> niah_tokens = common_tokenize(mi.vocab, niah_prompt, true, false);
+        int n_niah = (int)niah_tokens.size();
+
+        if (n_niah + 64 > (int)llama_n_ctx(mi.ctx)) {
+            printf("  SKIP: NIAH prompt (%d tokens) too large for context\n", n_niah);
+        } else {
+            // Full-cache baseline: prefill and generate
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_batch nb = llama_batch_init(n_niah, 0, 1);
+            for (int i = 0; i < n_niah; i++)
+                common_batch_add(nb, niah_tokens[i], i, {0}, (i == n_niah - 1));
+            llama_decode(mi.ctx, nb);
+            llama_batch_free(nb);
+
+            std::string full_answer;
+            {
+                common_sampler * smpl = common_sampler_init(mi.model, params.sampling);
+                llama_batch gb = llama_batch_init(1, 0, 1);
+                for (int i = 0; i < 30; i++) {
+                    llama_token id = common_sampler_sample(smpl, mi.ctx, -1);
+                    if (llama_vocab_is_eog(mi.vocab, id)) break;
+                    full_answer += common_token_to_piece(mi.vocab, id);
+                    common_sampler_accept(smpl, id, true);
+                    common_batch_clear(gb);
+                    common_batch_add(gb, id, n_niah + i, {0}, true);
+                    if (llama_decode(mi.ctx, gb) != 0) break;
+                }
+                common_sampler_free(smpl);
+                llama_batch_free(gb);
+            }
+
+            // Test at multiple compression ratios
+            float niah_ratios[] = {0.5f, 0.3f, 0.2f};
+            printf("  %-8s  %-60s  %s\n", "ratio", "answer", "found?");
+            printf("  %-8s  %-60s  %s\n", "--------", std::string(60, '-').c_str(), "------");
+            printf("  %-8s  \"%.57s\"  %s\n", "full",
+                   full_answer.c_str(),
+                   (full_answer.find("BLUE-FALCON-42") != std::string::npos) ? "YES" : "no");
+
+            for (float r : niah_ratios) {
+                // Prefill, save, compact, reload
+                llama_memory_seq_rm(mem, 0, -1, -1);
+                llama_batch pb2 = llama_batch_init(n_niah, 0, 1);
+                for (int i = 0; i < n_niah; i++)
+                    common_batch_add(pb2, niah_tokens[i], i, {0}, (i == n_niah - 1));
+                llama_decode(mi.ctx, pb2);
+                llama_batch_free(pb2);
+
+                size_t ss = llama_state_seq_get_size(mi.ctx, 0);
+                std::vector<uint8_t> sbuf(ss);
+                llama_state_seq_get_data(mi.ctx, sbuf.data(), sbuf.size(), 0);
+
+                parsed_kv_state ks_n;
+                ks_n.parse(sbuf.data(), ss, mi.n_pos_per_embd);
+
+                kv_compact_params pn = kv_compact_params_default();
+                pn.target_ratio = r;
+                pn.use_cheap_qref = 1;
+
+                int niah_d_k = ks_n.streams[0].layers[0].n_embd_k_gqa() / mi.n_head_kv;
+                int niah_d_v = ks_n.streams[0].layers[0].n_embd_v_gqa_computed() / mi.n_head_kv;
+
+                kv_compact_result rn = {};
+                kv_compact(ks_n.streams[0].layers[0].K.data(),
+                           ks_n.streams[0].layers[0].V.data(), NULL,
+                           n_niah, 0, mi.n_head_kv, niah_d_k, niah_d_v,
+                           &pn, &rn);
+
+                std::vector<int> sel_n(rn.selected_indices, rn.selected_indices + rn.t);
+                std::vector<std::vector<std::vector<float>>> cv_n, beta_n, dirs_n;
+                compact_all_layers(ks_n.streams[0], sel_n,
+                                  mi.n_head_kv, niah_d_k, niah_d_v,
+                                  cv_n, beta_n, dirs_n);
+
+                auto cb_n = build_compacted_state(ks_n, sel_n, cv_n,
+                                                   mi.n_head_kv, niah_d_k, niah_d_v,
+                                                   mi.n_pos_per_embd);
+
+                llama_memory_seq_rm(mem, 0, -1, -1);
+                llama_state_seq_set_data(mi.ctx, cb_n.data(), cb_n.size(), 0);
+                kv_compact_result_free(&rn);
+
+                llama_pos pm = llama_memory_seq_pos_max(mem, 0);
+                std::string comp_answer;
+                {
+                    common_sampler * smpl = common_sampler_init(mi.model, params.sampling);
+                    llama_batch gb = llama_batch_init(1, 0, 1);
+                    // Prime with a dummy decode to get first logits
+                    // Use a space token as neutral primer
+                    std::vector<llama_token> space_tok = common_tokenize(mi.vocab, " ", false, false);
+                    if (!space_tok.empty()) {
+                        common_batch_add(gb, space_tok[0], pm + 1, {0}, true);
+                        llama_decode(mi.ctx, gb);
+                        common_batch_clear(gb);
+                    }
+                    for (int i = 0; i < 30; i++) {
+                        llama_token id = common_sampler_sample(smpl, mi.ctx, -1);
+                        if (llama_vocab_is_eog(mi.vocab, id)) break;
+                        comp_answer += common_token_to_piece(mi.vocab, id);
+                        common_sampler_accept(smpl, id, true);
+                        common_batch_clear(gb);
+                        common_batch_add(gb, id, pm + 2 + i, {0}, true);
+                        if (llama_decode(mi.ctx, gb) != 0) break;
+                    }
+                    common_sampler_free(smpl);
+                    llama_batch_free(gb);
+                }
+
+                bool found = comp_answer.find("BLUE-FALCON-42") != std::string::npos;
+                printf("  %-8.0f%%  \"%.57s\"  %s\n", r * 100,
+                       comp_answer.c_str(), found ? "YES" : "no");
+            }
+        }
+    }
+
+    // ---- Step 5: Generation comparison ----
+    printf("\n  [5/5] Generation comparison...\n\n");
 
     const int n_gen = 50;
 
