@@ -4,6 +4,20 @@ AMD ROCm (Radeon Open Compute) platform features relevant to accelerating the kv
 
 **Target hardware:** AMD Ryzen AI 395 Pro Max — 8060S RDNA 3.5 iGPU (gfx1151), 128GB unified LPDDR5X
 
+### Hardware Specs
+
+| Parameter | Value |
+|-----------|-------|
+| CPU | 16 Zen 5 cores / 32 threads, up to 5.1 GHz |
+| GPU | Radeon 8060S, 40 RDNA 3.5 CUs, up to 2.9 GHz |
+| Peak FP16/BF16 | 59.4 TFLOPS (with WMMA wave32 VOPD) |
+| Measured hipBLASLt FP16 | ~36.9 TFLOPS (>60% of theoretical) |
+| Memory | 128 GB LPDDR5X-8000, 256-bit bus, ~212 GB/s measured |
+| NPU | XDNA 2, 50 TOPS (INT8) |
+| TDP | 45-120W configurable |
+
+**ROCm support:** gfx1151 not on official compatibility matrix but functionally supported. ROCm 6.4.1+ on Ubuntu 24.04. Linux kernel 6.16.9+ required for full memory visibility.
+
 ---
 
 ## 1. Math Libraries
@@ -29,6 +43,19 @@ AMD ROCm (Radeon Open Compute) platform features relevant to accelerating the kv
 
 **Key advantage:** Grouped GEMM handles heterogeneous matrix sizes across layers without padding.
 
+**Caveat:** hipBLASLt excels at FP16 (~36.9 TFLOPS on gfx1151) but FP32 performance is *worse* than standard rocBLAS. Use rocBLAS/Tensile for FP32 attention scoring. Set `ROCBLAS_USE_HIPBLASLT=0` on gfx11 to avoid batched GEMM regressions.
+
+### rocWMMA — Wave Matrix Multiply Accumulate
+
+| Feature | Value | Notes |
+|---------|-------|-------|
+| Tile size | 16x16x16 | Hardware WMMA instructions on RDNA 3.5 |
+| Data types | FP16, BF16, INT8, INT4 | Best throughput with FP16 |
+| Wave mode | Wave32 (32 threads) | Native RDNA wavefront size |
+| Use case | Custom small-matrix kernels | Direct hardware acceleration |
+
+**Opportunity:** For attention scoring, FP16 WMMA gives best throughput. Use FP32 only for NNLS/LS where numerical stability matters.
+
 ### rocSOLVER / hipSOLVER — Linear Solvers
 
 | API | Use in kv-compact | Notes |
@@ -49,6 +76,18 @@ AMD ROCm (Radeon Open Compute) platform features relevant to accelerating the kv
 
 **Relevance:** Lower priority — our matrices are small enough that dense ops dominate.
 
+### NNLS on GPU — Strategy
+
+No built-in NNLS solver exists in rocSOLVER. Implementation options:
+
+| Approach | Description | Pros | Cons |
+|----------|-------------|------|------|
+| Active-set on GPU | Port Lawson-Hanson using rocBLAS GEMM + rocSOLVER QR | Exact, matches CPU | Complex, variable iterations |
+| Wavefront-per-head | Single wave32 processes one head's NNLS in registers/LDS | Low overhead, no launch cost | Limited to small problems |
+| Projected gradient | Iterative using rocBLAS `sgemv` | Simple to implement | Slower convergence than active-set |
+
+**Recommended:** Wavefront-per-head for our small matrices (typically < 128 selected keys). Each of the 40 CUs can run one head's NNLS problem entirely in 64KB LDS.
+
 ---
 
 ## 2. Memory Management
@@ -63,6 +102,13 @@ AMD ROCm (Radeon Open Compute) platform features relevant to accelerating the kv
 | Prefetch hint | `hipMemPrefetchAsync()` | Hint GPU to stage data in L2 before kernel launch |
 
 **APU advantage:** On the Ryzen AI 395 Pro Max, CPU and GPU share 128GB LPDDR5X. `hipMallocManaged` has near-zero overhead — no PCIe transfers. This is our biggest hardware advantage.
+
+**Critical notes:**
+- Set BIOS VRAM reservation to minimum (~0.5 GB), increase shared (TTM/GTT) limit instead
+- For read-heavy GPU access (KV cache reads), non-coherent `hipMalloc` gives best GPU-side caching
+- For CPU+GPU shared data (compacted output), use `hipMallocManaged` with `hipMemAdvise` hints
+- llama.cpp uses `-DGGML_HIP_UMA=ON` for UMA-aware allocation on gfx1151
+- **Known issue:** PyTorch shows ~92-95% of decode time in `hipMemcpyWithStream` on gfx1151 due to unnecessary copies — avoid this pattern
 
 ### Memory Pools
 
