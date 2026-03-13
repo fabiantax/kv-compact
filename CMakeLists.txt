@@ -28,6 +28,13 @@ add_library(kv-compact-api STATIC src/kv-compact-api.cpp)
 target_link_libraries(kv-compact-api PUBLIC kv-compact-math)
 target_include_directories(kv-compact-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# OpenMP for parallel chunk processing (optional, graceful fallback)
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(kv-compact-api PUBLIC OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP found — parallel chunk processing enabled")
+endif()
+
 if(KV_COMPACT_HIP)
     target_link_libraries(kv-compact-api PUBLIC kv-compact-hip)
     target_compile_definitions(kv-compact-api PUBLIC KV_COMPACT_HIP)

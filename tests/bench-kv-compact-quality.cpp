@@ -24,6 +24,8 @@
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
 
+#include <climits>
+
 using clock_type = std::chrono::high_resolution_clock;
 
 // ============================================================================
@@ -716,35 +718,52 @@ static void bench_chunked_quality() {
 // Measures throughput (tokens/sec) and verifies quality.
 
 static void bench_chunked_throughput_scaling() {
-    printf("=== Chunked Throughput Scaling (Large T) ===\n\n");
+    printf("=== Chunked Throughput Scaling (up to 1M) ===\n\n");
 
-    const int n_head_kv = 4, d_k = 64, d_v = 64;
-    const int n_embd_k = n_head_kv * d_k;
-    const int n_embd_v = n_head_kv * d_v;
-    const int n_q = 64;
-    const int chunk_size = 4096;
-
-    // T values up to 30k (would OOM without chunking at 50% retention)
-    int T_sizes[] = {1024, 2048, 4096, 8192, 16384, 30000};
+    // Use smaller dims for large T to fit in memory:
+    //   T ≤ 30k: n_head=4, d=64 (256-dim embeddings)
+    //   T > 30k: n_head=2, d=32 (64-dim embeddings, ~256MB for 1M tokens)
+    struct test_config {
+        int T;
+        int n_head_kv, d_k, d_v;
+    };
+    test_config configs[] = {
+        {    1024, 4, 64, 64},
+        {    4096, 4, 64, 64},
+        {   16384, 4, 64, 64},
+        {   30000, 4, 64, 64},
+        {  100000, 2, 32, 32},
+        {  500000, 2, 32, 32},
+        { 1000000, 1, 16, 16},
+    };
+    int n_q = 64;
     float ratios[] = {0.5f, 0.2f};
 
-    printf("  %-7s  %-8s  %-8s  %12s  %14s  %12s\n",
-           "T", "ratio", "t", "time_ms", "tokens/sec", "cos_sim");
-    printf("  %-7s  %-8s  %-8s  %12s  %14s  %12s\n",
-           "-------", "--------", "--------", "------------",
-           "--------------", "------------");
+    printf("  %-8s  %-5s  %-4s  %-6s  %-8s  %10s  %12s  %10s\n",
+           "T", "heads", "d_k", "ratio", "t", "time_s", "tokens/sec", "cos_sim");
+    printf("  %-8s  %-5s  %-4s  %-6s  %-8s  %10s  %12s  %10s\n",
+           "--------", "-----", "----", "------", "--------",
+           "----------", "------------", "----------");
 
-    for (int T : T_sizes) {
+    for (auto & cfg : configs) {
+        int T = cfg.T;
+        int n_head_kv = cfg.n_head_kv, d_k = cfg.d_k, d_v = cfg.d_v;
+        int n_embd_k = n_head_kv * d_k;
+        int n_embd_v = n_head_kv * d_v;
+
         std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
-        std::vector<float> Q(n_q * n_embd_k);
-        gen_data(K.data(), T * n_embd_k, 10000 + T);
-        gen_data(V.data(), T * n_embd_v, 11000 + T);
+        std::vector<float> Q((size_t)n_q * n_embd_k);
+        // Use modular gen_data to avoid int overflow for large T*n_embd
+        int gen_size_k = (int)std::min((size_t)T * n_embd_k, (size_t)INT_MAX);
+        int gen_size_v = (int)std::min((size_t)T * n_embd_v, (size_t)INT_MAX);
+        gen_data(K.data(), gen_size_k, 10000 + T);
+        gen_data(V.data(), gen_size_v, 11000 + T);
         gen_data(Q.data(), n_q * n_embd_k, 12000 + T);
 
         for (float ratio : ratios) {
             kv_compact_params p = kv_compact_params_default();
             p.target_ratio = ratio;
-            p.chunk_size = chunk_size;
+            // Use auto chunk_size (0) — let the smart auto logic pick it
 
             kv_compact_result result = {};
             auto t0 = clock_type::now();
@@ -756,9 +775,9 @@ static void bench_chunked_throughput_scaling() {
             assert(rc == 0);
             double tokens_per_sec = T / (ms / 1000.0);
 
-            printf("  %-7d  %-8.0f%%  %-8d  %12.1f  %14.0f  %12.6f\n",
-                   T, ratio * 100, result.t, ms, tokens_per_sec,
-                   result.stats.avg_cosine_sim);
+            printf("  %-8d  %-5d  %-4d  %-6.0f%%  %-8d  %10.2f  %12.0f  %10.6f\n",
+                   T, n_head_kv, d_k, ratio * 100, result.t,
+                   ms / 1000.0, tokens_per_sec, result.stats.avg_cosine_sim);
 
             assert(std::isfinite(result.stats.avg_cosine_sim));
             assert(result.stats.avg_cosine_sim > 0.9f);

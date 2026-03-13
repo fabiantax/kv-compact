@@ -839,7 +839,7 @@ static void test_chunked_quality_vs_unchunked() {
 
 static void test_chunked_no_chunk_when_small() {
     printf("  test_chunked_no_chunk_when_small...\n");
-    // With auto chunk_size (0), T=128 should NOT be chunked
+    // With auto chunk_size (0), T=128 at 50% → t=64 ≤ 256, so no chunking
     const int T = 128, n_q = 64, n_head_kv = 2, d_k = 32, d_v = 32;
     int n_embd_k = n_head_kv * d_k;
     int n_embd_v = n_head_kv * d_v;
@@ -849,7 +849,7 @@ static void test_chunked_no_chunk_when_small() {
     gen_data(V.data(), T * n_embd_v, 6700);
     gen_data(Q.data(), n_q * n_embd_k, 6800);
 
-    // Auto mode (chunk_size = 0): T=128 < 8192, so no chunking
+    // Auto mode (chunk_size = 0): T=128, ratio=0.5, t=64 ≤ 256 → no chunking
     kv_compact_params p_auto = kv_compact_params_default();
     p_auto.target_ratio = 0.5f;
 
@@ -990,48 +990,142 @@ static void test_chunked_params_default() {
     printf("  test_chunked_params_default...");
     kv_compact_params p = kv_compact_params_default();
     assert(p.chunk_size == 0);  // auto mode
+    assert(p.n_threads == 0);   // auto threads
     printf(" OK\n");
 }
 
-static void test_chunked_large_T() {
-    printf("  test_chunked_large_T...\n");
-    // T=20000 would OOM without chunking (t=10000, AtA=400MB)
-    // With chunk_size=4096, each chunk's t=2048, AtA=16MB
-    const int T = 20000, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+static void test_chunked_parallel_vs_sequential() {
+    printf("  test_chunked_parallel_vs_sequential...\n");
+    const int T = 4096, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
     int n_embd_k = n_head_kv * d_k;
     int n_embd_v = n_head_kv * d_v;
 
     std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
     std::vector<float> Q(n_q * n_embd_k);
-    gen_data(K.data(), T * n_embd_k, 7700);
-    gen_data(V.data(), T * n_embd_v, 7800);
+    gen_data(K.data(), T * n_embd_k, 8200);
+    gen_data(V.data(), T * n_embd_v, 8300);
+    gen_data(Q.data(), n_q * n_embd_k, 8400);
+
+    // Sequential (1 thread)
+    kv_compact_params p_seq = kv_compact_params_default();
+    p_seq.target_ratio = 0.5f;
+    p_seq.n_threads = 1;
+
+    // Parallel (auto threads)
+    kv_compact_params p_par = kv_compact_params_default();
+    p_par.target_ratio = 0.5f;
+    p_par.n_threads = 0;
+
+    kv_compact_result r_seq = {}, r_par = {};
+    int rc1 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v, &p_seq, &r_seq);
+    int rc2 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v, &p_par, &r_par);
+    assert(rc1 == 0);
+    assert(rc2 == 0);
+
+    // Same number of selected tokens
+    assert(r_seq.t == r_par.t);
+
+    // Same indices (deterministic despite parallelism — chunks are independent)
+    for (int i = 0; i < r_seq.t; i++) {
+        assert(r_seq.selected_indices[i] == r_par.selected_indices[i]);
+    }
+
+    printf("    Sequential: t=%d cos=%.6f time=%.1fms\n",
+           r_seq.t, r_seq.stats.avg_cosine_sim, r_seq.stats.elapsed_ms);
+    printf("    Parallel:   t=%d cos=%.6f time=%.1fms\n",
+           r_par.t, r_par.stats.avg_cosine_sim, r_par.stats.elapsed_ms);
+
+    // Quality must be identical (same algorithm, just parallelized)
+    assert(fabsf(r_seq.stats.avg_cosine_sim - r_par.stats.avg_cosine_sim) < 1e-5f);
+
+    kv_compact_result_free(&r_seq);
+    kv_compact_result_free(&r_par);
+    printf("  OK\n");
+}
+
+static void test_chunked_100k() {
+    printf("  test_chunked_100k...\n");
+    // T=100k at 50% retention: t=50000, AtA would be 10GB without chunking.
+    // Auto mode: chunk=512 (t_chunk=256), 196 chunks. Each LS ≤ 1ms.
+    const int T = 100000, n_q = 64, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // K+V = 100k * 64 * 4 * 2 = 51.2 MB
+    std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+    std::vector<float> Q(n_q * n_embd_k);
+    gen_data(K.data(), (int)((size_t)T * n_embd_k), 7700);
+    gen_data(V.data(), (int)((size_t)T * n_embd_v), 7800);
     gen_data(Q.data(), n_q * n_embd_k, 7900);
 
     kv_compact_params p = kv_compact_params_default();
     p.target_ratio = 0.5f;
-    p.chunk_size = 4096;
+    // auto chunk_size: ratio=0.5 → chunk=512, t_chunk=256
 
     kv_compact_result result = {};
     int rc = kv_compact(K.data(), V.data(), Q.data(),
                         T, n_q, n_head_kv, d_k, d_v, &p, &result);
     assert(rc == 0);
+    assert(result.t == 50000);
 
-    // 5 chunks of 4096 = 20480, but T=20000, so:
-    // 4 full chunks of 4096 + 1 chunk of 3616 = 20000
-    // Selected: 4*2048 + 1808 = 10000
-    assert(result.t == 10000);
-
-    for (int i = 0; i < result.t; i++) {
-        assert(result.selected_indices[i] >= 0);
-        assert(result.selected_indices[i] < T);
-    }
+    // Spot check indices
+    assert(result.selected_indices[0] >= 0);
+    assert(result.selected_indices[result.t - 1] < T);
     for (int i = 1; i < result.t; i++) {
         assert(result.selected_indices[i] > result.selected_indices[i - 1]);
     }
 
     assert(std::isfinite(result.stats.avg_cosine_sim));
-    printf("    T=%d chunk=4096: t=%d cos=%.6f time=%.1fms (no OOM!)\n",
-           T, result.t, result.stats.avg_cosine_sim, result.stats.elapsed_ms);
+    assert(result.stats.avg_cosine_sim > 0.9f);
+    printf("    T=%d auto-chunk: t=%d cos=%.6f time=%.1fs (no OOM!)\n",
+           T, result.t, result.stats.avg_cosine_sim,
+           result.stats.elapsed_ms / 1000.0);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_chunked_1M() {
+    printf("  test_chunked_1M...\n");
+    // T=1M at 50% retention: t=500k. Auto chunk=512, ~1954 chunks.
+    // Using small dims to keep memory reasonable: K+V = 1M * 32 * 4 * 2 = 256 MB
+    const int T = 1000000, n_head_kv = 1, d_k = 16, d_v = 16;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // K = 1M * 16 * 4 = 64MB, V = 64MB → 128MB total
+    std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+    gen_data(K.data(), (int)((size_t)T * n_embd_k), 8000);
+    gen_data(V.data(), (int)((size_t)T * n_embd_v), 8100);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.use_cheap_qref = 1;  // generate Q_ref from K (no external queries at 1M)
+    // auto chunk_size: ratio=0.5 → chunk=512, t_chunk=256, ~1954 chunks
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), NULL,
+                        T, 0, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+    assert(result.t == 500000);
+
+    // Spot check: indices valid and sorted
+    assert(result.selected_indices[0] >= 0);
+    assert(result.selected_indices[result.t - 1] < T);
+    // Check a few samples (don't iterate all 500k in debug)
+    for (int i = 1; i < 1000; i++) {
+        assert(result.selected_indices[i] > result.selected_indices[i - 1]);
+    }
+    int mid = result.t / 2;
+    assert(result.selected_indices[mid] > result.selected_indices[mid - 1]);
+    assert(result.selected_indices[result.t - 1] > result.selected_indices[result.t - 2]);
+
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    printf("    T=%d auto-chunk: t=%d cos=%.6f time=%.1fs (1M context!)\n",
+           T, result.t, result.stats.avg_cosine_sim,
+           result.stats.elapsed_ms / 1000.0);
 
     kv_compact_result_free(&result);
     printf("  OK\n");
@@ -1099,7 +1193,9 @@ int main() {
     test_chunked_uneven_chunks();
     test_chunked_with_shared_prefix();
     test_chunked_with_cheap_qref();
-    test_chunked_large_T();
+    test_chunked_100k();
+    test_chunked_1M();
+    test_chunked_parallel_vs_sequential();
 
     printf("\nAll tests passed!\n");
     return 0;

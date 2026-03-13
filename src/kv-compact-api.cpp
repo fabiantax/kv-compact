@@ -22,10 +22,15 @@
 #define KV_COMPACT_ACCEL_IMPL
 #include "kv-compact-accel.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using clock_type = std::chrono::high_resolution_clock;
 
@@ -261,6 +266,7 @@ kv_compact_params kv_compact_params_default(void) {
     p.use_cheap_qref = 0;
     p.skip_beta = 1;
     p.chunk_size = 0;
+    p.n_threads = 0;
     p.layer_filter = NULL;
     p.layer_filter_data = NULL;
     return p;
@@ -320,12 +326,27 @@ int kv_compact(
     int n_embd_v_early = n_head_kv * d_v;
 
     // ---- Chunked compaction: split T into segments to avoid OOM in LS ----
-    // The LS normal equations matrix is O(t²). With chunk_size C, each chunk's
-    // LS matrix is O((C*ratio)²) instead of O((T*ratio)²), bounding memory.
+    // The LS normal equations matrix is O(t²) and solve is O(t³). With
+    // chunk_size C, each chunk's t = C*ratio, bounding both memory and time.
+    // We target t_chunk ≤ 256, which keeps LS at O(256³) ≈ 17M ops (<1ms).
     int effective_chunk_size = p.chunk_size;
     if (effective_chunk_size == 0) {
-        // Auto: chunk when T > 8192, using 4096-token chunks
-        effective_chunk_size = (T > 8192) ? 4096 : T;
+        // Auto: chunk when the per-chunk LS selected count (t) would exceed 256.
+        // chunk_size = ceil(256 / ratio) so each chunk selects ~256 keys.
+        // This scales to 1M+ tokens: e.g., ratio=0.5 → chunk=512, 1M/512=1954 chunks.
+        float ratio_est = (p.target_count > 0)
+            ? (float)p.target_count / (float)T
+            : p.target_ratio;
+        if (ratio_est <= 0.0f) ratio_est = 0.5f;
+        if (ratio_est > 1.0f) ratio_est = 1.0f;
+        int estimated_t = (int)(T * ratio_est);
+        if (estimated_t > 256) {
+            effective_chunk_size = (int)(256.0f / ratio_est);
+            if (effective_chunk_size < 64) effective_chunk_size = 64;
+            if (effective_chunk_size >= T) effective_chunk_size = T;
+        } else {
+            effective_chunk_size = T;  // small enough, no chunking needed
+        }
     } else if (effective_chunk_size < 0) {
         effective_chunk_size = T;  // disabled
     }
@@ -336,19 +357,37 @@ int kv_compact(
         int n_chunks = (T + effective_chunk_size - 1) / effective_chunk_size;
         std::vector<kv_compact_result> chunk_results(n_chunks);
         std::vector<int> chunk_starts(n_chunks);
-        int total_selected = 0;
+        std::vector<int> chunk_rc(n_chunks, 0);
 
+        // Precompute chunk metadata
         for (int c = 0; c < n_chunks; c++) {
-            int start = c * effective_chunk_size;
+            chunk_starts[c] = c * effective_chunk_size;
+            chunk_results[c] = {};
+        }
+
+        // Determine thread count for parallel chunk processing
+        int n_threads_use = p.n_threads;
+#ifdef _OPENMP
+        if (n_threads_use <= 0) n_threads_use = omp_get_max_threads();
+        if (n_threads_use > n_chunks) n_threads_use = n_chunks;
+#else
+        n_threads_use = 1;
+#endif
+
+        // Process chunks in parallel — each chunk is fully independent
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic) num_threads(n_threads_use) if(n_threads_use > 1)
+#endif
+        for (int c = 0; c < n_chunks; c++) {
+            int start = chunk_starts[c];
             int end = start + effective_chunk_size;
             if (end > T) end = T;
             int chunk_T = end - start;
 
-            chunk_starts[c] = start;
-
             // Disable further chunking in sub-calls
             kv_compact_params chunk_p = p;
             chunk_p.chunk_size = -1;
+            chunk_p.n_threads = 1;  // no nested parallelism
 
             // Shared prefix only applies to the first chunk
             if (c > 0) {
@@ -358,18 +397,24 @@ int kv_compact(
                 chunk_p.n_shared_prefix = chunk_T;
             }
 
-            chunk_results[c] = {};
-            int rc = kv_compact(
+            chunk_rc[c] = kv_compact(
                 K_all + (size_t)start * n_embd_k,
                 V_all + (size_t)start * n_embd_v_early,
                 Q_ref_used,
                 chunk_T, n_q_used, n_head_kv, d_k, d_v,
                 &chunk_p, &chunk_results[c]);
+        }
 
-            if (rc != 0) {
-                for (int i = 0; i <= c; i++) kv_compact_result_free(&chunk_results[i]);
-                return rc;
+        // Check for errors (after parallel region)
+        for (int c = 0; c < n_chunks; c++) {
+            if (chunk_rc[c] != 0) {
+                for (int i = 0; i < n_chunks; i++) kv_compact_result_free(&chunk_results[i]);
+                return chunk_rc[c];
             }
+        }
+
+        int total_selected = 0;
+        for (int c = 0; c < n_chunks; c++) {
             total_selected += chunk_results[c].t;
         }
 

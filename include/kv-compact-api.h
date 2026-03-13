@@ -117,14 +117,23 @@ typedef struct kv_compact_params {
                                // at 2048 tokens this is 6.75x faster with 0.9999 vs 0.9994 cos sim.
 
     int    chunk_size;         // chunk size for chunked compaction (default: 0 = auto)
-                               //   0 = auto: use 4096 when T > 8192, otherwise no chunking
+                               //   0 = auto: target t_chunk ≤ 256 (chunk = ceil(256/ratio))
+                               //             e.g., ratio=0.5 → chunk=512, ratio=0.2 → chunk=1280
+                               //             no chunking when t ≤ 256 (T*ratio ≤ 256)
                                //  -1 = disabled: never chunk (may OOM at large T)
                                //  >0 = explicit chunk size (tokens per chunk)
                                // Chunked compaction splits the T tokens into segments,
                                // compacts each independently, then merges results.
                                // This bounds LS memory to O(chunk_t^2) per chunk instead
-                               // of O(t^2) total, enabling 100k+ token contexts.
+                               // of O(t^2) total, enabling 1M+ token contexts.
                                // Quality impact is minimal since attention is mostly local.
+
+    int    n_threads;          // number of threads for parallel chunk processing (default: 0)
+                               //   0 = auto (use all available cores via OpenMP)
+                               //   1 = single-threaded (no OpenMP overhead)
+                               //  >1 = explicit thread count
+                               // Only affects chunked compaction. Each chunk is processed
+                               // independently in parallel. Speedup is near-linear with cores.
 
     // Layer filter for hybrid architectures (e.g., Qwen 3.5 DeltaNet + attention)
     // When non-NULL, only layers where filter returns non-zero are compacted.
