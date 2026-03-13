@@ -1352,6 +1352,70 @@ static void test_nnls_pgd_with_iters() {
     printf(" OK\n");
 }
 
+// Generate keys that create spiky, realistic LLM-like attention patterns:
+// - A few "attention sink" tokens (BOS, delimiters) with unique key directions
+// - Recent tokens get locality bias (higher magnitude)
+// - Most middle tokens are similar/clustered (hard to distinguish)
+static void gen_spiky_data(float * K, float * V, float * Q,
+                           int T, int n_q, int n_head_kv, int d_k, int d_v,
+                           int seed) {
+    // Fill V with normal-ish random data (values don't affect key selection)
+    gen_data(V, T * n_head_kv * d_v, seed + 500);
+
+    // K: make most keys very similar (clustered), with a few outlier "sinks"
+    int n_embd_k = n_head_kv * d_k;
+    // Base direction that most keys will be close to
+    std::vector<float> base_dir(d_k);
+    for (int d = 0; d < d_k; d++) {
+        base_dir[d] = sinf((float)(d * 7 + seed) * 0.31f);
+    }
+
+    for (int t = 0; t < T; t++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * row = K + t * n_embd_k + h * d_k;
+            if (t == 0) {
+                // Attention sink 0 (BOS-like): strong unique direction
+                for (int d = 0; d < d_k; d++) {
+                    row[d] = 3.0f * cosf((float)(d * 13 + seed) * 0.17f);
+                }
+            } else if (t == 1 || t == T/4 || t == T/2) {
+                // A few delimiter/punctuation sinks: distinct directions
+                for (int d = 0; d < d_k; d++) {
+                    row[d] = 2.5f * sinf((float)(d * 11 + t * 37 + seed) * 0.23f);
+                }
+            } else if (t > T - T/10) {
+                // Recent tokens: slightly boosted magnitude (locality bias)
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.1f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = 1.5f * (base_dir[d] + noise);
+                }
+            } else {
+                // Middle tokens: clustered near base_dir with small noise
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.05f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = base_dir[d] + noise;
+                }
+            }
+        }
+    }
+
+    // Q: queries that attend sharply to sinks + recent tokens
+    // High dot product with sink directions, moderate with recent, low with middle
+    for (int q = 0; q < n_q; q++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * qrow = Q + q * n_embd_k + h * d_k;
+            // Mix of sink-0 direction and base direction
+            float sink_weight = 0.7f + 0.3f * sinf((float)(q * 13 + h * 7 + seed) * 0.29f);
+            for (int d = 0; d < d_k; d++) {
+                float sink_dir = cosf((float)(d * 13 + seed) * 0.17f);
+                qrow[d] = sink_weight * sink_dir + (1.0f - sink_weight) * base_dir[d];
+                // Add per-query variation
+                qrow[d] += 0.2f * sinf((float)(q * 41 + d * 3 + h * 19 + seed) * 0.37f);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Extreme compression ratio benchmark (50× = 2% retention)
 // ============================================================================
@@ -1441,6 +1505,72 @@ static void test_extreme_compression_ratios() {
     printf("  OK\n");
 }
 
+static void test_extreme_compression_spiky() {
+    printf("  test_extreme_compression_spiky (realistic attention)...\n");
+
+    // Larger T with spiky attention patterns — this is where things should break
+    const int T = 500, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_spiky_data(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, 8000);
+
+    float ratios[] = { 0.50f, 0.20f, 0.10f, 0.05f, 0.02f };
+    int n_ratios = 5;
+
+    printf("    %-8s  %-28s  %-28s  %-28s\n",
+           "Ratio", "HighestAttn (skip_beta)", "OMP (skip_beta)", "OMP (+beta)");
+    printf("    %-8s  %-28s  %-28s  %-28s\n",
+           "-----", "------------------------", "------------------------", "------------------------");
+
+    for (int ri = 0; ri < n_ratios; ri++) {
+        float ratio = ratios[ri];
+        int t_expected = (int)(T * ratio);
+        if (t_expected < 2) t_expected = 2;
+
+        // --- HighestAttn (skip_beta=1, default) ---
+        kv_compact_params p_hat = kv_compact_params_default();
+        p_hat.target_ratio = ratio;
+        p_hat.chunk_size = -1;
+        kv_compact_result r_hat = {};
+        kv_compact(K.data(), V.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p_hat, &r_hat);
+
+        // --- OMP (skip_beta=1) ---
+        kv_compact_params p_omp = kv_compact_params_default();
+        p_omp.target_ratio = ratio;
+        p_omp.use_omp = 1;
+        p_omp.omp_k_choice = 4;
+        p_omp.omp_refit_interval = 2;
+        p_omp.chunk_size = -1;
+        kv_compact_result r_omp = {};
+        kv_compact(K.data(), V.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p_omp, &r_omp);
+
+        // --- OMP with beta ---
+        kv_compact_params p_omp_beta = kv_compact_params_default();
+        p_omp_beta.target_ratio = ratio;
+        p_omp_beta.use_omp = 1;
+        p_omp_beta.omp_k_choice = 4;
+        p_omp_beta.omp_refit_interval = 2;
+        p_omp_beta.skip_beta = 0;
+        p_omp_beta.chunk_size = -1;
+        kv_compact_result r_omp_beta = {};
+        kv_compact(K.data(), V.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p_omp_beta, &r_omp_beta);
+
+        printf("    %5.1f%%    cos=%.4f mse=%.6f %4.1fms  cos=%.4f mse=%.6f %4.1fms  cos=%.4f mse=%.6f %4.1fms\n",
+               ratio * 100.0f,
+               r_hat.stats.avg_cosine_sim, r_hat.stats.avg_mse, r_hat.stats.elapsed_ms,
+               r_omp.stats.avg_cosine_sim, r_omp.stats.avg_mse, r_omp.stats.elapsed_ms,
+               r_omp_beta.stats.avg_cosine_sim, r_omp_beta.stats.avg_mse, r_omp_beta.stats.elapsed_ms);
+
+        kv_compact_result_free(&r_hat);
+        kv_compact_result_free(&r_omp);
+        kv_compact_result_free(&r_omp_beta);
+    }
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-api:\n\n");
 
@@ -1505,6 +1635,7 @@ int main() {
 
     printf("\n=== Extreme compression ratios (50x = 2%%) ===\n");
     test_extreme_compression_ratios();
+    test_extreme_compression_spiky();
 
     printf("\n=== Chunked compaction ===\n");
     test_chunked_params_default();
