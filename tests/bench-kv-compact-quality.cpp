@@ -39,6 +39,62 @@ static void gen_data(float * out, int n, int seed) {
     }
 }
 
+// Generate keys/queries that create spiky LLM-like attention patterns:
+// - Attention sink tokens (BOS, delimiters) with unique key directions
+// - Recent tokens with locality bias
+// - Clustered middle tokens that are hard to distinguish
+static void gen_spiky_data(float * K, float * V, float * Q,
+                           int T, int n_q, int n_head_kv, int d_k, int d_v,
+                           int seed) {
+    gen_data(V, T * n_head_kv * d_v, seed + 500);
+
+    int n_embd_k = n_head_kv * d_k;
+    std::vector<float> base_dir(d_k);
+    for (int d = 0; d < d_k; d++) {
+        base_dir[d] = sinf((float)(d * 7 + seed) * 0.31f);
+    }
+
+    for (int t = 0; t < T; t++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * row = K + t * n_embd_k + h * d_k;
+            if (t == 0) {
+                // BOS-like attention sink
+                for (int d = 0; d < d_k; d++)
+                    row[d] = 3.0f * cosf((float)(d * 13 + seed) * 0.17f);
+            } else if (t == 1 || t == T/4 || t == T/2) {
+                // Delimiter/punctuation sinks
+                for (int d = 0; d < d_k; d++)
+                    row[d] = 2.5f * sinf((float)(d * 11 + t * 37 + seed) * 0.23f);
+            } else if (t > T - T/10) {
+                // Recent tokens: locality bias
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.1f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = 1.5f * (base_dir[d] + noise);
+                }
+            } else {
+                // Middle tokens: clustered, hard to distinguish
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.05f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = base_dir[d] + noise;
+                }
+            }
+        }
+    }
+
+    // Queries that attend sharply to sinks
+    for (int q = 0; q < n_q; q++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * qrow = Q + q * n_embd_k + h * d_k;
+            float sink_w = 0.7f + 0.3f * sinf((float)(q * 13 + h * 7 + seed) * 0.29f);
+            for (int d = 0; d < d_k; d++) {
+                float sink_dir = cosf((float)(d * 13 + seed) * 0.17f);
+                qrow[d] = sink_w * sink_dir + (1.0f - sink_w) * base_dir[d];
+                qrow[d] += 0.2f * sinf((float)(q * 41 + d * 3 + h * 19 + seed) * 0.37f);
+            }
+        }
+    }
+}
+
 // Generate a random "vocabulary projection" matrix W_vocab [d_v × vocab_size]
 // Used to simulate logit computation: logits = attn_output @ W_vocab
 static void gen_vocab_proj(float * out, int d_v, int vocab_size, int seed) {
@@ -789,6 +845,253 @@ static void bench_chunked_throughput_scaling() {
 }
 
 // ============================================================================
+// Benchmark 8: Method Comparison at Extreme Ratios (Spiky Attention)
+// ============================================================================
+// Compares all 4 paper methods on PPL, KL divergence, and mass preservation
+// using realistic spiky attention data at extreme compression (2%-50%).
+//
+// Methods:
+//   HighestAttn-fast  — top-k by score, skip beta, LS value refit only
+//   HighestAttn       — top-k by score + NNLS beta + LS value refit
+//   AM-OMP-fast       — OMP selection (k=4, int=2), skip beta
+//   AM-OMP            — OMP selection + NNLS beta + LS value refit
+
+struct method_config {
+    const char * name;
+    int use_omp;
+    int skip_beta;
+    int omp_k_choice;
+    int omp_refit_interval;
+};
+
+static void bench_method_comparison_extreme() {
+    printf("=== Method Comparison — Spiky Attention at Extreme Ratios ===\n\n");
+
+    const int T = 512, n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int vocab_size = 256;
+    const int n_q = 64;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    std::vector<float> Q_eval(n_q * n_embd_k);
+    gen_spiky_data(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, 7777);
+
+    // Separate eval queries — same spiky style but different seed
+    // (queries attend sharply to sinks, like real LLM queries)
+    {
+        std::vector<float> base_dir(d_k);
+        for (int d = 0; d < d_k; d++)
+            base_dir[d] = sinf((float)(d * 7 + 7777) * 0.31f);
+        for (int q = 0; q < n_q; q++) {
+            for (int h = 0; h < n_head_kv; h++) {
+                float * qrow = Q_eval.data() + q * n_embd_k + h * d_k;
+                float sink_w = 0.7f + 0.3f * sinf((float)(q * 17 + h * 11 + 8888) * 0.29f);
+                for (int d = 0; d < d_k; d++) {
+                    float sink_dir = cosf((float)(d * 13 + 7777) * 0.17f);
+                    qrow[d] = sink_w * sink_dir + (1.0f - sink_w) * base_dir[d];
+                    qrow[d] += 0.2f * sinf((float)(q * 43 + d * 5 + h * 23 + 8888) * 0.37f);
+                }
+            }
+        }
+    }
+
+    std::vector<float> W_vocab(d_v * vocab_size);
+    gen_vocab_proj(W_vocab.data(), d_v, vocab_size, 42);
+
+    method_config methods[] = {
+        {"HighestAttn-fast", 0, 1, 0, 0},
+        {"HighestAttn     ", 0, 0, 0, 0},
+        {"AM-OMP-fast     ", 1, 1, 4, 2},
+        {"AM-OMP          ", 1, 0, 4, 2},
+    };
+
+    float ratios[] = {0.50f, 0.20f, 0.10f, 0.05f, 0.02f};
+
+    // --- Perplexity ---
+    printf("  Perplexity ratio (compacted / original, closer to 1.0 = better):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+
+    // Store results for all methods/ratios
+    struct bench_result {
+        double ppl_ratio;
+        double avg_kl;
+        double max_kl;
+        double avg_mass_err;
+        double max_mass_err;
+    };
+    bench_result results[4][5] = {};
+
+    for (int mi = 0; mi < 4; mi++) {
+        auto & m = methods[mi];
+        printf("  %-18s", m.name);
+
+        for (int ri = 0; ri < 5; ri++) {
+            float ratio = ratios[ri];
+
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            p.chunk_size = -1;
+            p.use_omp = m.use_omp;
+            p.skip_beta = m.skip_beta;
+            if (m.use_omp) {
+                p.omp_k_choice = m.omp_k_choice;
+                p.omp_refit_interval = m.omp_refit_interval;
+            }
+
+            kv_compact_result result = {};
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            assert(rc == 0);
+
+            // --- Perplexity on head 0 ---
+            double log_prob_orig = 0.0, log_prob_comp = 0.0;
+            double sum_kl = 0.0, max_kl = 0.0;
+            double sum_mass_err = 0.0, max_mass_err = 0.0;
+            int h = 0;
+            float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+            // Extract per-head K, V
+            std::vector<float> K_h(T * d_k), V_h(T * d_v);
+            for (int j = 0; j < T; j++) {
+                memcpy(K_h.data() + j * d_k, K.data() + j * n_embd_k + h * d_k, d_k * sizeof(float));
+                memcpy(V_h.data() + j * d_v, V.data() + j * n_embd_v + h * d_v, d_v * sizeof(float));
+            }
+
+            for (int qi = 0; qi < n_q; qi++) {
+                const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+                // Original output
+                std::vector<float> orig_out(d_v), comp_out(d_v);
+                compute_original_output(q, K_h.data(), V_h.data(), T, d_k, d_v, orig_out.data());
+                compute_compacted_output(q, K_h.data(), result.beta[h],
+                                         result.C_v[h], result.selected_indices,
+                                         result.t, d_k, d_v, comp_out.data());
+
+                // Perplexity: project to vocab logits
+                std::vector<float> logits_o(vocab_size), logits_c(vocab_size);
+                for (int v = 0; v < vocab_size; v++) {
+                    float dot_o = 0.0f, dot_c = 0.0f;
+                    for (int d = 0; d < d_v; d++) {
+                        dot_o += orig_out[d] * W_vocab[d * vocab_size + v];
+                        dot_c += comp_out[d] * W_vocab[d * vocab_size + v];
+                    }
+                    logits_o[v] = dot_o;
+                    logits_c[v] = dot_c;
+                }
+                softmax_rows(logits_o.data(), 1, vocab_size);
+                softmax_rows(logits_c.data(), 1, vocab_size);
+
+                // PPL target = original's argmax
+                int target = 0;
+                for (int v = 1; v < vocab_size; v++)
+                    if (logits_o[v] > logits_o[target]) target = v;
+                log_prob_orig += log(logits_o[target] + 1e-12);
+                log_prob_comp += log(logits_c[target] + 1e-12);
+
+                // KL divergence
+                double kl = 0.0;
+                for (int v = 0; v < vocab_size; v++) {
+                    double pv = logits_o[v] + 1e-12;
+                    double qv = logits_c[v] + 1e-12;
+                    kl += pv * log(pv / qv);
+                }
+                if (kl < 0.0) kl = 0.0;
+                sum_kl += kl;
+                if (kl > max_kl) max_kl = kl;
+
+                // Attention mass preservation
+                std::vector<float> scores_orig(T);
+                float max_score = -1e30f;
+                for (int j = 0; j < T; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++) dot += q[d] * K_h[j * d_k + d];
+                    scores_orig[j] = dot * inv_sqrt_dk;
+                    if (scores_orig[j] > max_score) max_score = scores_orig[j];
+                }
+                double mass_orig = 0.0;
+                for (int j = 0; j < T; j++) mass_orig += exp(scores_orig[j] - max_score);
+
+                double mass_comp = 0.0;
+                for (int j = 0; j < result.t; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++)
+                        dot += q[d] * K_h[result.selected_indices[j] * d_k + d];
+                    float score = dot * inv_sqrt_dk + result.beta[h][j];
+                    mass_comp += exp(score - max_score);
+                }
+
+                double rel_err = fabs(mass_comp - mass_orig) / (mass_orig + 1e-12);
+                sum_mass_err += rel_err;
+                if (rel_err > max_mass_err) max_mass_err = rel_err;
+            }
+
+            double ppl_orig = exp(-log_prob_orig / n_q);
+            double ppl_comp = exp(-log_prob_comp / n_q);
+
+            results[mi][ri].ppl_ratio     = ppl_comp / ppl_orig;
+            results[mi][ri].avg_kl        = sum_kl / n_q;
+            results[mi][ri].max_kl        = max_kl;
+            results[mi][ri].avg_mass_err  = sum_mass_err / n_q;
+            results[mi][ri].max_mass_err  = max_mass_err;
+
+            printf("  %8.4f", ppl_comp / ppl_orig);
+
+            kv_compact_result_free(&result);
+        }
+        printf("\n");
+    }
+
+    // --- KL Divergence ---
+    printf("\n  Avg KL divergence (lower = better, 0 = identical):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].avg_kl);
+        printf("\n");
+    }
+
+    // --- Max KL ---
+    printf("\n  Max KL divergence (worst-case query):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].max_kl);
+        printf("\n");
+    }
+
+    // --- Mass Preservation ---
+    printf("\n  Avg attention mass relative error (lower = better):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].avg_mass_err);
+        printf("\n");
+    }
+
+    printf("\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -801,6 +1104,7 @@ int main() {
     bench_mass_preservation();
     bench_throughput_scaling();
     bench_eviction_vs_compaction();
+    bench_method_comparison_extreme();
     bench_chunked_quality();
     bench_chunked_throughput_scaling();
 
