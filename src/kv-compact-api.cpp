@@ -265,6 +265,12 @@ kv_compact_params kv_compact_params_default(void) {
     p.n_shared_prefix = 0;
     p.use_cheap_qref = 0;
     p.skip_beta = 1;
+    p.score_method = 1;          // RMS (paper default, Section 3.1)
+    p.use_omp = 0;
+    p.omp_k_choice = 1;
+    p.omp_refit_interval = 1;
+    p.nnls_method = 1;           // PGD (paper's Algorithm 3)
+    p.nnls_pgd_iters = 0;       // clamped LS only (paper default)
     p.chunk_size = 0;
     p.n_threads = 0;
     p.layer_filter = NULL;
@@ -536,17 +542,23 @@ int kv_compact(
 
     // Fused post-processing: softmax + per-key importance
     // When skip_beta, use lighter version (no exp_scores/row_sums needed)
+    int score_agg = p.score_method;  // 0=max, 1=rms, 2=mean
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
         std::vector<float> head_imp(T);
 
-        if (p.skip_beta) {
+        if (p.skip_beta && !p.use_omp) {
             softmax_importance_fused(hc.scores.data(), hc.attn_weights.data(),
-                                     head_imp.data(), n_q_used, T);
+                                     head_imp.data(), n_q_used, T, score_agg);
         } else {
+            // OMP needs exp_scores and row_sums even when skip_beta is set
+            if (p.use_omp && p.skip_beta) {
+                hc.exp_scores.resize(n_q_used * T);
+                hc.row_sums.resize(n_q_used);
+            }
             exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
                                          hc.row_sums.data(), hc.attn_weights.data(),
-                                         head_imp.data(), n_q_used, T);
+                                         head_imp.data(), n_q_used, T, score_agg);
         }
 
         if (p.use_sensitivity) {
@@ -566,9 +578,33 @@ int kv_compact(
                                        T, n_head_kv, global_importance.data());
     }
 
-    // Key selection: diversity-aware or standard
+    // Key selection: OMP, diversity-aware, or standard
     std::vector<int> selected;
-    if (p.use_diversity) {
+    std::vector<float> omp_weights;  // only used when use_omp && !skip_beta
+
+    if (p.use_omp) {
+        // OMP key selection (Algorithm 1) — operates on combined exp_scores
+        // across all heads. For multi-head, we sum the exp_scores and row_sums.
+        std::vector<float> combined_exp(n_q_used * T, 0.0f);
+        std::vector<float> combined_sums(n_q_used, 0.0f);
+
+        for (int h = 0; h < n_head_kv; h++) {
+            const auto & hc = hcache[0][h];
+            for (int i = 0; i < n_q_used * T; i++) {
+                combined_exp[i] += hc.exp_scores[i];
+            }
+            for (int i = 0; i < n_q_used; i++) {
+                combined_sums[i] += hc.row_sums[i];
+            }
+        }
+
+        selected.resize(t);
+        omp_weights.resize(t);
+        omp_select_keys(combined_exp.data(), combined_sums.data(),
+                        T, n_q_used, t,
+                        selected.data(), omp_weights.data(),
+                        p.omp_k_choice, p.omp_refit_interval, p.nnls_pgd_iters);
+    } else if (p.use_diversity) {
         selected = select_keys_diverse(global_importance.data(), K_all,
                                        T, t, n_embd_k, p.diversity_strength,
                                        p.n_shared_prefix);
@@ -649,6 +685,24 @@ int kv_compact(
         if (p.skip_beta) {
             // Skip NNLS: beta = 0, go straight to LS value refit
             std::fill(beta_vecs[h].begin(), beta_vecs[h].end(), 0.0f);
+        } else if (p.use_omp && !omp_weights.empty()) {
+            // OMP already computed per-key weights; derive per-head beta from them.
+            // For multi-head, re-solve NNLS per head on the OMP-selected keys.
+            std::vector<float> M(n_q_used * t);
+            for (int qi = 0; qi < n_q_used; qi++) {
+                for (int j = 0; j < t; j++) {
+                    M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+                }
+            }
+            std::vector<float> w(t);
+            if (p.nnls_method == 0) {
+                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+            } else {
+                nnls_pgd_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, 1e-12f, p.nnls_pgd_iters);
+            }
+            for (int j = 0; j < t; j++) {
+                beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+            }
         } else {
             // NNLS for beta (Section 3.2)
             std::vector<float> M(n_q_used * t);
@@ -659,7 +713,11 @@ int kv_compact(
             }
 
             std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+            if (p.nnls_method == 0) {
+                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+            } else {
+                nnls_pgd_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, 1e-12f, p.nnls_pgd_iters);
+            }
 
             for (int j = 0; j < t; j++) {
                 beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
@@ -746,7 +804,11 @@ int kv_compact(
                     }
 
                     std::vector<float> w(t);
-                    nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+                    if (p.nnls_method == 0) {
+                        nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+                    } else {
+                        nnls_pgd_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, 1e-12f, p.nnls_pgd_iters);
+                    }
 
                     for (int j = 0; j < t; j++) {
                         beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));

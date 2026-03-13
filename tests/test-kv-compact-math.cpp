@@ -231,6 +231,134 @@ static void test_nnls_overdetermined() {
 }
 
 // ============================================================================
+// PGD NNLS solver tests
+// ============================================================================
+
+static void test_nnls_pgd_basic() {
+    printf("  test_nnls_pgd_basic...");
+    float A[] = {1, 0, 0, 1};
+    float b[] = {3.0f, 7.0f};
+    float w[2] = {};
+    nnls_pgd_solve(A, b, w, 2, 2);
+    assert(approx_eq(w[0], 3.0f, 0.01f));
+    assert(approx_eq(w[1], 7.0f, 0.01f));
+    printf(" OK\n");
+}
+
+static void test_nnls_pgd_clamping() {
+    printf("  test_nnls_pgd_clamping...");
+    float A[] = {1, 0, 0, 1};
+    float b[] = {-1.0f, 5.0f};
+    float w[2] = {};
+    nnls_pgd_solve(A, b, w, 2, 2);
+    assert(w[0] >= 0.0f);
+    assert(approx_eq(w[1], 5.0f, 0.01f));
+    printf(" OK\n");
+}
+
+static void test_nnls_pgd_with_iters() {
+    printf("  test_nnls_pgd_with_iters...");
+    float A[] = {1, 1, 1};
+    float b[] = {2.0f, 3.0f, 4.0f};
+    float w[1] = {};
+    nnls_pgd_solve(A, b, w, 3, 1, 1e-12f, 50);
+    assert(approx_eq(w[0], 3.0f, 0.2f));
+    printf(" OK\n");
+}
+
+// ============================================================================
+// OMP key selection tests
+// ============================================================================
+
+static void test_omp_select_basic() {
+    printf("  test_omp_select_basic...");
+    int T = 8, n_q = 4, t = 3;
+    std::vector<float> exp_scores(n_q * T, 0.1f);
+    std::vector<float> row_sums(n_q);
+
+    for (int i = 0; i < n_q; i++) {
+        exp_scores[i * T + 0] = 10.0f;
+        exp_scores[i * T + 7] = 5.0f;
+        exp_scores[i * T + 3] = 3.0f;
+    }
+    for (int i = 0; i < n_q; i++) {
+        float s = 0.0f;
+        for (int j = 0; j < T; j++) s += exp_scores[i * T + j];
+        row_sums[i] = s;
+    }
+
+    std::vector<int> selected(t);
+    std::vector<float> w_out(t);
+    omp_select_keys(exp_scores.data(), row_sums.data(), T, n_q, t,
+                    selected.data(), w_out.data());
+
+    // Key 0 should always be selected first (highest correlation)
+    bool has_0 = false;
+    for (int j = 0; j < t; j++) if (selected[j] == 0) has_0 = true;
+    assert(has_0);
+    // All selected should be sorted and distinct
+    for (int j = 1; j < t; j++) assert(selected[j] > selected[j-1]);
+    // Weights should all be positive
+    for (int j = 0; j < t; j++) assert(w_out[j] > 0.0f);
+    printf(" OK\n");
+}
+
+static void test_omp_select_with_kchoice() {
+    printf("  test_omp_select_with_kchoice...");
+    int T = 8, n_q = 4, t = 4;
+    std::vector<float> exp_scores(n_q * T, 0.1f);
+    std::vector<float> row_sums(n_q);
+
+    for (int i = 0; i < n_q; i++) {
+        exp_scores[i * T + 0] = 10.0f;
+        exp_scores[i * T + 7] = 5.0f;
+        exp_scores[i * T + 3] = 3.0f;
+        exp_scores[i * T + 5] = 2.0f;
+    }
+    for (int i = 0; i < n_q; i++) {
+        float s = 0.0f;
+        for (int j = 0; j < T; j++) s += exp_scores[i * T + j];
+        row_sums[i] = s;
+    }
+
+    std::vector<int> selected(t);
+    std::vector<float> w_out(t);
+    omp_select_keys(exp_scores.data(), row_sums.data(), T, n_q, t,
+                    selected.data(), w_out.data(), 2, 1);
+
+    for (int j = 1; j < t; j++) assert(selected[j] > selected[j-1]);
+    printf(" OK\n");
+}
+
+// ============================================================================
+// Score aggregation tests
+// ============================================================================
+
+static void test_score_agg_rms() {
+    printf("  test_score_agg_rms...");
+    // 2 queries, 3 keys
+    float scores[] = {1.0f, 2.0f, 0.5f,
+                      0.5f, 1.0f, 2.0f};
+    float sm_out[6], imp_max[3], imp_rms[3], imp_mean[3];
+
+    softmax_importance_fused(scores, sm_out, imp_max, 2, 3, SCORE_AGG_MAX);
+    softmax_importance_fused(scores, sm_out, imp_rms, 2, 3, SCORE_AGG_RMS);
+    softmax_importance_fused(scores, sm_out, imp_mean, 2, 3, SCORE_AGG_MEAN);
+
+    // All should be non-negative
+    for (int j = 0; j < 3; j++) {
+        assert(imp_max[j] >= 0.0f);
+        assert(imp_rms[j] >= 0.0f);
+        assert(imp_mean[j] >= 0.0f);
+    }
+    // RMS should be >= mean (by Jensen's inequality)
+    for (int j = 0; j < 3; j++) {
+        assert(imp_rms[j] >= imp_mean[j] - 1e-6f);
+    }
+    printf(" OK\n");
+}
+
+// ============================================================================
 // least_squares_solve tests
 // ============================================================================
 
@@ -1408,10 +1536,22 @@ int main() {
     test_exp_rows_stable_basic();
     test_exp_rows_stable_large_values();
 
-    printf("\n=== NNLS solver ===\n");
+    printf("\n=== NNLS solver (Lawson-Hanson) ===\n");
     test_nnls_identity();
     test_nnls_non_negative_constraint();
     test_nnls_overdetermined();
+
+    printf("\n=== NNLS solver (PGD — paper's Algorithm 3) ===\n");
+    test_nnls_pgd_basic();
+    test_nnls_pgd_clamping();
+    test_nnls_pgd_with_iters();
+
+    printf("\n=== OMP key selection ===\n");
+    test_omp_select_basic();
+    test_omp_select_with_kchoice();
+
+    printf("\n=== Score aggregation methods ===\n");
+    test_score_agg_rms();
 
     printf("\n=== Least squares solver ===\n");
     test_least_squares_identity();

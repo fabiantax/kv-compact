@@ -116,6 +116,31 @@ typedef struct kv_compact_params {
                                // while eliminating the O(n_q*t^2) NNLS bottleneck.
                                // at 2048 tokens this is 6.75x faster with 0.9999 vs 0.9994 cos sim.
 
+    int    score_method;       // key importance aggregation across queries (default: 1 = RMS)
+                               //   0 = max: max_i softmax[i,j] — fast, original default
+                               //   1 = rms: sqrt(mean_i(softmax[i,j]^2)) — paper default (Section 3.1)
+                               //   2 = mean: mean_i softmax[i,j]
+                               // The paper (Section 3.1) found RMS "more robust than mean or max".
+
+    int    use_omp;            // use OMP key selection (0=disabled, default: 0)
+                               // when enabled, uses Orthogonal Matching Pursuit (Algorithm 1)
+                               // to greedily select keys that best approximate the partition
+                               // function. This is the paper's best method (AM-OMP) but slower
+                               // than highest-attention selection.
+    int    omp_k_choice;       // OMP: keys to select per iteration (default: 1)
+                               //   1 = standard OMP (best quality, slowest)
+                               //   4 = fast OMP (paper's AM-OMP-fast, 4-8x speedup)
+    int    omp_refit_interval; // OMP: NNLS refit interval (default: 1)
+                               //   1 = refit every iteration (standard)
+                               //   2 = refit every other iteration (paper's fast variant)
+
+    int    nnls_method;        // NNLS solver method (default: 1 = PGD)
+                               //   0 = Lawson-Hanson active-set (exact, finite convergence)
+                               //   1 = projected gradient descent (paper's Algorithm 3)
+    int    nnls_pgd_iters;     // PGD iterations for NNLS refinement (default: 0)
+                               //   0 = clamped LS only (paper's default, fast)
+                               //  >0 = additional PGD refinement steps
+
     int    chunk_size;         // chunk size for chunked compaction (default: 0 = auto)
                                //   0 = auto: target t_chunk ≤ 256 (chunk = ceil(256/ratio))
                                //             e.g., ratio=0.5 → chunk=512, ratio=0.2 → chunk=1280

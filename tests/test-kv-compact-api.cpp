@@ -31,6 +31,12 @@ static void test_params_default() {
     assert(p.use_sensitivity == 0);
     assert(p.ridge > 0.0f);
     assert(p.nnls_max_iter > 0);
+    assert(p.score_method == 1);         // RMS (paper default)
+    assert(p.use_omp == 0);
+    assert(p.omp_k_choice == 1);
+    assert(p.omp_refit_interval == 1);
+    assert(p.nnls_method == 1);          // PGD (paper default)
+    assert(p.nnls_pgd_iters == 0);
     printf(" OK\n");
 }
 
@@ -1135,6 +1141,217 @@ static void test_chunked_1M() {
 // Main
 // ============================================================================
 
+// ============================================================================
+// Score aggregation method tests
+// ============================================================================
+
+static void test_score_method_rms() {
+    printf("  test_score_method_rms...");
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 42);
+    gen_data(V.data(), T * n_embd_v, 43);
+    gen_data(Q.data(), n_q * n_embd_k, 44);
+
+    // Compare all three score methods
+    float cos_max = 0, cos_rms = 0, cos_mean = 0;
+    for (int method = 0; method <= 2; method++) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.score_method = method;
+        p.chunk_size = -1;
+
+        kv_compact_result r = {};
+        int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &r);
+        assert(rc == 0);
+        assert(r.t == 32);
+
+        if (method == 0) cos_max = r.stats.avg_cosine_sim;
+        else if (method == 1) cos_rms = r.stats.avg_cosine_sim;
+        else cos_mean = r.stats.avg_cosine_sim;
+
+        kv_compact_result_free(&r);
+    }
+
+    printf("\n    max=%.6f rms=%.6f mean=%.6f", cos_max, cos_rms, cos_mean);
+    // All methods should produce reasonable quality
+    assert(cos_max > 0.99f);
+    assert(cos_rms > 0.99f);
+    assert(cos_mean > 0.99f);
+    printf(" OK\n");
+}
+
+// ============================================================================
+// OMP key selection tests
+// ============================================================================
+
+static void test_omp_basic() {
+    printf("  test_omp_basic...");
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 100);
+    gen_data(V.data(), T * n_embd_v, 200);
+    gen_data(Q.data(), n_q * n_embd_k, 300);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.use_omp = 1;
+    p.skip_beta = 0;
+    p.chunk_size = -1;
+
+    kv_compact_result r = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &r);
+    assert(rc == 0);
+    assert(r.t == 32);
+    assert(r.stats.avg_cosine_sim > 0.95f);
+    printf("\n    OMP+beta: cos=%.6f mse=%.8f", r.stats.avg_cosine_sim, r.stats.avg_mse);
+    kv_compact_result_free(&r);
+    printf(" OK\n");
+}
+
+static void test_omp_fast() {
+    printf("  test_omp_fast...");
+    const int T = 128, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 100);
+    gen_data(V.data(), T * n_embd_v, 200);
+    gen_data(Q.data(), n_q * n_embd_k, 300);
+
+    // AM-OMP-fast: k_choice=4, refit_interval=2 (paper's fast variant)
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.use_omp = 1;
+    p.omp_k_choice = 4;
+    p.omp_refit_interval = 2;
+    p.skip_beta = 1;
+    p.chunk_size = -1;
+
+    kv_compact_result r = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &r);
+    assert(rc == 0);
+    assert(r.t == 64);
+    assert(r.stats.avg_cosine_sim > 0.95f);
+    printf("\n    OMP-fast(k=4,int=2): cos=%.6f", r.stats.avg_cosine_sim);
+    kv_compact_result_free(&r);
+    printf(" OK\n");
+}
+
+static void test_omp_vs_highest_attn() {
+    printf("  test_omp_vs_highest_attn...");
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 77);
+    gen_data(V.data(), T * n_embd_v, 78);
+    gen_data(Q.data(), n_q * n_embd_k, 79);
+
+    // OMP
+    kv_compact_params p_omp = kv_compact_params_default();
+    p_omp.target_ratio = 0.3f;
+    p_omp.use_omp = 1;
+    p_omp.skip_beta = 0;
+    p_omp.chunk_size = -1;
+
+    kv_compact_result r_omp = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_omp, &r_omp);
+
+    // Highest attention keys
+    kv_compact_params p_hat = kv_compact_params_default();
+    p_hat.target_ratio = 0.3f;
+    p_hat.skip_beta = 0;
+    p_hat.chunk_size = -1;
+
+    kv_compact_result r_hat = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_hat, &r_hat);
+
+    printf("\n    OMP:          cos=%.6f mse=%.8f", r_omp.stats.avg_cosine_sim, r_omp.stats.avg_mse);
+    printf("\n    HighestAttn:  cos=%.6f mse=%.8f", r_hat.stats.avg_cosine_sim, r_hat.stats.avg_mse);
+
+    // Both should produce reasonable quality
+    assert(r_omp.stats.avg_cosine_sim > 0.95f);
+    assert(r_hat.stats.avg_cosine_sim > 0.95f);
+
+    kv_compact_result_free(&r_omp);
+    kv_compact_result_free(&r_hat);
+    printf(" OK\n");
+}
+
+// ============================================================================
+// NNLS solver method tests
+// ============================================================================
+
+static void test_nnls_method_pgd() {
+    printf("  test_nnls_method_pgd...");
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 55);
+    gen_data(V.data(), T * n_embd_v, 56);
+    gen_data(Q.data(), n_q * n_embd_k, 57);
+
+    // PGD solver (paper default)
+    kv_compact_params p_pgd = kv_compact_params_default();
+    p_pgd.target_ratio = 0.5f;
+    p_pgd.skip_beta = 0;
+    p_pgd.nnls_method = 1;  // PGD
+    p_pgd.nnls_pgd_iters = 0;  // clamped LS only
+    p_pgd.chunk_size = -1;
+
+    kv_compact_result r_pgd = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_pgd, &r_pgd);
+    assert(rc == 0);
+
+    // Lawson-Hanson solver
+    kv_compact_params p_lh = kv_compact_params_default();
+    p_lh.target_ratio = 0.5f;
+    p_lh.skip_beta = 0;
+    p_lh.nnls_method = 0;  // Lawson-Hanson
+    p_lh.chunk_size = -1;
+
+    kv_compact_result r_lh = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_lh, &r_lh);
+
+    printf("\n    PGD(iters=0): cos=%.6f", r_pgd.stats.avg_cosine_sim);
+    printf("\n    Lawson-Hanson: cos=%.6f", r_lh.stats.avg_cosine_sim);
+
+    // Both should produce reasonable quality
+    assert(r_pgd.stats.avg_cosine_sim > 0.99f);
+    assert(r_lh.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_result_free(&r_pgd);
+    kv_compact_result_free(&r_lh);
+    printf(" OK\n");
+}
+
+static void test_nnls_pgd_with_iters() {
+    printf("  test_nnls_pgd_with_iters...");
+    const int T = 64, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k, n_embd_v = n_head_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 55);
+    gen_data(V.data(), T * n_embd_v, 56);
+    gen_data(Q.data(), n_q * n_embd_k, 57);
+
+    // PGD with additional iterations
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.skip_beta = 0;
+    p.nnls_method = 1;
+    p.nnls_pgd_iters = 50;
+    p.chunk_size = -1;
+
+    kv_compact_result r = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &r);
+    assert(rc == 0);
+    assert(r.stats.avg_cosine_sim > 0.99f);
+    printf("\n    PGD(iters=50): cos=%.6f", r.stats.avg_cosine_sim);
+    kv_compact_result_free(&r);
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-api:\n\n");
 
@@ -1184,6 +1401,18 @@ int main() {
     test_layer_filter_count();
     test_layer_filter_should_compact();
     test_layer_filter_in_compaction();
+
+    printf("\n=== Score aggregation methods ===\n");
+    test_score_method_rms();
+
+    printf("\n=== OMP key selection ===\n");
+    test_omp_basic();
+    test_omp_fast();
+    test_omp_vs_highest_attn();
+
+    printf("\n=== NNLS solver methods ===\n");
+    test_nnls_method_pgd();
+    test_nnls_pgd_with_iters();
 
     printf("\n=== Chunked compaction ===\n");
     test_chunked_params_default();

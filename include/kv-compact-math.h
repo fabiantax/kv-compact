@@ -117,20 +117,33 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
     }
 }
 
+// Score aggregation methods for key importance across queries.
+// The paper (Section 3.1) recommends RMS as default; this implementation
+// also supports max (our original default) and mean.
+enum score_agg_method {
+    SCORE_AGG_MAX  = 0,   // max_i softmax[i,j] — fast, slightly less robust
+    SCORE_AGG_RMS  = 1,   // sqrt(mean_i(softmax[i,j]^2)) — paper default (Section 3.1)
+    SCORE_AGG_MEAN = 2,   // mean_i softmax[i,j]
+};
+
 // Fused exp + softmax + per-column importance in a single pass.
 //
 // Given scores [m × n], computes in one pass:
 //   exp_out[i,j]    = exp(scores[i,j] - max_row)     (unnormalized)
 //   row_sums[i]     = sum_j exp_out[i,j]              (partition function)
 //   softmax_out[i,j]= exp_out[i,j] / row_sums[i]     (normalized weights)
-//   importance[j]   = max_i softmax_out[i,j]          (per-key importance)
+//   importance[j]   = aggregated importance per key    (method-dependent)
+//
+// The agg parameter selects how per-query attention weights are aggregated
+// into a single importance score per key (see score_agg_method).
 //
 // Replaces: memcpy + exp_rows_stable + memcpy + softmax_rows + column-max loop
 // with a single pass over the data. This is 5 operations fused into 1.
 static void exp_softmax_importance_fused(
         const float * scores, float * exp_out, float * row_sums,
-        float * softmax_out, float * importance, int m, int n) {
-    // Zero importance
+        float * softmax_out, float * importance, int m, int n,
+        int agg = SCORE_AGG_MAX) {
+    // Zero importance (or init for sum-of-squares for RMS)
     memset(importance, 0, n * sizeof(float));
 
     for (int i = 0; i < m; i++) {
@@ -153,12 +166,31 @@ static void exp_softmax_importance_fused(
         }
         row_sums[i] = sum;
 
-        // Normalize and update column-max importance
+        // Normalize and update column importance
         float inv_sum = 1.0f / (sum + 1e-12f);
         for (int j = 0; j < n; j++) {
             float sm = exp_row[j] * inv_sum;
             sm_row[j] = sm;
-            if (sm > importance[j]) importance[j] = sm;
+            if (agg == SCORE_AGG_MAX) {
+                if (sm > importance[j]) importance[j] = sm;
+            } else if (agg == SCORE_AGG_RMS) {
+                importance[j] += sm * sm;  // accumulate squares
+            } else { // SCORE_AGG_MEAN
+                importance[j] += sm;
+            }
+        }
+    }
+
+    // Finalize aggregation
+    if (agg == SCORE_AGG_RMS) {
+        float inv_m = 1.0f / (float)m;
+        for (int j = 0; j < n; j++) {
+            importance[j] = sqrtf(importance[j] * inv_m);
+        }
+    } else if (agg == SCORE_AGG_MEAN) {
+        float inv_m = 1.0f / (float)m;
+        for (int j = 0; j < n; j++) {
+            importance[j] *= inv_m;
         }
     }
 }
@@ -167,7 +199,8 @@ static void exp_softmax_importance_fused(
 // When beta is skipped, we don't need exp_scores or row_sums.
 // Saves memory allocation and avoids unnecessary buffer writes.
 static void softmax_importance_fused(
-        const float * scores, float * softmax_out, float * importance, int m, int n) {
+        const float * scores, float * softmax_out, float * importance, int m, int n,
+        int agg = SCORE_AGG_MAX) {
     memset(importance, 0, n * sizeof(float));
 
     for (int i = 0; i < m; i++) {
@@ -190,7 +223,26 @@ static void softmax_importance_fused(
         for (int j = 0; j < n; j++) {
             float sm = sm_row[j] * inv_sum;
             sm_row[j] = sm;
-            if (sm > importance[j]) importance[j] = sm;
+            if (agg == SCORE_AGG_MAX) {
+                if (sm > importance[j]) importance[j] = sm;
+            } else if (agg == SCORE_AGG_RMS) {
+                importance[j] += sm * sm;
+            } else { // SCORE_AGG_MEAN
+                importance[j] += sm;
+            }
+        }
+    }
+
+    // Finalize aggregation
+    if (agg == SCORE_AGG_RMS) {
+        float inv_m = 1.0f / (float)m;
+        for (int j = 0; j < n; j++) {
+            importance[j] = sqrtf(importance[j] * inv_m);
+        }
+    } else if (agg == SCORE_AGG_MEAN) {
+        float inv_m = 1.0f / (float)m;
+        for (int j = 0; j < n; j++) {
+            importance[j] *= inv_m;
         }
     }
 }
@@ -609,6 +661,291 @@ static void apply_beta_to_keys(float * K_all, int n_embd_k_gqa,
         for (int d = 0; d < d_k; d++) {
             k_row[d] += b_scaled * direction[d];
         }
+    }
+}
+
+// ============================================================================
+// Projected gradient descent NNLS solver (paper's Algorithm 3)
+// ============================================================================
+
+// Solve non-negative least squares via projected gradient descent:
+//   min_{w >= eps} ||A*w - b||^2
+//
+// This matches the paper's Appendix C.2 (Algorithm 3):
+//   1. Compute unconstrained least-squares solution via normal equations
+//   2. Clamp to enforce w >= eps
+//   3. If iters > 0, refine via projected gradient descent with step size 1/L
+//      where L ≈ ||A||_2^2 estimated via power iteration.
+//
+// A is (m x n), b is (m), w is (n)
+// eps: lower bound (default 1e-12)
+// iters: PGD iterations (0 = clamped LS only, matching paper's default)
+static void nnls_pgd_solve(const float * A, const float * b, float * w,
+                            int m, int n, float eps = 1e-12f, int iters = 0) {
+    // Precompute A^T*A and A^T*b
+    std::vector<float> AtA(n * n);
+    std::vector<float> Atb(n);
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < m; k++) {
+                sum += A[k * n + i] * A[k * n + j];
+            }
+            AtA[i * n + j] = sum;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        float sum = 0.0f;
+        for (int k = 0; k < m; k++) {
+            sum += A[k * n + i] * b[k];
+        }
+        Atb[i] = sum;
+    }
+
+    // Step 1: Unconstrained least-squares via normal equations (with small ridge)
+    {
+        std::vector<float> aug(n * (n + 1));
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                aug[i * (n + 1) + j] = AtA[i * n + j];
+            }
+            aug[i * (n + 1) + i] += 1e-10f;  // tiny ridge for stability
+            aug[i * (n + 1) + n] = Atb[i];
+        }
+
+        // Gaussian elimination with partial pivoting
+        for (int col = 0; col < n; col++) {
+            int max_row = col;
+            float max_val = fabsf(aug[col * (n + 1) + col]);
+            for (int row = col + 1; row < n; row++) {
+                float val = fabsf(aug[row * (n + 1) + col]);
+                if (val > max_val) { max_val = val; max_row = row; }
+            }
+            if (max_row != col) {
+                for (int j = 0; j < n + 1; j++)
+                    std::swap(aug[col * (n + 1) + j], aug[max_row * (n + 1) + j]);
+            }
+            float pivot = aug[col * (n + 1) + col];
+            if (fabsf(pivot) < 1e-12f) continue;
+            for (int row = col + 1; row < n; row++) {
+                float factor = aug[row * (n + 1) + col] / pivot;
+                for (int j = col; j < n + 1; j++)
+                    aug[row * (n + 1) + j] -= factor * aug[col * (n + 1) + j];
+            }
+        }
+        for (int col = n - 1; col >= 0; col--) {
+            float pivot = aug[col * (n + 1) + col];
+            if (fabsf(pivot) < 1e-12f) { w[col] = eps; continue; }
+            float val = aug[col * (n + 1) + n];
+            for (int row = col + 1; row < n; row++)
+                val -= aug[col * (n + 1) + row] * w[row];
+            w[col] = val / pivot;
+        }
+    }
+
+    // Step 2: Clamp to enforce w >= eps
+    for (int i = 0; i < n; i++) {
+        if (w[i] < eps) w[i] = eps;
+    }
+
+    if (iters <= 0) return;
+
+    // Step 3: Projected gradient descent
+    // Estimate L ≈ ||A||_2^2 via 3 power iteration steps
+    std::vector<float> u(n), v(m);
+    for (int i = 0; i < n; i++) u[i] = 1.0f / sqrtf((float)n);
+    for (int pw = 0; pw < 3; pw++) {
+        // v = A*u
+        for (int i = 0; i < m; i++) {
+            float s = 0.0f;
+            for (int j = 0; j < n; j++) s += A[i * n + j] * u[j];
+            v[i] = s;
+        }
+        float vn = 0.0f;
+        for (int i = 0; i < m; i++) vn += v[i] * v[i];
+        vn = sqrtf(vn);
+        if (vn < 1e-12f) break;
+        for (int i = 0; i < m; i++) v[i] /= vn;
+        // u = A^T*v
+        for (int j = 0; j < n; j++) {
+            float s = 0.0f;
+            for (int i = 0; i < m; i++) s += A[i * n + j] * v[i];
+            u[j] = s;
+        }
+        float un = 0.0f;
+        for (int j = 0; j < n; j++) un += u[j] * u[j];
+        un = sqrtf(un);
+        if (un < 1e-12f) break;
+        for (int j = 0; j < n; j++) u[j] /= un;
+    }
+    // L = u^T * AtA * u
+    float L = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float s = 0.0f;
+        for (int j = 0; j < n; j++) s += AtA[i * n + j] * u[j];
+        L += u[i] * s;
+    }
+    if (L < 1e-6f) L = 1e-6f;
+    float eta = 1.0f / L;
+
+    // PGD iterations: w = clamp(w - eta * grad, eps, inf)
+    std::vector<float> grad(n);
+    for (int iter = 0; iter < iters; iter++) {
+        // grad = AtA * w - Atb
+        for (int i = 0; i < n; i++) {
+            float s = 0.0f;
+            for (int j = 0; j < n; j++) s += AtA[i * n + j] * w[j];
+            grad[i] = s - Atb[i];
+        }
+        for (int i = 0; i < n; i++) {
+            w[i] -= eta * grad[i];
+            if (w[i] < eps) w[i] = eps;
+        }
+    }
+}
+
+// ============================================================================
+// OMP key selection (paper's Algorithm 1, Section 3.3)
+// ============================================================================
+
+// Select t keys via Orthogonal Matching Pursuit on the attention mass.
+//
+// The paper's best method (AM-OMP) greedily selects keys to minimize the
+// attention mass residual. At each step:
+//   1. Compute residual r = target - current approximation
+//   2. Select the key with highest correlation to r
+//   3. Re-solve NNLS for weights w on selected keys
+//
+// Parameters:
+//   exp_scores: [n_q × T] unnormalized exp(q@k/sqrt(d) - max) per row
+//   row_sums:   [n_q] partition function sum per query
+//   T:          total number of keys
+//   n_q:        number of reference queries
+//   t:          target number of keys to select
+//   selected:   [t] output selected indices (sorted)
+//   w_out:      [t] output NNLS weights (beta = log(w))
+//   k_choice:   number of keys to select per iteration (default: 1)
+//               k_choice=4 with refit_interval=2 gives 4-8x speedup
+//   refit_interval: solve NNLS every N iterations (default: 1)
+//   nnls_iters: PGD iterations for NNLS refinement (default: 0)
+static void omp_select_keys(
+        const float * exp_scores, const float * row_sums,
+        int T, int n_q, int t,
+        int * selected, float * w_out,
+        int k_choice = 1, int refit_interval = 1, int nnls_iters = 0) {
+
+    std::vector<bool> mask(T, false);
+    std::vector<float> current(n_q, 0.0f);  // current approximation
+    std::vector<int> sel_order;
+    sel_order.reserve(t);
+
+    // Temporary for NNLS
+    std::vector<float> prev_w;
+
+    int iteration = 0;
+    while ((int)sel_order.size() < t) {
+        // Compute residual
+        std::vector<float> residual(n_q);
+        for (int i = 0; i < n_q; i++) {
+            residual[i] = row_sums[i] - current[i];
+        }
+
+        // Correlation of each key with residual
+        std::vector<float> corr(T, 0.0f);
+        for (int j = 0; j < T; j++) {
+            if (mask[j]) continue;
+            float c = 0.0f;
+            for (int i = 0; i < n_q; i++) {
+                c += exp_scores[i * T + j] * residual[i];
+            }
+            corr[j] = c;
+        }
+
+        // Select top k_choice keys by correlation
+        int remaining = t - (int)sel_order.size();
+        int k_sel = k_choice < remaining ? k_choice : remaining;
+        int available = T - (int)sel_order.size();
+        if (k_sel > available) k_sel = available;
+        if (k_sel <= 0) break;
+
+        // Find top k_sel indices
+        for (int k = 0; k < k_sel; k++) {
+            int best = -1;
+            float best_c = -1e30f;
+            for (int j = 0; j < T; j++) {
+                if (mask[j]) continue;
+                if (corr[j] > best_c) { best_c = corr[j]; best = j; }
+            }
+            if (best < 0) break;
+            sel_order.push_back(best);
+            mask[best] = true;
+            corr[best] = -1e30f;
+        }
+
+        int cur_t = (int)sel_order.size();
+
+        // Solve NNLS (or reuse previous weights)
+        bool should_solve = (refit_interval <= 1) || (iteration % refit_interval == 0)
+                            || (cur_t == t);  // always solve on last iteration
+
+        if (should_solve) {
+            // Build design matrix M: [n_q × cur_t]
+            std::vector<float> M(n_q * cur_t);
+            for (int i = 0; i < n_q; i++) {
+                for (int j = 0; j < cur_t; j++) {
+                    M[i * cur_t + j] = exp_scores[i * T + sel_order[j]];
+                }
+            }
+
+            std::vector<float> w(cur_t);
+            nnls_pgd_solve(M.data(), row_sums, w.data(), n_q, cur_t, 1e-12f, nnls_iters);
+            prev_w = w;
+
+            // Update current approximation
+            for (int i = 0; i < n_q; i++) {
+                float s = 0.0f;
+                for (int j = 0; j < cur_t; j++) {
+                    s += M[i * cur_t + j] * w[j];
+                }
+                current[i] = s;
+            }
+        } else {
+            // Extend previous weights with eps for new entries
+            std::vector<float> w(cur_t, 1e-12f);
+            for (int j = 0; j < (int)prev_w.size() && j < cur_t; j++) {
+                w[j] = prev_w[j];
+            }
+            prev_w = w;
+
+            // Update current approximation
+            for (int i = 0; i < n_q; i++) {
+                float s = 0.0f;
+                for (int j = 0; j < cur_t; j++) {
+                    s += exp_scores[i * T + sel_order[j]] * w[j];
+                }
+                current[i] = s;
+            }
+        }
+
+        iteration++;
+    }
+
+    // Sort selected indices for cache locality, maintaining weight mapping
+    int actual_t = (int)sel_order.size();
+    std::vector<int> order(actual_t);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return sel_order[a] < sel_order[b]; });
+
+    for (int j = 0; j < actual_t; j++) {
+        selected[j] = sel_order[order[j]];
+        w_out[j] = (j < (int)prev_w.size()) ? prev_w[order[j]] : 1e-12f;
+    }
+    // Zero-fill if we got fewer than t
+    for (int j = actual_t; j < t; j++) {
+        selected[j] = 0;
+        w_out[j] = 1e-12f;
     }
 }
 
