@@ -441,7 +441,9 @@ static void bench_throughput_scaling() {
     const int n_embd_v = n_head_kv * d_v;
     const int n_q = 64;
 
-    int T_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096, 10240, 102400};
+    // NOTE: T>10k at 50% retention causes OOM in LS normal equations
+    // (t^2 matrix = 10GB+ at t=51200). Needs iterative solver or GPU for 100k.
+    int T_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096, 10240};
     float ratios[] = {0.5f, 0.2f};
 
     printf("  %-6s  %-8s  %8s  %12s  %14s\n",

@@ -175,6 +175,10 @@ static const bench_config configs[] = {
     {"medium-2L",   128,  64, 8,  64,  64, 2},
     {"large-4L",    256,  64, 8, 128, 128, 4},
     {"wide-heads",  128,  32, 32, 64,  64, 1},
+    {"1k-8h",      1024,  64, 8,  128, 128, 1},
+    {"5k-4h",      5120,  32, 4,   64,  64, 1},
+    {"10k-4h",    10240,  32, 4,   64,  64, 1},
+    {"10k-8h",    10240,  32, 8,  128, 128, 1},
 };
 static const int n_configs = sizeof(configs) / sizeof(configs[0]);
 
