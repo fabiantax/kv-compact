@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV Compact - Browser Example</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+
+    .container {
+      background: white;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+
+    h1 { color: #333; margin-bottom: 24px; }
+    h2 { color: #666; font-size: 18px; margin-top: 24px; }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 16px;
+      margin: 20px 0;
+    }
+
+    .stat-card {
+      background: #f8f9fa;
+      border-radius: 6px;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+      font-size: 24px;
+      font-weight: 600;
+      color: #333;
+      margin-top: 8px;
+    }
+
+    .stat-value.excellent { color: #28a745; }
+    .stat-value.good { color: #6c757d; }
+    .stat-value.fair { color: #ffc107; }
+
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 12px 24px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+
+    button:hover { background: #0056b3; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .log-output {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      border-radius: 6px;
+      padding: 16px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      max-height: 300px;
+      overflow-y: auto;
+      margin-top: 20px;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #e9ecef;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 16px 0;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: #007bff;
+      transition: width 0.3s ease;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .badge-success { background: #d4edda; color: #155724; }
+    .badge-warning { background: #fff3cd; color: #856404; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🚀 KV Cache Compaction Demo</h1>
+
+    <div id="status">
+      <span class="badge badge-warning">Initializing...</span>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Tokens</div>
+        <div class="stat-value" id="totalTokens">0</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Compacted Tokens</div>
+        <div class="stat-value" id="compactedTokens">0</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Compression Ratio</div>
+        <div class="stat-value" id="compressionRatio">0x</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Compaction Time</div>
+        <div class="stat-value" id="compactionTime">0 ms</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Quality Score</div>
+        <div class="stat-value" id="qualityScore">-</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Memory Saved</div>
+        <div class="stat-value" id="memorySaved">0 MB</div>
+      </div>
+    </div>
+
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+    </div>
+
+    <div>
+      <button id="compactBtn" disabled>Run Compaction</button>
+      <button id="streamBtn" disabled>Start Streaming</button>
+      <button id="resetBtn">Reset</button>
+    </div>
+
+    <h2>Event Log</h2>
+    <div class="log-output" id="logOutput"></div>
+  </div>
+
+  <script type="module">
+    import { StreamingCompactor, formatMetrics } from './src/compaction.ts';
+
+    const compactor = new StreamingCompactor({
+      triggerThreshold: 1000,
+      targetBudget: 500,
+      recentWindow: 100,
+      pinPrefix: 50,
+    });
+
+    const ui = {
+      status: document.getElementById('status'),
+      totalTokens: document.getElementById('totalTokens'),
+      compactedTokens: document.getElementById('compactedTokens'),
+      compressionRatio: document.getElementById('compressionRatio'),
+      compactionTime: document.getElementById('compactionTime'),
+      qualityScore: document.getElementById('qualityScore'),
+      memorySaved: document.getElementById('memorySaved'),
+      progressFill: document.getElementById('progressFill'),
+      logOutput: document.getElementById('logOutput'),
+      compactBtn: document.getElementById('compactBtn'),
+      streamBtn: document.getElementById('streamBtn'),
+      resetBtn: document.getElementById('resetBtn'),
+    };
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString();
+      ui.logOutput.innerHTML += `[${timestamp}] ${message}\n`;
+      ui.logOutput.scrollTop = ui.logOutput.scrollHeight;
+    }
+
+    function updateStats(metrics) {
+      ui.totalTokens.textContent = metrics.originalTokenCount.toLocaleString();
+      ui.compactedTokens.textContent = metrics.compactedTokenCount.toLocaleString();
+      ui.compressionRatio.textContent = `${metrics.compressionRatio.toFixed(1)}x`;
+      ui.compactionTime.textContent = `${metrics.compactionTimeMs.toFixed(1)} ms`;
+
+      ui.qualityScore.textContent = (metrics.qualityScore * 100).toFixed(1) + '%';
+      ui.qualityScore.className = 'stat-value ' +
+        (metrics.qualityScore > 0.95 ? 'excellent' :
+         metrics.qualityScore > 0.9 ? 'good' : 'fair');
+
+      ui.memorySaved.textContent = `${metrics.memorySavedMB.toFixed(1)} MB`;
+    }
+
+    function updateProgress(percent) {
+      ui.progressFill.style.width = `${percent}%`;
+    }
+
+    async function runCompaction() {
+      ui.compactBtn.disabled = true;
+      ui.streamBtn.disabled = true;
+
+      log('Starting compaction...');
+      updateProgress(0);
+
+      try {
+        // Simulate adding tokens
+        for (let i = 0; i < 100; i++) {
+          const zone = compactor.addTokens(10);
+          updateProgress((i + 1) * 0.3);
+        }
+
+        log(`Added 1000 tokens, cache size: ${compactor.getStats().cacheSize}`);
+
+        if (compactor.needsCompaction()) {
+          log('Trigger threshold reached, compacting...');
+          updateProgress(40);
+
+          const result = await compactor.compact();
+          updateProgress(100);
+
+          if (result.success && result.metrics) {
+            log(`✓ Compaction complete!`);
+            log(formatMetrics(result.metrics));
+            updateStats(result.metrics);
+
+            ui.status.innerHTML = '<span class="badge badge-success">Ready</span>';
+          } else {
+            log(`✗ Compaction failed: ${result.error}`);
+          }
+        }
+      } catch (error) {
+        log(`✗ Error: ${error.message}`);
+      }
+
+      ui.compactBtn.disabled = false;
+      ui.streamBtn.disabled = false;
+    }
+
+    async function startStreaming() {
+      ui.compactBtn.disabled = true;
+      ui.streamBtn.disabled = true;
+
+      log('Starting streaming compaction demo...');
+      log('Adding tokens incrementally...');
+
+      let totalTokens = 0;
+      const targetTokens = 2000;
+
+      const interval = setInterval(async () => {
+        const tokensToAdd = 50;
+        const zone = compactor.addTokens(tokensToAdd);
+        totalTokens += tokensToAdd;
+
+        log(`Added ${tokensToAdd} tokens (zone: ${zone}), total: ${totalTokens}`);
+
+        const stats = compactor.getStats();
+        updateProgress((totalTokens / targetTokens) * 100);
+
+        if (compactor.needsCompaction()) {
+          log('Trigger threshold reached!');
+          clearInterval(interval);
+
+          log('Compacting...');
+          const result = await compactor.compact();
+
+          if (result.success && result.metrics) {
+            log(`✓ Compaction #${stats.compactionCount + 1} complete!`);
+            log(formatMetrics(result.metrics));
+            updateStats(result.metrics);
+
+            // Continue streaming
+            setTimeout(() => {
+              log('Continuing to add tokens...');
+              startStreaming();
+            }, 1000);
+          }
+        }
+
+        if (totalTokens >= targetTokens) {
+          clearInterval(interval);
+          log(`✓ Streaming demo complete! Total compactions: ${compactor.getStats().compactionCount}`);
+          ui.compactBtn.disabled = false;
+          ui.streamBtn.disabled = false;
+        }
+      }, 500);
+    }
+
+    function reset() {
+      log('Resetting compactor state...');
+      const newCompactor = new StreamingCompactor({
+        triggerThreshold: 1000,
+        targetBudget: 500,
+        recentWindow: 100,
+        pinPrefix: 50,
+      });
+
+      // Copy state to global compactor
+      Object.assign(compactor, newCompactor);
+
+      ui.totalTokens.textContent = '0';
+      ui.compactedTokens.textContent = '0';
+      ui.compressionRatio.textContent = '0x';
+      ui.compactionTime.textContent = '0 ms';
+      ui.qualityScore.textContent = '-';
+      ui.qualityScore.className = 'stat-value';
+      ui.memorySaved.textContent = '0 MB';
+      ui.progressFill.style.width = '0%';
+      ui.status.innerHTML = '<span class="badge badge-warning">Ready</span>';
+    }
+
+    // Event listeners
+    ui.compactBtn.addEventListener('click', runCompaction);
+    ui.streamBtn.addEventListener('click', startStreaming);
+    ui.resetBtn.addEventListener('click', reset);
+
+    // Initialize
+    log('KV Compact initialized');
+    log('Ready to run compaction!');
+    ui.status.innerHTML = '<span class="badge badge-success">Ready</span>';
+    ui.compactBtn.disabled = false;
+    ui.streamBtn.disabled = false;
+  </script>
+</body>
+</html>

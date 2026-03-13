@@ -27,6 +27,7 @@
 
 #include "kv-compact-math.h"
 #include "kv-compact-state.h"
+#include "kv-compact-optimized.h"
 
 // ============================================================================
 // Helpers
@@ -78,6 +79,19 @@ static void print_usage(int argc, char ** argv) {
     LOG("  --no-writeback    skip write-back (demo mode: compute quality metrics only)\n");
     LOG("  --no-eviction     skip token eviction baseline\n");
     LOG("\n");
+    LOG("Streaming compaction options (Phase 1):\n");
+    LOG("  --pin-prefix N    pin first N tokens (system prompt, default: 256)\n");
+    LOG("  --recent-window N keep last N tokens uncompactable (default: 512)\n");
+    LOG("  --trigger N       compact when cache exceeds N tokens (default: 8192)\n");
+    LOG("  --budget N        target budget after compaction (default: 4096)\n");
+    LOG("\n");
+    LOG("Sublinear optimization (Phase 2):\n");
+    LOG("  --optimized       enable sublinear optimizations (O(n log n) instead of O(n²))\n");
+    LOG("  --method M        compaction method: baseline|l2|hybrid (default: baseline)\n");
+    LOG("  --early-stop      enable early stopping in NNLS (reduces iterations)\n");
+    LOG("  --closed-form-beta use closed-form beta (no NNLS, ~160x faster)\n");
+    LOG("  --layer-budget    enable layer-wise budget allocation\n");
+    LOG("\n");
 }
 
 int main(int argc, char ** argv) {
@@ -89,12 +103,24 @@ int main(int argc, char ** argv) {
     bool  do_writeback  = true;
     bool  do_eviction   = true;
 
-    // Parse standard params
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
-        return 1;
-    }
+    // Streaming compaction parameters (Phase 1)
+    int stream_pin_prefix = 256;
+    int stream_recent_window = 512;
+    int stream_trigger = 8192;
+    int stream_budget = 4096;
 
-    // Parse custom args
+    // Sublinear optimization parameters (Phase 2)
+    bool use_optimized = false;
+    std::string compaction_method = "baseline";  // baseline, l2, hybrid
+    bool enable_early_stop = false;
+    bool enable_closed_form_beta = false;
+    bool enable_layer_budget = false;
+
+    // Parse custom args FIRST (before common_params_parse which rejects unknowns)
+    // Build a filtered argv for llama.cpp's parser
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--compact-ratio") == 0 && i + 1 < argc) {
             compact_ratio = std::stof(argv[++i]);
@@ -104,11 +130,100 @@ int main(int argc, char ** argv) {
             do_writeback = false;
         } else if (strcmp(argv[i], "--no-eviction") == 0) {
             do_eviction = false;
+        } else if (strcmp(argv[i], "--pin-prefix") == 0 && i + 1 < argc) {
+            stream_pin_prefix = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--recent-window") == 0 && i + 1 < argc) {
+            stream_recent_window = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--trigger") == 0 && i + 1 < argc) {
+            stream_trigger = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) {
+            stream_budget = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--optimized") == 0) {
+            use_optimized = true;
+        } else if (strcmp(argv[i], "--method") == 0 && i + 1 < argc) {
+            compaction_method = argv[++i];
+        } else if (strcmp(argv[i], "--early-stop") == 0) {
+            enable_early_stop = true;
+        } else if (strcmp(argv[i], "--closed-form-beta") == 0) {
+            enable_closed_form_beta = true;
+        } else if (strcmp(argv[i], "--layer-budget") == 0) {
+            enable_layer_budget = true;
+        } else {
+            // Pass through to llama.cpp parser
+            filtered_argv.push_back(argv[i]);
         }
+    }
+
+    int filtered_argc = (int)filtered_argv.size();
+
+    // Parse standard params (llama.cpp args only)
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
+        return 1;
     }
 
     if (compact_ratio <= 0.0f || compact_ratio >= 1.0f) {
         LOG_ERR("compact-ratio must be between 0 and 1 (exclusive)\n");
+        return 1;
+    }
+
+    // Validate streaming parameters
+    if (stream_pin_prefix < 0) {
+        LOG_ERR("pin-prefix must be non-negative\n");
+        return 1;
+    }
+    if (stream_recent_window < 0) {
+        LOG_ERR("recent-window must be non-negative\n");
+        return 1;
+    }
+    if (stream_trigger <= stream_budget) {
+        LOG_ERR("trigger must be greater than budget\n");
+        return 1;
+    }
+    if (stream_pin_prefix + stream_recent_window >= stream_budget) {
+        LOG_ERR("pin-prefix + recent-window must be less than budget\n");
+        return 1;
+    }
+
+    // Validate optimization parameters
+    if (compaction_method != "baseline" && compaction_method != "l2" && compaction_method != "hybrid") {
+        LOG_ERR("Invalid method: %s (must be baseline, l2, or hybrid)\n", compaction_method.c_str());
+        return 1;
+    }
+
+    // Log streaming config if any streaming flag was used
+    bool use_streaming = (stream_trigger != 8192 || stream_budget != 4096 ||
+                          stream_pin_prefix != 256 || stream_recent_window != 512);
+
+    // Log optimization config if any optimization flag was used
+    bool use_optimizations = (use_optimized || compaction_method != "baseline" ||
+                              enable_early_stop || enable_closed_form_beta ||
+                              enable_layer_budget);
+
+    if (use_streaming) {
+        LOG_INF("Streaming mode ENABLED: budget=%d, trigger=%d, pin=%d, recent=%d\n",
+                stream_budget, stream_trigger, stream_pin_prefix, stream_recent_window);
+    }
+
+    if (use_optimizations) {
+        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s, closed_form_beta=%s, layer_budget=%s\n",
+                compaction_method.c_str(),
+                enable_early_stop ? "ON" : "OFF",
+                enable_closed_form_beta ? "ON" : "OFF",
+                enable_layer_budget ? "ON" : "OFF");
+    }
+
+    // Construct streaming_config
+    streaming_config stream_cfg;
+    stream_cfg.budget = stream_budget;
+    stream_cfg.trigger = stream_trigger;
+    stream_cfg.pin_prefix = stream_pin_prefix;
+    stream_cfg.recent_window = stream_recent_window;
+    stream_cfg.select_mode = KEY_SELECT_MAX_ATTN;
+    stream_cfg.fit_mode = BETA_FIT_NNLS;
+    stream_cfg.n_alt_rounds = 2;
+
+    if (use_streaming && !stream_cfg.is_valid()) {
+        LOG_ERR("Invalid streaming configuration\n");
         return 1;
     }
 
@@ -173,17 +288,23 @@ int main(int argc, char ** argv) {
     // ============================================================
     LOG_INF("\n--- Phase 1: Prefill ---\n");
 
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    for (int i = 0; i < n_tokens; i++) {
-        common_batch_add(batch, tokens[i], i, {0}, (i == n_tokens - 1));
-    }
+    const int n_batch = llama_n_batch(ctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
-    if (llama_decode(ctx, batch) != 0) {
-        LOG_ERR("Prefill failed\n");
-        llama_batch_free(batch);
-        return 1;
+    // Prefill in chunks of n_batch
+    for (int start = 0; start < n_tokens; start += n_batch) {
+        const int end = std::min(start + n_batch, n_tokens);
+        common_batch_clear(batch);
+        for (int i = start; i < end; i++) {
+            common_batch_add(batch, tokens[i], i, {0}, (i == n_tokens - 1));
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("Prefill failed at token %d\n", start);
+            llama_batch_free(batch);
+            return 1;
+        }
     }
-    LOG_INF("Prefill complete: %d tokens in KV cache\n", n_tokens);
+    LOG_INF("Prefill complete: %d tokens in KV cache (batch size %d)\n", n_tokens, n_batch);
 
     // Save full state
     const size_t state_size = llama_state_seq_get_size(ctx, 0);
@@ -202,8 +323,18 @@ int main(int argc, char ** argv) {
     LOG_INF("\n--- Phase 2: Full cache generation (reference) ---\n");
 
     const int n_gen = std::min(params.n_predict > 0 ? params.n_predict : 128, n_ctx - n_tokens);
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
     std::string full_output = generate_tokens(ctx, model, vocab, params, n_tokens, n_gen);
-    LOG_INF("Full output:\n%s\n", full_output.c_str());
+    auto gen_t1 = std::chrono::high_resolution_clock::now();
+    double full_gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+    int full_gen_tokens = 0;
+    { // count generated tokens
+        auto toks = common_tokenize(vocab, full_output, false, false);
+        full_gen_tokens = (int)toks.size();
+    }
+    double full_tgs = (full_gen_tokens > 0 && full_gen_ms > 0) ? (full_gen_tokens * 1000.0 / full_gen_ms) : 0.0;
+    LOG_INF("Full output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+            full_gen_tokens, full_gen_ms, full_tgs, full_output.c_str());
 
     llama_memory_t mem = llama_get_memory(ctx);
 
@@ -247,8 +378,15 @@ int main(int argc, char ** argv) {
         LOG_INF("Eviction: keeping %d / %d tokens\n", n_kept, n_tokens);
 
         llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
+        auto evict_t0 = std::chrono::high_resolution_clock::now();
         evict_output = generate_tokens(ctx, model, vocab, params, pos_max + 1, n_gen);
-        LOG_INF("Eviction output:\n%s\n", evict_output.c_str());
+        auto evict_t1 = std::chrono::high_resolution_clock::now();
+        double evict_gen_ms = std::chrono::duration<double, std::milli>(evict_t1 - evict_t0).count();
+        int evict_gen_tokens = 0;
+        { auto toks = common_tokenize(vocab, evict_output, false, false); evict_gen_tokens = (int)toks.size(); }
+        double evict_tgs = (evict_gen_tokens > 0 && evict_gen_ms > 0) ? (evict_gen_tokens * 1000.0 / evict_gen_ms) : 0.0;
+        LOG_INF("Eviction output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+                evict_gen_tokens, evict_gen_ms, evict_tgs, evict_output.c_str());
     }
 
     // ============================================================
@@ -301,11 +439,8 @@ int main(int argc, char ** argv) {
     // (because cell positions must be consistent across layers in the state format)
     // Strategy: compute importance per layer, aggregate, then select globally
 
-    LOG_INF("Computing global key importance across %u layers × %d heads...\n",
-            sd.n_layer, n_head_kv);
-
-    // Global importance: max across all layers and heads
-    std::vector<float> global_importance(sd.cell_count, 0.0f);
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    const int T = (int) sd.cell_count;
 
     // Store per-layer precomputed data for reuse in NNLS/LSQ steps
     struct layer_head_cache {
@@ -314,61 +449,150 @@ int main(int argc, char ** argv) {
         std::vector<float> row_sums;     // [n_q]
         std::vector<float> attn_weights; // [n_q, T]
     };
+
+    // ---- Step 1: Key importance scoring and selection ----
+    // Global importance: max across all layers and heads
+    std::vector<float> global_importance(sd.cell_count, 0.0f);
+
+    // Cache only needed for baseline and NNLS/LSQ phases
     std::vector<std::vector<layer_head_cache>> lh_cache(sd.n_layer);
 
-    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
-    const int T = (int) sd.cell_count;
+    if (use_optimized && (compaction_method == "l2" || compaction_method == "hybrid")) {
+        // ---- OPTIMIZED: L2 importance estimation ----
+        LOG_INF("Using L2 importance estimation (method=%s)...\n", compaction_method.c_str());
 
-    for (uint32_t l = 0; l < sd.n_layer; l++) {
-        const auto & ld = sd.layers[l];
-        lh_cache[l].resize(n_head_kv);
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
 
-        for (int h = 0; h < n_head_kv; h++) {
-            auto & hc = lh_cache[l][h];
-            hc.scores.resize(n_ref_queries * T);
-            hc.exp_scores.resize(n_ref_queries * T);
-            hc.row_sums.resize(n_ref_queries);
-            hc.attn_weights.resize(n_ref_queries * T);
+            for (int h = 0; h < n_head_kv; h++) {
+                // Use L2 norm + query dot product for importance
+                auto importance = kvcompact::optimized::FastImportanceEstimator::estimate_importance_l2(
+                    ld.K.data() + h * d_k,  // keys for this head (strided)
+                    ld.K.data() + ref_start * n_embd_k_gqa + h * d_k,  // queries for this head
+                    T, n_ref_queries, d_k
+                );
 
-            // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
-                for (int ki = 0; ki < T; ki++) {
-                    const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
-                    float dot = 0.0f;
+                // NOTE: keys/queries are stored with stride n_embd_k_gqa, not d_k.
+                // Recompute with correct strided access:
+                for (int j = 0; j < T; j++) {
+                    const float * k_row = ld.K.data() + j * n_embd_k_gqa + h * d_k;
+
+                    // L2 norm of key
+                    float key_norm = 0.0f;
                     for (int d = 0; d < d_k; d++) {
-                        dot += q_row[d] * k_row[d];
+                        key_norm += k_row[d] * k_row[d];
                     }
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    key_norm = sqrtf(key_norm);
+
+                    // Mean absolute dot product with reference queries
+                    float query_importance = 0.0f;
+                    for (int qi = 0; qi < n_ref_queries; qi++) {
+                        const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        query_importance += fabsf(dot);
+                    }
+
+                    float imp = key_norm * (query_importance / n_ref_queries);
+                    if (imp > global_importance[j]) {
+                        global_importance[j] = imp;
+                    }
                 }
             }
 
-            // exp and softmax
-            memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
-
-            memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
-
-            // Per-key max attention across queries → global importance
-            for (int j = 0; j < T; j++) {
-                float max_w = 0.0f;
-                for (int qi = 0; qi < n_ref_queries; qi++) {
-                    float w = hc.attn_weights[qi * T + j];
-                    if (w > max_w) max_w = w;
-                }
-                if (max_w > global_importance[j]) {
-                    global_importance[j] = max_w;
-                }
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  L2-scored %u / %u layers\n", l + 1, sd.n_layer);
             }
         }
 
-        if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
-            LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
+        // We still need the attention cache for NNLS/LSQ phases
+        LOG_INF("Computing attention cache for NNLS/LSQ...\n");
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
+            lh_cache[l].resize(n_head_kv);
+
+            for (int h = 0; h < n_head_kv; h++) {
+                auto & hc = lh_cache[l][h];
+                hc.scores.resize(n_ref_queries * T);
+                hc.exp_scores.resize(n_ref_queries * T);
+                hc.row_sums.resize(n_ref_queries);
+                hc.attn_weights.resize(n_ref_queries * T);
+
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
+                }
+
+                memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+
+                memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+            }
+        }
+    } else {
+        // ---- BASELINE: Full attention scoring ----
+        LOG_INF("Computing global key importance across %u layers × %d heads...\n",
+                sd.n_layer, n_head_kv);
+
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
+            lh_cache[l].resize(n_head_kv);
+
+            for (int h = 0; h < n_head_kv; h++) {
+                auto & hc = lh_cache[l][h];
+                hc.scores.resize(n_ref_queries * T);
+                hc.exp_scores.resize(n_ref_queries * T);
+                hc.row_sums.resize(n_ref_queries);
+                hc.attn_weights.resize(n_ref_queries * T);
+
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
+                }
+
+                memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+
+                memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+
+                // Per-key max attention across queries → global importance
+                for (int j = 0; j < T; j++) {
+                    float max_w = 0.0f;
+                    for (int qi = 0; qi < n_ref_queries; qi++) {
+                        float w = hc.attn_weights[qi * T + j];
+                        if (w > max_w) max_w = w;
+                    }
+                    if (max_w > global_importance[j]) {
+                        global_importance[j] = max_w;
+                    }
+                }
+            }
+
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
+            }
         }
     }
 
-    // Select top-t globally
+    // ---- Select top-t globally ----
     {
         std::vector<int> indices(T);
         std::iota(indices.begin(), indices.end(), 0);
@@ -381,35 +605,80 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Selected %d / %d positions globally\n", t, T);
 
-    // Per-layer, per-head NNLS (beta) and least-squares (C_v)
+    // ---- Layer-wise budget allocation (optional) ----
+    std::vector<int> layer_budgets(sd.n_layer, t);  // default: same budget for all layers
+    if (use_optimized && enable_layer_budget) {
+        LOG_INF("Using layer-wise budget allocation...\n");
+        auto sensitivities = kvcompact::optimized::LayerWiseBudgetAllocator::get_default_sensitivities(sd.n_layer);
+        layer_budgets = kvcompact::optimized::LayerWiseBudgetAllocator::allocate_budgets(t, sensitivities, sd.n_layer);
+
+        // Clamp budgets to shared_selected size (can't exceed global selection)
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            layer_budgets[l] = std::min(layer_budgets[l], t);
+            layer_budgets[l] = std::max(layer_budgets[l], 1);
+        }
+
+        LOG_INF("  Budget range: %d - %d (global t=%d)\n",
+                *std::min_element(layer_budgets.begin(), layer_budgets.end()),
+                *std::max_element(layer_budgets.begin(), layer_budgets.end()), t);
+    }
+
+    // ---- Step 2+3: Per-layer, per-head NNLS (beta) and least-squares (C_v) ----
     std::vector<std::vector<std::vector<float>>> beta_all(sd.n_layer);
+    int total_nnls_iters = 0;
+    int total_nnls_calls = 0;
 
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         const auto & ld = sd.layers[l];
         cv_all[l].resize(n_head_kv);
         beta_all[l].resize(n_head_kv);
 
+        // Layer budget: use fewer tokens for less sensitive layers
+        const int t_layer = layer_budgets[l];
+
         for (int h = 0; h < n_head_kv; h++) {
             const auto & hc = lh_cache[l][h];
 
             auto & beta = beta_all[l][h];
             auto & cv   = cv_all[l][h];
-            beta.resize(t);
+            beta.resize(t);   // always t for state consistency
             cv.resize(t * d_v);
 
-            // Step 2: NNLS for beta
-            std::vector<float> M(n_ref_queries * t);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t; j++) {
-                    M[qi * t + j] = hc.exp_scores[qi * T + shared_selected[j]];
+            // Step 2: Beta fitting (NNLS or closed-form)
+            if (enable_closed_form_beta) {
+                // Closed-form: O(n_ref_queries * t) with no iterations
+                beta_closed_form(hc.attn_weights.data(), shared_selected.data(),
+                                  beta.data(), n_ref_queries, T, t);
+                total_nnls_calls++;
+                total_nnls_iters += 0;  // no iterations
+            } else {
+                // NNLS: O(t² * max_iter)
+                std::vector<float> M(n_ref_queries * t_layer);
+                for (int qi = 0; qi < n_ref_queries; qi++) {
+                    for (int j = 0; j < t_layer; j++) {
+                        M[qi * t_layer + j] = hc.exp_scores[qi * T + shared_selected[j]];
+                    }
                 }
-            }
 
-            std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t);
+                std::vector<float> w(t_layer);
 
-            for (int j = 0; j < t; j++) {
-                beta[j] = logf(std::max(1e-12f, w[j]));
+                if (use_optimized && enable_early_stop) {
+                    int iters = nnls_solve_early_stop(M.data(), hc.row_sums.data(), w.data(),
+                                                       n_ref_queries, t_layer, 200, 1e-4f);
+                    total_nnls_iters += iters;
+                } else {
+                    nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t_layer);
+                    total_nnls_iters += 200;
+                }
+                total_nnls_calls++;
+
+                for (int j = 0; j < t_layer; j++) {
+                    beta[j] = logf(std::max(1e-12f, w[j]));
+                }
+                // Zero out beta for positions beyond layer budget
+                for (int j = t_layer; j < t; j++) {
+                    beta[j] = 0.0f;
+                }
             }
 
             // Step 3: Least squares for C_v
@@ -438,6 +707,15 @@ int main(int argc, char ** argv) {
 
         if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
             LOG_INF("  Compacted %u / %u layers\n", l + 1, sd.n_layer);
+        }
+    }
+
+    if (total_nnls_calls > 0) {
+        if (enable_closed_form_beta) {
+            LOG_INF("Beta: closed-form (0 iterations), %d calls\n", total_nnls_calls);
+        } else if (use_optimized && enable_early_stop) {
+            LOG_INF("NNLS early-stop: avg %.1f iters/call (vs 200 max), %d calls\n",
+                    (float)total_nnls_iters / total_nnls_calls, total_nnls_calls);
         }
     }
 
@@ -534,18 +812,59 @@ int main(int argc, char ** argv) {
         } else {
             LOG_INF("Loaded compacted state: %zu bytes\n", loaded);
 
+            // Compute averaged beta across heads and layers for mask injection
+            // beta_avg[j] = mean over all layers and heads of beta_all[l][h][j]
+            std::vector<float> beta_avg(t, 0.0f);
+            for (uint32_t l = 0; l < sd.n_layer; l++) {
+                for (int h = 0; h < n_head_kv; h++) {
+                    for (int j = 0; j < t; j++) {
+                        beta_avg[j] += beta_all[l][h][j];
+                    }
+                }
+            }
+            const float inv_count = 1.0f / (sd.n_layer * n_head_kv);
+            float beta_min = 0.0f, beta_max = 0.0f, beta_mean = 0.0f;
+            for (int j = 0; j < t; j++) {
+                beta_avg[j] *= inv_count;
+                beta_mean += beta_avg[j];
+                if (beta_avg[j] < beta_min) beta_min = beta_avg[j];
+                if (beta_avg[j] > beta_max) beta_max = beta_avg[j];
+            }
+            beta_mean /= t;
+            LOG_INF("Beta bias: mean=%.4f min=%.4f max=%.4f (averaged across %u layers × %d heads)\n",
+                    beta_mean, beta_min, beta_max, sd.n_layer, n_head_kv);
+
+            // Inject beta into the attention mask via per-cell bias
+            llama_memory_set_attn_bias(mem, 0, beta_avg.data(), t);
+            LOG_INF("Set attention bias for %d compacted cells\n", t);
+
             // Generate with compacted cache
             // Position after the max position in selected cells
             llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
             LOG_INF("Generating from pos %d...\n", (int)pos_max + 1);
 
+            auto am_t0 = std::chrono::high_resolution_clock::now();
             std::string am_output = generate_tokens(ctx, model, vocab, params, pos_max + 1, n_gen);
-            LOG_INF("\nAttention Matching output:\n%s\n", am_output.c_str());
+            auto am_t1 = std::chrono::high_resolution_clock::now();
+            double am_gen_ms = std::chrono::duration<double, std::milli>(am_t1 - am_t0).count();
+            int am_gen_tokens = 0;
+            { auto toks = common_tokenize(vocab, am_output, false, false); am_gen_tokens = (int)toks.size(); }
+            double am_tgs = (am_gen_tokens > 0 && am_gen_ms > 0) ? (am_gen_tokens * 1000.0 / am_gen_ms) : 0.0;
+            LOG_INF("\nAttention Matching output (%d tokens, %.1f ms, %.2f tg/s):\n%s\n",
+                    am_gen_tokens, am_gen_ms, am_tgs, am_output.c_str());
 
             // Summary comparison
             LOG_INF("\n=== Summary ===\n");
             LOG_INF("Compression: %d → %d tokens (%.1fx)\n", n_tokens, t, (float)n_tokens / t);
             LOG_INF("Compaction time: %.1f ms\n", compact_ms);
+            LOG_INF("\n--- tg/s comparison ---\n");
+            LOG_INF("  Full cache:          %6.2f tg/s (%d tokens in %.0f ms)\n",
+                    full_tgs, full_gen_tokens, full_gen_ms);
+            LOG_INF("  Attention Matching:  %6.2f tg/s (%d tokens in %.0f ms)\n",
+                    am_tgs, am_gen_tokens, am_gen_ms);
+            if (full_tgs > 0) {
+                LOG_INF("  Speedup:             %.2fx\n", am_tgs / full_tgs);
+            }
             LOG_INF("\nFull cache output (first 200 chars):\n  %.200s\n", full_output.c_str());
             if (do_eviction) {
                 LOG_INF("\nToken eviction output (first 200 chars):\n  %.200s\n", evict_output.c_str());

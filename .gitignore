@@ -8,3 +8,8 @@ CMakeUserPresets.json
 *.lib
 *.dll
 *.pdb
+.arxiv-papers/
+.claude/
+.fab-swarm/
+fab-swarm.config.json
+models/
