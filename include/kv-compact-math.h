@@ -66,6 +66,19 @@ static void mat_mul_AtB(const float * A, const float * B, float * C, int m, int 
     }
 }
 
+// Compute C = A * B  where A is (m x k), B is (k x n), result is (m x n)
+static void mat_mul_AB(const float * A, const float * B, float * C, int m, int k, int n) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int l = 0; l < k; l++) {
+                sum += A[i * k + l] * B[l * n + j];
+            }
+            C[i * n + j] = sum;
+        }
+    }
+}
+
 // Softmax over rows: input (m x n), output (m x n), in-place safe
 static void softmax_rows(float * data, int m, int n) {
     for (int i = 0; i < m; i++) {
@@ -101,6 +114,67 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
             sum += row[j];
         }
         row_sums[i] = sum;
+    }
+}
+
+// Fused exp + softmax + per-column importance in a single pass.
+//
+// Given scores [m × n], computes in one pass:
+//   exp_out[i,j]    = exp(scores[i,j] - max_row)     (unnormalized)
+//   row_sums[i]     = sum_j exp_out[i,j]              (partition function)
+//   softmax_out[i,j]= exp_out[i,j] / row_sums[i]     (normalized weights)
+//   importance[j]   = max_i softmax_out[i,j]          (per-key importance)
+//
+// Replaces: memcpy + exp_rows_stable + memcpy + softmax_rows + column-max loop
+// with a single pass over the data. This is 5 operations fused into 1.
+static void exp_softmax_importance_fused(
+        const float * scores, float * exp_out, float * row_sums,
+        float * softmax_out, float * importance, int m, int n) {
+    // Zero importance
+    memset(importance, 0, n * sizeof(float));
+
+    for (int i = 0; i < m; i++) {
+        const float * row = scores + i * n;
+        float * exp_row = exp_out + i * n;
+        float * sm_row  = softmax_out + i * n;
+
+        // Find row max
+        float max_val = row[0];
+        for (int j = 1; j < n; j++) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            float e = expf(row[j] - max_val);
+            exp_row[j] = e;
+            sum += e;
+        }
+        row_sums[i] = sum;
+
+        // Normalize and update column-max importance
+        float inv_sum = 1.0f / (sum + 1e-12f);
+        for (int j = 0; j < n; j++) {
+            float sm = exp_row[j] * inv_sum;
+            sm_row[j] = sm;
+            if (sm > importance[j]) importance[j] = sm;
+        }
+    }
+}
+
+// Extract per-head slice from interleaved layout into contiguous buffer.
+//   src:       [rows × stride] interleaved data
+//   dst:       [rows × width] contiguous output
+//   rows:      number of rows to extract
+//   width:     elements per head (d_k or d_v)
+//   stride:    total row stride (n_embd_k_gqa or n_embd_v_gqa)
+//   offset:    head offset within each row (h * d_k or h * d_v)
+static void extract_head_contiguous(
+        const float * src, float * dst,
+        int rows, int width, int stride, int offset) {
+    for (int i = 0; i < rows; i++) {
+        memcpy(dst + i * width, src + i * stride + offset, width * sizeof(float));
     }
 }
 
@@ -646,15 +720,9 @@ static compacted_head compact_head_highest_attn(
     softmax_rows(X.data(), n_q, t);
 
     // Compute Y: original attention output = attn_weights @ V  [n_q, d_v]
-    std::vector<float> Y(n_q * d_v, 0.0f);
-    for (int i = 0; i < n_q; i++) {
-        for (int j = 0; j < T; j++) {
-            float w_ij = attn_weights[i * T + j];
-            for (int d = 0; d < d_v; d++) {
-                Y[i * d_v + d] += w_ij * V[j * d_v + d];
-            }
-        }
-    }
+    // V is contiguous [T × d_v] for single-head, so use batched matmul directly
+    std::vector<float> Y(n_q * d_v);
+    mat_mul_AB(attn_weights.data(), V, Y.data(), n_q, T, d_v);
 
     // Solve: X * C_v = Y  =>  C_v = (X^T X)^{-1} X^T Y
     least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
@@ -734,6 +802,11 @@ static compacted_layer compact_layer_all_heads(
 
     const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
 
+    // Temporary contiguous buffers for per-head extraction (reused across heads)
+    std::vector<float> q_buf(n_q * d_k);
+    std::vector<float> k_buf(T * d_k);
+    std::vector<float> v_buf(T * d_v);
+
     for (int h = 0; h < n_head_kv; h++) {
         auto & hd = hdata[h];
         hd.scores.resize(n_q * T);
@@ -741,41 +814,25 @@ static compacted_layer compact_layer_all_heads(
         hd.row_sums.resize(n_q);
         hd.attn_weights.resize(n_q * T);
 
-        // Extract per-head K and Q_ref slices
-        // K_head[i] = K_all[i * n_embd_k_gqa + h * d_k ... + (h+1)*d_k]
-        // Instead of extracting, compute Q_ref_h @ K_h^T directly
+        // Extract per-head Q_ref and K into contiguous buffers for cache-friendly matmul
+        const int head_offset = h * d_k;
+        extract_head_contiguous(Q_ref_all, q_buf.data(), n_q, d_k, n_embd_k_gqa, head_offset);
+        extract_head_contiguous(K_all, k_buf.data(), T, d_k, n_embd_k_gqa, head_offset);
 
-        // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
-        for (int qi = 0; qi < n_q; qi++) {
-            const float * q_row = Q_ref_all + qi * n_embd_k_gqa + h * d_k;
-            for (int ki = 0; ki < T; ki++) {
-                const float * k_row = K_all + ki * n_embd_k_gqa + h * d_k;
-                float dot = 0.0f;
-                for (int d = 0; d < d_k; d++) {
-                    dot += q_row[d] * k_row[d];
-                }
-                hd.scores[qi * T + ki] = dot * inv_sqrt_dk;
-            }
-        }
+        // Batched matmul: scores = Q_ref_h @ K_h^T  [n_q × T]
+        mat_mul_ABt(q_buf.data(), k_buf.data(), hd.scores.data(), n_q, T, d_k);
+        for (int i = 0; i < n_q * T; i++) hd.scores[i] *= inv_sqrt_dk;
 
-        // Compute exp(scores) for mass computation
-        memcpy(hd.exp_scores.data(), hd.scores.data(), n_q * T * sizeof(float));
-        exp_rows_stable(hd.exp_scores.data(), hd.row_sums.data(), n_q, T);
+        // Fused: exp + softmax + per-key importance in a single pass
+        std::vector<float> head_importance(T);
+        exp_softmax_importance_fused(hd.scores.data(), hd.exp_scores.data(),
+                                     hd.row_sums.data(), hd.attn_weights.data(),
+                                     head_importance.data(), n_q, T);
 
-        // Compute softmax for key scoring
-        memcpy(hd.attn_weights.data(), hd.scores.data(), n_q * T * sizeof(float));
-        softmax_rows(hd.attn_weights.data(), n_q, T);
-
-        // Per-key max attention weight across queries
+        // Global score = max across heads
         for (int j = 0; j < T; j++) {
-            float max_w = 0.0f;
-            for (int qi = 0; qi < n_q; qi++) {
-                float w = hd.attn_weights[qi * T + j];
-                if (w > max_w) max_w = w;
-            }
-            // Global score = max across heads
-            if (max_w > global_scores[j]) {
-                global_scores[j] = max_w;
+            if (head_importance[j] > global_scores[j]) {
+                global_scores[j] = head_importance[j];
             }
         }
     }
@@ -826,16 +883,10 @@ static compacted_layer compact_layer_all_heads(
         softmax_rows(X.data(), n_q, t);
 
         // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
-        std::vector<float> Y(n_q * d_v, 0.0f);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int ki = 0; ki < T; ki++) {
-                float w_ij = hd.attn_weights[qi * T + ki];
-                const float * v_row = V_all + ki * n_embd_v_gqa + h * d_v;
-                for (int d = 0; d < d_v; d++) {
-                    Y[qi * d_v + d] += w_ij * v_row[d];
-                }
-            }
-        }
+        // Extract V_head into contiguous buffer, then use batched matmul
+        extract_head_contiguous(V_all, v_buf.data(), T, d_v, n_embd_v_gqa, h * d_v);
+        std::vector<float> Y(n_q * d_v);
+        mat_mul_AB(hd.attn_weights.data(), v_buf.data(), Y.data(), n_q, T, d_v);
 
         least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
     }

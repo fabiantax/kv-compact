@@ -364,42 +364,31 @@ int kv_compact(
         gpu_scored = (rc == 0);
     }
 
+    // Temporary contiguous buffers for per-head extraction (reused across heads)
+    std::vector<float> q_buf(n_q_used * d_k);
+    std::vector<float> k_buf((size_t)T * d_k);
+    std::vector<float> v_buf((size_t)T * d_v);
+
     if (!gpu_scored) {
-        // CPU fallback: per-head triple-nested loop
+        // CPU fallback: extract per-head contiguous data + batched matmul
         for (int h = 0; h < n_head_kv; h++) {
             auto & hc = hcache[0][h];
-            for (int qi = 0; qi < n_q_used; qi++) {
-                const float * q_row = Q_ref_used + qi * n_embd_k + h * d_k;
-                for (int ki = 0; ki < T; ki++) {
-                    const float * k_row = K_all + ki * n_embd_k + h * d_k;
-                    float dot = 0.0f;
-                    for (int d = 0; d < d_k; d++) dot += q_row[d] * k_row[d];
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
-                }
-            }
+            const int head_offset = h * d_k;
+            extract_head_contiguous(Q_ref_used, q_buf.data(), n_q_used, d_k, n_embd_k, head_offset);
+            extract_head_contiguous(K_all, k_buf.data(), T, d_k, n_embd_k, head_offset);
+            mat_mul_ABt(q_buf.data(), k_buf.data(), hc.scores.data(), n_q_used, T, d_k);
+            for (int i = 0; i < n_q_used * T; i++) hc.scores[i] *= inv_sqrt_dk;
         }
     }
 
-    // Post-process scores: exp, softmax, importance (same for GPU and CPU paths)
+    // Fused post-processing: exp + softmax + per-key importance in a single pass
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
 
-        memcpy(hc.exp_scores.data(), hc.scores.data(), n_q_used * T * sizeof(float));
-        exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_q_used, T);
-
-        memcpy(hc.attn_weights.data(), hc.scores.data(), n_q_used * T * sizeof(float));
-        softmax_rows(hc.attn_weights.data(), n_q_used, T);
-
-        // Per-key importance
         std::vector<float> head_imp(T);
-        for (int j = 0; j < T; j++) {
-            float max_w = 0.0f;
-            for (int qi = 0; qi < n_q_used; qi++) {
-                float w = hc.attn_weights[qi * T + j];
-                if (w > max_w) max_w = w;
-            }
-            head_imp[j] = max_w;
-        }
+        exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
+                                     hc.row_sums.data(), hc.attn_weights.data(),
+                                     head_imp.data(), n_q_used, T);
 
         if (p.use_sensitivity) {
             float sens = compute_head_sensitivity(hc.attn_weights.data(), n_q_used, T);
@@ -485,18 +474,11 @@ int kv_compact(
     }
 
     if (!gpu_refit) {
-        // CPU fallback: per-head Y = attn_weights @ V_h
+        // CPU fallback: extract per-head V contiguous + batched matmul
         for (int h = 0; h < n_head_kv; h++) {
-            const auto & hc = hcache[0][h];
-            float * Y = Y_vecs[h].data();
-            for (int qi = 0; qi < n_q_used; qi++) {
-                for (int ki = 0; ki < T; ki++) {
-                    float w_ij = hc.attn_weights[qi * T + ki];
-                    const float * v_row = V_all + ki * n_embd_v + h * d_v;
-                    for (int d = 0; d < d_v; d++)
-                        Y[qi * d_v + d] += w_ij * v_row[d];
-                }
-            }
+            extract_head_contiguous(V_all, v_buf.data(), T, d_v, n_embd_v, h * d_v);
+            mat_mul_AB(hcache[0][h].attn_weights.data(), v_buf.data(),
+                       Y_vecs[h].data(), n_q_used, T, d_v);
         }
     }
 

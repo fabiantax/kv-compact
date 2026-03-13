@@ -490,6 +490,11 @@ int main(int argc, char ** argv) {
         all_sensitivities.reserve((size_t)sd.n_layer * n_head_kv);
     }
 
+    // Temporary contiguous buffers for per-head extraction (reused across layers/heads)
+    std::vector<float> q_buf(n_ref_queries * d_k);
+    std::vector<float> k_buf(T * d_k);
+    std::vector<float> v_buf(T * d_v);
+
     int layers_scored = 0;
     for (uint32_t l = 0; l < sd.n_layer; l++) {
         // Skip non-attention layers (hybrid architecture support)
@@ -507,36 +512,25 @@ int main(int argc, char ** argv) {
             hc.row_sums.resize(n_ref_queries);
             hc.attn_weights.resize(n_ref_queries * T);
 
-            // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
-                for (int ki = 0; ki < T; ki++) {
-                    const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
-                    float dot = 0.0f;
-                    for (int d = 0; d < d_k; d++) {
-                        dot += q_row[d] * k_row[d];
-                    }
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
-                }
+            // Extract per-head Q_ref and K into contiguous buffers for cache-friendly matmul
+            const int head_offset = h * d_k;
+            extract_head_contiguous(ld.K.data() + ref_start * n_embd_k_gqa,
+                                    q_buf.data(), n_ref_queries, d_k, n_embd_k_gqa, head_offset);
+            extract_head_contiguous(ld.K.data(), k_buf.data(), T, d_k, n_embd_k_gqa, head_offset);
+
+            // Batched matmul: scores = Q_ref_h @ K_h^T  [n_q × T]
+            mat_mul_ABt(q_buf.data(), k_buf.data(), hc.scores.data(), n_ref_queries, T, d_k);
+
+            // Scale by 1/sqrt(d_k)
+            for (int i = 0; i < n_ref_queries * T; i++) {
+                hc.scores[i] *= inv_sqrt_dk;
             }
 
-            // exp and softmax
-            memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
-
-            memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
-
-            // Per-key max attention across queries
+            // Fused: exp + softmax + per-key importance in a single pass
             std::vector<float> head_importance(T);
-            for (int j = 0; j < T; j++) {
-                float max_w = 0.0f;
-                for (int qi = 0; qi < n_ref_queries; qi++) {
-                    float w = hc.attn_weights[qi * T + j];
-                    if (w > max_w) max_w = w;
-                }
-                head_importance[j] = max_w;
-            }
+            exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
+                                         hc.row_sums.data(), hc.attn_weights.data(),
+                                         head_importance.data(), n_ref_queries, T);
 
             if (sensitivity_budget) {
                 // Store per-head importance and sensitivity for weighted aggregation
@@ -653,16 +647,10 @@ int main(int argc, char ** argv) {
             softmax_rows(X.data(), n_ref_queries, t);
 
             // Y = original attention output: attn_weights @ V_head  [n_q, d_v]
-            std::vector<float> Y(n_ref_queries * d_v, 0.0f);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int ki = 0; ki < T; ki++) {
-                    float w_ij = hc.attn_weights[qi * T + ki];
-                    const float * v_row = ld.V.data() + ki * n_embd_v_gqa + h * d_v;
-                    for (int d = 0; d < d_v; d++) {
-                        Y[qi * d_v + d] += w_ij * v_row[d];
-                    }
-                }
-            }
+            // Extract V_head into contiguous buffer, then use batched matmul
+            extract_head_contiguous(ld.V.data(), v_buf.data(), T, d_v, n_embd_v_gqa, h * d_v);
+            std::vector<float> Y(n_ref_queries * d_v);
+            mat_mul_AB(hc.attn_weights.data(), v_buf.data(), Y.data(), n_ref_queries, T, d_v);
 
             least_squares_solve(X.data(), Y.data(), cv.data(), n_ref_queries, t, d_v);
         }
