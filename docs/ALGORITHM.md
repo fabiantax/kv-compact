@@ -12,7 +12,7 @@ This library implements a training-free, post-hoc algorithm for compressing the 
 
 The algorithm compresses T cached tokens down to t tokens (where t ≪ T) by solving three sequential optimization problems, each with closed-form or convex solutions. No gradient descent through the model is needed, making it orders of magnitude faster than prior latent-space compression methods.
 
-**Key result:** 50x compression in ~20 seconds with minimal accuracy loss.
+**Key result:** 50x compression in ~20 seconds with minimal accuracy loss. Scales to 1M+ tokens via chunked compaction with OpenMP parallelism.
 
 ---
 
@@ -138,6 +138,8 @@ Solved directly using Gaussian elimination with partial pivoting. The matrix X^T
 
 **Ridge regularization (λ = 10⁻⁶):** Ensures invertibility and prevents extreme values when reference queries are nearly collinear.
 
+**OOM risk at large T:** When t is large (e.g., T=100k at 50% → t=50k), the X^T·X matrix requires t² × 4 bytes ≈ 10 GB. Chunked compaction (see below) solves this by bounding t per chunk.
+
 **Implementation:** `ls_solve()` in `kv-compact-math.h`
 
 ---
@@ -179,6 +181,70 @@ After the initial 3-step pipeline, optional refinement rounds evaluate per-key r
 ### Multi-Round Compaction
 
 For incrementally growing caches, `kv_compact_multi_round()` applies compaction repeatedly. Each round compacts the output of the previous round, with beta folded into K vectors and C_v replacing V. Selected indices map back to original positions.
+
+### Chunked Compaction (1M+ Token Contexts)
+
+The least-squares normal equations solver (Step 3) builds an X^T·X matrix of size [t × t]. At large T with moderate compression ratios, t grows proportionally and the O(t²) memory + O(t³) compute becomes prohibitive:
+
+| T | Ratio | t | X^T·X Memory | LS Time |
+|---|-------|---|-------------|---------|
+| 10k | 50% | 5k | 100 MB | ~2s |
+| 100k | 50% | 50k | 10 GB | OOM |
+| 1M | 50% | 500k | 1 TB | OOM |
+
+**Solution:** Split the T tokens into fixed-size chunks, compact each independently, then merge results.
+
+**Auto chunk sizing:** By default (`chunk_size = 0`), the chunk size is computed to keep t_chunk ≤ 256:
+
+```
+chunk_size = ceil(256 / ratio)
+```
+
+Examples:
+- ratio=0.5 → chunk=512, t_chunk=256 → LS per chunk: O(256³) ≈ 17M ops
+- ratio=0.2 → chunk=1280, t_chunk=256 → same LS cost
+- ratio=0.1 → chunk=2560, t_chunk=256 → same LS cost
+
+This makes LS time constant per chunk regardless of compression ratio.
+
+**Algorithm:**
+
+1. Divide T tokens into `n_chunks = ceil(T / chunk_size)` segments.
+2. For each chunk c (start = c×chunk_size, end = min(start+chunk_size, T)):
+   - Extract K, V, Q_ref for the chunk's token range.
+   - Run the full 3-step pipeline (key selection, NNLS, LS) on this chunk.
+   - Collect selected indices (offset by chunk start), beta, and C_v.
+3. Merge: concatenate selected_indices, beta, C_v across all chunks, then re-sort indices.
+4. Compute final quality metrics against the full original data.
+
+**Why chunking works:** Attention is predominantly local — tokens mostly attend to nearby context. Chunking preserves local structure while bounding memory. Quality impact is minimal (cos_sim > 0.9999 at chunk=512 vs unchunked).
+
+**Parallel processing:** Chunks are fully independent, enabling embarrassingly parallel execution. With OpenMP (`n_threads` parameter):
+
+```cpp
+#pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+for (int c = 0; c < n_chunks; c++) { ... }
+```
+
+Dynamic scheduling handles uneven last chunks efficiently. Speedup is near-linear with cores (2.1x on 4 cores measured).
+
+**Performance at scale:**
+
+| T | Ratio | Chunks | Time | Tokens/sec | Cos Sim |
+|---|-------|--------|------|------------|---------|
+| 100k | 50% | 195 | 1.6s | 62k | 0.999996 |
+| 500k | 50% | 977 | 8.5s | 59k | 0.999834 |
+| 1M | 50% | 1954 | 4.6s | 216k | 0.999949 |
+
+**Parameters:**
+- `chunk_size = 0` (default): auto — target t_chunk ≤ 256
+- `chunk_size = -1`: disabled — never chunk (may OOM at large T)
+- `chunk_size > 0`: explicit chunk size in tokens
+- `n_threads = 0` (default): auto — use all available cores
+- `n_threads = 1`: single-threaded (no OpenMP overhead)
+- `n_threads > 1`: explicit thread count
+
+**Implementation:** `kv_compact()` in `kv-compact-api.cpp`
 
 ### ROCm/HIP GPU Acceleration
 
@@ -258,6 +324,14 @@ kv_compact_result {
 | Value Refit (per head) | O(t² · d_v + t³) | ~2s total |
 | **Total (HighestAttn)** | **O(n_q · T · d_k + n_head · t² · n_q)** | **~7s** |
 
+With chunked compaction (auto mode, t_chunk ≤ 256):
+
+| Step | Complexity per chunk | At T=1M, ratio=50% |
+|------|---------------------|---------------------|
+| Key Selection | O(n_q · chunk · d_k) | ~1ms |
+| Value Refit | O(256² · d_v + 256³) | <1ms |
+| **Total (1954 chunks, parallel)** | | **~4.6s** |
+
 The Q_ref generation step (repeat-prefill) adds ~8s. Using the cheap K-proxy instead reduces this to <1s.
 
 ---
@@ -268,7 +342,7 @@ The Q_ref generation step (repeat-prefill) adds ~8s. Using the cheap K-proxy ins
 |------|----------|
 | `include/kv-compact-math.h` | Core algorithms: matmul, softmax, NNLS, LS, key selection, compaction pipeline |
 | `include/kv-compact-api.h` | C API types and function declarations |
-| `src/kv-compact-api.cpp` | API implementation: diversity selection, cheap Q_ref, multi-round, quality metrics |
+| `src/kv-compact-api.cpp` | API implementation: diversity selection, cheap Q_ref, multi-round, chunked compaction, OpenMP parallelism, quality metrics |
 | `src/kv-compact-hip.hip` | ROCm/HIP GPU kernels for attention scoring acceleration |
 | `include/kv-compact-accel.h` | GPU acceleration interface (CPU fallback stubs) |
 | `src/kv-compact.cpp` | CLI tool integration with llama.cpp |
