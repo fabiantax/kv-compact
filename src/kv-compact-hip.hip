@@ -44,7 +44,9 @@ __global__ void kernel_mat_mul_ABt(
 }
 
 // Tiled matrix multiply for better cache utilization
-// Uses shared memory tiles for both A and B
+// Uses shared memory tiles for both A and B.
+// Tiles are padded to TILE_SIZE+1 columns to avoid shared memory bank conflicts
+// on RDNA 3.5 (32 banks, 4-byte stride → consecutive columns hit same bank).
 #define TILE_SIZE 16
 
 __global__ void kernel_mat_mul_ABt_tiled(
@@ -52,8 +54,8 @@ __global__ void kernel_mat_mul_ABt_tiled(
         const float * __restrict__ B,
         float * __restrict__ C,
         int m, int n, int k, float scale) {
-    __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
-    __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
+    __shared__ float tile_A[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float tile_B[TILE_SIZE][TILE_SIZE + 1];
 
     int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     int col = blockIdx.x * TILE_SIZE + threadIdx.x;
@@ -114,6 +116,37 @@ __global__ void kernel_score_all_heads(
 }
 
 // ============================================================================
+// Value refit target kernel: Y_h = attn_weights_h @ V_h (interleaved V)
+// ============================================================================
+
+// Computes Y[h][qi * d_v + d] = sum_ki( W[h][qi * T + ki] * V[ki * n_embd_v + h * d_v + d] )
+// for all heads in a single dispatch.
+//
+// W (attn_weights): [n_head_kv][n_q × T] — contiguous per-head blocks
+// V_all:            [T × n_embd_v]         — interleaved, stride = n_embd_v
+// Y_out:            [n_head_kv][n_q × d_v] — contiguous per-head blocks
+//
+// Grid: (ceil(d_v/16), ceil(n_q/16), n_head_kv)
+__global__ void kernel_refit_target_all_heads(
+        const float * __restrict__ W,       // [n_head_kv * n_q * T]
+        const float * __restrict__ V_all,   // [T * n_embd_v]
+        float * __restrict__ Y_out,         // [n_head_kv * n_q * d_v]
+        int n_q, int T, int n_head_kv, int d_v, int n_embd_v) {
+    int d   = blockIdx.x * TILE_SIZE + threadIdx.x;  // column in d_v
+    int qi  = blockIdx.y * TILE_SIZE + threadIdx.y;  // row in n_q
+    int h   = blockIdx.z;                            // head
+
+    if (qi < n_q && d < d_v) {
+        const float * w_row = W + (size_t)h * n_q * T + qi * T;
+        float sum = 0.0f;
+        for (int ki = 0; ki < T; ki++) {
+            sum += w_row[ki] * V_all[ki * n_embd_v + h * d_v + d];
+        }
+        Y_out[(size_t)h * n_q * d_v + qi * d_v + d] = sum;
+    }
+}
+
+// ============================================================================
 // Persistent buffer pool
 // ============================================================================
 
@@ -121,15 +154,17 @@ __global__ void kernel_score_all_heads(
 // and are reused across calls. On APU, managed memory is backed by the same
 // physical LPDDR5X so the "allocation" is just a virtual address reservation.
 struct hip_buffer_pool {
-    float * q_buf;       // contiguous Q per-head slice
-    float * k_buf;       // contiguous K per-head slice
-    float * scores_buf;  // all-heads scores output
+    float * q_buf;       // Q or W (attn_weights) input
+    float * k_buf;       // K or V input
+    float * scores_buf;  // scores or Y output
+    float * aux_buf;     // auxiliary (e.g. W for value refit when q_buf holds Q)
     size_t  q_cap;       // allocated capacity in bytes
     size_t  k_cap;
     size_t  scores_cap;
+    size_t  aux_cap;
 };
 
-static hip_buffer_pool g_pool = {nullptr, nullptr, nullptr, 0, 0, 0};
+static hip_buffer_pool g_pool = {nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0};
 
 // Ensure pool buffer is at least `needed` bytes. Only reallocates if current
 // capacity is insufficient.
@@ -254,10 +289,61 @@ int kv_compact_hip_score_all_heads(
     return 0;
 }
 
+int kv_compact_hip_refit_target_all_heads(
+        const float * const * W_per_head,
+        const float * V_all,
+        float ** Y_out,
+        int n_q, int T, int n_head_kv, int d_v) {
+    ensure_hip_init();
+    if (!hip_available) return -1;
+
+    int n_embd_v = n_head_kv * d_v;
+    size_t w_bytes = (size_t)n_head_kv * n_q * T * sizeof(float);
+    size_t v_bytes = (size_t)T * n_embd_v * sizeof(float);
+    size_t y_bytes = (size_t)n_head_kv * n_q * d_v * sizeof(float);
+
+    // Grow pool buffers as needed
+    if (pool_ensure(&g_pool.aux_buf, &g_pool.aux_cap, w_bytes) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.k_buf, &g_pool.k_cap, v_bytes) != hipSuccess) return -1;
+    if (pool_ensure(&g_pool.scores_buf, &g_pool.scores_cap, y_bytes) != hipSuccess) return -1;
+
+    // Pack per-head W arrays into contiguous buffer
+    for (int h = 0; h < n_head_kv; h++) {
+        memcpy(g_pool.aux_buf + (size_t)h * n_q * T,
+               W_per_head[h],
+               (size_t)n_q * T * sizeof(float));
+    }
+
+    // Copy interleaved V (zero-copy on APU)
+    memcpy(g_pool.k_buf, V_all, v_bytes);
+
+    // Launch one 3D grid: (d_v, n_q, n_head_kv)
+    dim3 block(TILE_SIZE, TILE_SIZE, 1);
+    dim3 grid((d_v + TILE_SIZE - 1) / TILE_SIZE,
+              (n_q + TILE_SIZE - 1) / TILE_SIZE,
+              n_head_kv);
+    kernel_refit_target_all_heads<<<grid, block>>>(
+        g_pool.aux_buf, g_pool.k_buf, g_pool.scores_buf,
+        n_q, T, n_head_kv, d_v, n_embd_v);
+
+    hipError_t err = hipDeviceSynchronize();
+    if (err != hipSuccess) return -1;
+
+    // Copy results into caller's per-head Y buffers
+    for (int h = 0; h < n_head_kv; h++) {
+        memcpy(Y_out[h],
+               g_pool.scores_buf + (size_t)h * n_q * d_v,
+               (size_t)n_q * d_v * sizeof(float));
+    }
+
+    return 0;
+}
+
 void kv_compact_hip_pool_free(void) {
     if (g_pool.q_buf)      { hipFree(g_pool.q_buf);      g_pool.q_buf = nullptr;      g_pool.q_cap = 0; }
     if (g_pool.k_buf)      { hipFree(g_pool.k_buf);      g_pool.k_buf = nullptr;      g_pool.k_cap = 0; }
     if (g_pool.scores_buf) { hipFree(g_pool.scores_buf); g_pool.scores_buf = nullptr; g_pool.scores_cap = 0; }
+    if (g_pool.aux_buf)    { hipFree(g_pool.aux_buf);    g_pool.aux_buf = nullptr;    g_pool.aux_cap = 0; }
 }
 
 } // extern "C"

@@ -39,6 +39,18 @@ int kv_compact_hip_score_all_heads(
         const float * Q_ref, const float * K_all, float ** scores_out,
         int n_q, int T, int n_head_kv, int d_k, float scale);
 
+// GPU-accelerated value refit target computation for all heads.
+//
+// Computes Y_h = W_h @ V_h for each head h, where:
+//   W_per_head[h]: [n_q × T] attention weights (contiguous per head)
+//   V_all:         [T × n_embd_v] interleaved values (n_embd_v = n_head_kv * d_v)
+//   Y_out[h]:      [n_q × d_v] pre-allocated output buffers
+//
+// Returns 0 on success, -1 if HIP not available.
+int kv_compact_hip_refit_target_all_heads(
+        const float * const * W_per_head, const float * V_all, float ** Y_out,
+        int n_q, int T, int n_head_kv, int d_v);
+
 // Release persistent GPU buffer pool (call at shutdown or when done).
 void kv_compact_hip_pool_free(void);
 
@@ -69,6 +81,14 @@ inline int kv_compact_hip_score_all_heads(
     return -1;
 }
 
+inline int kv_compact_hip_refit_target_all_heads(
+        const float * const * W_per_head, const float * V_all, float ** Y_out,
+        int n_q, int T, int n_head_kv, int d_v) {
+    (void)W_per_head; (void)V_all; (void)Y_out;
+    (void)n_q; (void)T; (void)n_head_kv; (void)d_v;
+    return -1;
+}
+
 inline void kv_compact_hip_pool_free(void) {}
 
 #else
@@ -84,6 +104,9 @@ int kv_compact_hip_mat_mul_ABt_scaled(
 int kv_compact_hip_score_all_heads(
         const float * Q_ref, const float * K_all, float ** scores_out,
         int n_q, int T, int n_head_kv, int d_k, float scale);
+int kv_compact_hip_refit_target_all_heads(
+        const float * const * W_per_head, const float * V_all, float ** Y_out,
+        int n_q, int T, int n_head_kv, int d_v);
 void kv_compact_hip_pool_free(void);
 
 #ifdef __cplusplus

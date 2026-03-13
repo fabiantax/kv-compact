@@ -462,6 +462,44 @@ int kv_compact(
     std::vector<std::vector<float>> beta_vecs(n_head_kv);
     std::vector<std::vector<float>> cv_vecs(n_head_kv);
 
+    // Precompute Y_h = attn_weights_h @ V_h for all heads.
+    // Y_h only depends on attn_weights (fixed from scoring) and V_all,
+    // so it can be computed once and reused in the per-head LS solve.
+    std::vector<std::vector<float>> Y_vecs(n_head_kv);
+    for (int h = 0; h < n_head_kv; h++) {
+        Y_vecs[h].resize(n_q_used * d_v, 0.0f);
+    }
+
+    bool gpu_refit = false;
+    if (kv_compact_hip_available()) {
+        std::vector<const float *> w_ptrs(n_head_kv);
+        std::vector<float *> y_ptrs(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            w_ptrs[h] = hcache[0][h].attn_weights.data();
+            y_ptrs[h] = Y_vecs[h].data();
+        }
+        int rc = kv_compact_hip_refit_target_all_heads(
+            w_ptrs.data(), V_all, y_ptrs.data(),
+            n_q_used, T, n_head_kv, d_v);
+        gpu_refit = (rc == 0);
+    }
+
+    if (!gpu_refit) {
+        // CPU fallback: per-head Y = attn_weights @ V_h
+        for (int h = 0; h < n_head_kv; h++) {
+            const auto & hc = hcache[0][h];
+            float * Y = Y_vecs[h].data();
+            for (int qi = 0; qi < n_q_used; qi++) {
+                for (int ki = 0; ki < T; ki++) {
+                    float w_ij = hc.attn_weights[qi * T + ki];
+                    const float * v_row = V_all + ki * n_embd_v + h * d_v;
+                    for (int d = 0; d < d_v; d++)
+                        Y[qi * d_v + d] += w_ij * v_row[d];
+                }
+            }
+        }
+    }
+
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hc = hcache[0][h];
         beta_vecs[h].resize(t);
@@ -491,17 +529,7 @@ int kv_compact(
         }
         softmax_rows(X.data(), n_q_used, t);
 
-        std::vector<float> Y(n_q_used * d_v, 0.0f);
-        for (int qi = 0; qi < n_q_used; qi++) {
-            for (int ki = 0; ki < T; ki++) {
-                float w_ij = hc.attn_weights[qi * T + ki];
-                const float * v_row = V_all + ki * n_embd_v + h * d_v;
-                for (int d = 0; d < d_v; d++)
-                    Y[qi * d_v + d] += w_ij * v_row[d];
-            }
-        }
-
-        least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
+        least_squares_solve(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
                            n_q_used, t, d_v, p.ridge);
     }
 
@@ -556,6 +584,8 @@ int kv_compact(
             selected[worst_slot] = best_unused;
             std::sort(selected.begin(), selected.end());
 
+            // Y_vecs[h] is unchanged (attn_weights and V_all are fixed) —
+            // reuse the precomputed values from before the per-head loop.
             for (int h = 0; h < n_head_kv; h++) {
                 const auto & hc = hcache[0][h];
 
@@ -581,17 +611,7 @@ int kv_compact(
                 }
                 softmax_rows(X.data(), n_q_used, t);
 
-                std::vector<float> Y(n_q_used * d_v, 0.0f);
-                for (int qi = 0; qi < n_q_used; qi++) {
-                    for (int ki = 0; ki < T; ki++) {
-                        float w_ij = hc.attn_weights[qi * T + ki];
-                        const float * v_row = V_all + ki * n_embd_v + h * d_v;
-                        for (int d = 0; d < d_v; d++)
-                            Y[qi * d_v + d] += w_ij * v_row[d];
-                    }
-                }
-
-                least_squares_solve(X.data(), Y.data(), cv_vecs[h].data(),
+                least_squares_solve(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
                                    n_q_used, t, d_v, p.ridge);
             }
         }
