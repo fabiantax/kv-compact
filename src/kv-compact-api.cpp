@@ -260,6 +260,7 @@ kv_compact_params kv_compact_params_default(void) {
     p.n_shared_prefix = 0;
     p.use_cheap_qref = 0;
     p.skip_beta = 1;
+    p.chunk_size = 0;
     p.layer_filter = NULL;
     p.layer_filter_data = NULL;
     return p;
@@ -314,6 +315,110 @@ int kv_compact(
     if (p.n_shared_prefix > t) {
         // If more prefix tokens than target, keep all prefix
         t = p.n_shared_prefix < T ? p.n_shared_prefix : T;
+    }
+
+    int n_embd_v_early = n_head_kv * d_v;
+
+    // ---- Chunked compaction: split T into segments to avoid OOM in LS ----
+    // The LS normal equations matrix is O(t²). With chunk_size C, each chunk's
+    // LS matrix is O((C*ratio)²) instead of O((T*ratio)²), bounding memory.
+    int effective_chunk_size = p.chunk_size;
+    if (effective_chunk_size == 0) {
+        // Auto: chunk when T > 8192, using 4096-token chunks
+        effective_chunk_size = (T > 8192) ? 4096 : T;
+    } else if (effective_chunk_size < 0) {
+        effective_chunk_size = T;  // disabled
+    }
+
+    if (effective_chunk_size < T) {
+        auto t_total = clock_type::now();
+
+        int n_chunks = (T + effective_chunk_size - 1) / effective_chunk_size;
+        std::vector<kv_compact_result> chunk_results(n_chunks);
+        std::vector<int> chunk_starts(n_chunks);
+        int total_selected = 0;
+
+        for (int c = 0; c < n_chunks; c++) {
+            int start = c * effective_chunk_size;
+            int end = start + effective_chunk_size;
+            if (end > T) end = T;
+            int chunk_T = end - start;
+
+            chunk_starts[c] = start;
+
+            // Disable further chunking in sub-calls
+            kv_compact_params chunk_p = p;
+            chunk_p.chunk_size = -1;
+
+            // Shared prefix only applies to the first chunk
+            if (c > 0) {
+                chunk_p.n_shared_prefix = 0;
+            }
+            if (chunk_p.n_shared_prefix > chunk_T) {
+                chunk_p.n_shared_prefix = chunk_T;
+            }
+
+            chunk_results[c] = {};
+            int rc = kv_compact(
+                K_all + (size_t)start * n_embd_k,
+                V_all + (size_t)start * n_embd_v_early,
+                Q_ref_used,
+                chunk_T, n_q_used, n_head_kv, d_k, d_v,
+                &chunk_p, &chunk_results[c]);
+
+            if (rc != 0) {
+                for (int i = 0; i <= c; i++) kv_compact_result_free(&chunk_results[i]);
+                return rc;
+            }
+            total_selected += chunk_results[c].t;
+        }
+
+        // Merge chunk results
+        result->t = total_selected;
+        result->n_head_kv = n_head_kv;
+        result->selected_indices = (int *) malloc(total_selected * sizeof(int));
+        result->beta = (float **) malloc(n_head_kv * sizeof(float *));
+        result->C_v  = (float **) malloc(n_head_kv * sizeof(float *));
+
+        for (int h = 0; h < n_head_kv; h++) {
+            result->beta[h] = (float *) malloc(total_selected * sizeof(float));
+            result->C_v[h]  = (float *) malloc((size_t)total_selected * d_v * sizeof(float));
+        }
+
+        int offset = 0;
+        for (int c = 0; c < n_chunks; c++) {
+            auto & cr = chunk_results[c];
+            for (int j = 0; j < cr.t; j++) {
+                result->selected_indices[offset + j] = cr.selected_indices[j] + chunk_starts[c];
+            }
+            for (int h = 0; h < n_head_kv; h++) {
+                memcpy(result->beta[h] + offset,
+                       cr.beta[h], cr.t * sizeof(float));
+                memcpy(result->C_v[h] + (size_t)offset * d_v,
+                       cr.C_v[h], (size_t)cr.t * d_v * sizeof(float));
+            }
+            offset += cr.t;
+        }
+
+        // Quality metrics against full original data
+        compute_quality_metrics(K_all, V_all, Q_ref_used,
+                               T, n_q_used, n_head_kv, d_k, d_v, result,
+                               &result->stats);
+
+        // Timing: total wall clock + sum of chunk phase timings
+        result->stats.elapsed_ms = elapsed_ms(t_total);
+        double total_scoring = 0.0, total_nnls = 0.0;
+        for (int c = 0; c < n_chunks; c++) {
+            total_scoring += chunk_results[c].stats.scoring_ms;
+            total_nnls += chunk_results[c].stats.nnls_ms;
+        }
+        result->stats.scoring_ms = total_scoring;
+        result->stats.nnls_ms = total_nnls;
+
+        for (int c = 0; c < n_chunks; c++) {
+            kv_compact_result_free(&chunk_results[c]);
+        }
+        return 0;
     }
 
     auto t_total = clock_type::now();

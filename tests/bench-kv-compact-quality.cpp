@@ -635,6 +635,141 @@ static void bench_eviction_vs_compaction() {
 }
 
 // ============================================================================
+// Benchmark 6: Chunked Compaction — Quality vs Chunk Size
+// ============================================================================
+// Measures the quality impact of chunking at various chunk sizes. Smaller
+// chunks use less memory but lose cross-chunk attention patterns.
+
+static void bench_chunked_quality() {
+    printf("=== Chunked Compaction — Quality vs Chunk Size ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_q = 64;
+
+    int T_sizes[] = {256, 512, 1024, 2048};
+    int chunk_sizes[] = {-1, 64, 128, 256, 512, 1024};
+
+    printf("  %-6s  %-8s  %-8s  %12s  %12s  %12s  %14s\n",
+           "T", "ratio", "chunk", "cos_sim", "mse", "time_ms", "LS_peak_MB");
+    printf("  %-6s  %-8s  %-8s  %12s  %12s  %12s  %14s\n",
+           "------", "--------", "--------", "------------", "------------",
+           "------------", "--------------");
+
+    for (int T : T_sizes) {
+        std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+        std::vector<float> Q(n_q * n_embd_k);
+        gen_data(K.data(), T * n_embd_k, 8000 + T);
+        gen_data(V.data(), T * n_embd_v, 8500 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 9000 + T);
+
+        float ratio = 0.5f;
+
+        for (int cs : chunk_sizes) {
+            // Skip chunk sizes larger than T (same as unchunked)
+            if (cs > 0 && cs >= T) continue;
+
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            p.chunk_size = cs;
+
+            kv_compact_result result = {};
+            auto t0 = clock_type::now();
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            double ms = std::chrono::duration<double, std::milli>(
+                clock_type::now() - t0).count();
+
+            assert(rc == 0);
+
+            // Estimate peak LS memory: t_chunk^2 * 4 bytes
+            int effective_cs = (cs < 0) ? T : cs;
+            int t_chunk = (int)(effective_cs * ratio);
+            double ls_peak_mb = (double)t_chunk * t_chunk * 4.0 / (1024.0 * 1024.0);
+
+            const char * cs_str = (cs < 0) ? "none" : "";
+            if (cs < 0) {
+                printf("  %-6d  %-8.0f%%  %-8s  %12.6f  %12.2e  %12.1f  %14.1f\n",
+                       T, ratio * 100, "none",
+                       result.stats.avg_cosine_sim, result.stats.avg_mse,
+                       ms, ls_peak_mb);
+            } else {
+                printf("  %-6d  %-8.0f%%  %-8d  %12.6f  %12.2e  %12.1f  %14.1f\n",
+                       T, ratio * 100, cs,
+                       result.stats.avg_cosine_sim, result.stats.avg_mse,
+                       ms, ls_peak_mb);
+            }
+            (void)cs_str;
+
+            assert(std::isfinite(result.stats.avg_cosine_sim));
+            kv_compact_result_free(&result);
+        }
+        printf("\n");
+    }
+}
+
+// ============================================================================
+// Benchmark 7: Chunked Compaction — Throughput at Large T
+// ============================================================================
+// Tests chunked compaction at context lengths that would OOM without chunking.
+// Measures throughput (tokens/sec) and verifies quality.
+
+static void bench_chunked_throughput_scaling() {
+    printf("=== Chunked Throughput Scaling (Large T) ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_q = 64;
+    const int chunk_size = 4096;
+
+    // T values up to 30k (would OOM without chunking at 50% retention)
+    int T_sizes[] = {1024, 2048, 4096, 8192, 16384, 30000};
+    float ratios[] = {0.5f, 0.2f};
+
+    printf("  %-7s  %-8s  %-8s  %12s  %14s  %12s\n",
+           "T", "ratio", "t", "time_ms", "tokens/sec", "cos_sim");
+    printf("  %-7s  %-8s  %-8s  %12s  %14s  %12s\n",
+           "-------", "--------", "--------", "------------",
+           "--------------", "------------");
+
+    for (int T : T_sizes) {
+        std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+        std::vector<float> Q(n_q * n_embd_k);
+        gen_data(K.data(), T * n_embd_k, 10000 + T);
+        gen_data(V.data(), T * n_embd_v, 11000 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 12000 + T);
+
+        for (float ratio : ratios) {
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            p.chunk_size = chunk_size;
+
+            kv_compact_result result = {};
+            auto t0 = clock_type::now();
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            double ms = std::chrono::duration<double, std::milli>(
+                clock_type::now() - t0).count();
+
+            assert(rc == 0);
+            double tokens_per_sec = T / (ms / 1000.0);
+
+            printf("  %-7d  %-8.0f%%  %-8d  %12.1f  %14.0f  %12.6f\n",
+                   T, ratio * 100, result.t, ms, tokens_per_sec,
+                   result.stats.avg_cosine_sim);
+
+            assert(std::isfinite(result.stats.avg_cosine_sim));
+            assert(result.stats.avg_cosine_sim > 0.9f);
+
+            kv_compact_result_free(&result);
+        }
+    }
+    printf("\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -647,6 +782,8 @@ int main() {
     bench_mass_preservation();
     bench_throughput_scaling();
     bench_eviction_vs_compaction();
+    bench_chunked_quality();
+    bench_chunked_throughput_scaling();
 
     printf("All quality benchmarks completed.\n");
     return 0;

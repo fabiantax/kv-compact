@@ -723,6 +723,321 @@ static void test_layer_filter_in_compaction() {
 }
 
 // ============================================================================
+// Chunked compaction tests
+// ============================================================================
+
+static void test_chunked_basic() {
+    printf("  test_chunked_basic...\n");
+    const int T = 512, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 6000);
+    gen_data(V.data(), T * n_embd_v, 6100);
+    gen_data(Q.data(), n_q * n_embd_k, 6200);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = 128;  // 4 chunks of 128 tokens each
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    // 50% of 512 = 256 selected (each chunk: 50% of 128 = 64, 4 chunks = 256)
+    assert(result.t == 256);
+    assert(result.n_head_kv == n_head_kv);
+    assert(result.selected_indices != NULL);
+    assert(result.beta != NULL);
+    assert(result.C_v != NULL);
+
+    // Indices should be sorted and in valid range
+    for (int i = 0; i < result.t; i++) {
+        assert(result.selected_indices[i] >= 0);
+        assert(result.selected_indices[i] < T);
+    }
+    for (int i = 1; i < result.t; i++) {
+        assert(result.selected_indices[i] > result.selected_indices[i - 1]);
+    }
+
+    // All values should be finite
+    for (int h = 0; h < n_head_kv; h++) {
+        for (int j = 0; j < result.t; j++) {
+            assert(std::isfinite(result.beta[h][j]));
+        }
+        for (int j = 0; j < result.t * d_v; j++) {
+            assert(std::isfinite(result.C_v[h][j]));
+        }
+    }
+
+    // Quality metrics should be computed against the full original
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    assert(result.stats.avg_cosine_sim > 0.8f);
+    assert(result.stats.elapsed_ms > 0.0);
+
+    printf("    t=%d cos=%.6f mse=%.8f time=%.1fms\n",
+           result.t, result.stats.avg_cosine_sim, result.stats.avg_mse,
+           result.stats.elapsed_ms);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_chunked_quality_vs_unchunked() {
+    printf("  test_chunked_quality_vs_unchunked...\n");
+    const int T = 256, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 6300);
+    gen_data(V.data(), T * n_embd_v, 6400);
+    gen_data(Q.data(), n_q * n_embd_k, 6500);
+
+    // Unchunked (baseline)
+    kv_compact_params p_unchunked = kv_compact_params_default();
+    p_unchunked.target_ratio = 0.5f;
+    p_unchunked.chunk_size = -1;
+
+    // Chunked (64-token chunks)
+    kv_compact_params p_chunked = kv_compact_params_default();
+    p_chunked.target_ratio = 0.5f;
+    p_chunked.chunk_size = 64;
+
+    kv_compact_result r_unchunked = {}, r_chunked = {};
+
+    int rc1 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v,
+                         &p_unchunked, &r_unchunked);
+    int rc2 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v,
+                         &p_chunked, &r_chunked);
+    assert(rc1 == 0);
+    assert(rc2 == 0);
+
+    // Both should select the same number of tokens
+    assert(r_unchunked.t == r_chunked.t);
+
+    printf("    Unchunked: cos=%.6f mse=%.8f time=%.1fms\n",
+           r_unchunked.stats.avg_cosine_sim, r_unchunked.stats.avg_mse,
+           r_unchunked.stats.elapsed_ms);
+    printf("    Chunked:   cos=%.6f mse=%.8f time=%.1fms\n",
+           r_chunked.stats.avg_cosine_sim, r_chunked.stats.avg_mse,
+           r_chunked.stats.elapsed_ms);
+
+    // Chunked may lose some quality from cross-chunk attention, but should
+    // still be reasonable (within 10% of unchunked cosine similarity)
+    assert(r_chunked.stats.avg_cosine_sim > r_unchunked.stats.avg_cosine_sim - 0.1f);
+    assert(r_chunked.stats.avg_cosine_sim > 0.8f);
+
+    kv_compact_result_free(&r_unchunked);
+    kv_compact_result_free(&r_chunked);
+    printf("  OK\n");
+}
+
+static void test_chunked_no_chunk_when_small() {
+    printf("  test_chunked_no_chunk_when_small...\n");
+    // With auto chunk_size (0), T=128 should NOT be chunked
+    const int T = 128, n_q = 64, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 6600);
+    gen_data(V.data(), T * n_embd_v, 6700);
+    gen_data(Q.data(), n_q * n_embd_k, 6800);
+
+    // Auto mode (chunk_size = 0): T=128 < 8192, so no chunking
+    kv_compact_params p_auto = kv_compact_params_default();
+    p_auto.target_ratio = 0.5f;
+
+    // Explicit disabled
+    kv_compact_params p_disabled = kv_compact_params_default();
+    p_disabled.target_ratio = 0.5f;
+    p_disabled.chunk_size = -1;
+
+    kv_compact_result r_auto = {}, r_disabled = {};
+    int rc1 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v,
+                         &p_auto, &r_auto);
+    int rc2 = kv_compact(K.data(), V.data(), Q.data(),
+                         T, n_q, n_head_kv, d_k, d_v,
+                         &p_disabled, &r_disabled);
+    assert(rc1 == 0);
+    assert(rc2 == 0);
+
+    // Should produce identical results (no chunking in either case)
+    assert(r_auto.t == r_disabled.t);
+    for (int i = 0; i < r_auto.t; i++) {
+        assert(r_auto.selected_indices[i] == r_disabled.selected_indices[i]);
+    }
+
+    printf("    Auto vs disabled identical: yes (t=%d)\n", r_auto.t);
+
+    kv_compact_result_free(&r_auto);
+    kv_compact_result_free(&r_disabled);
+    printf("  OK\n");
+}
+
+static void test_chunked_uneven_chunks() {
+    printf("  test_chunked_uneven_chunks...\n");
+    // T=500 with chunk_size=200: chunks of 200, 200, 100
+    const int T = 500, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 6900);
+    gen_data(V.data(), T * n_embd_v, 7000);
+    gen_data(Q.data(), n_q * n_embd_k, 7100);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = 200;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    // 50% of 200=100, 50% of 200=100, 50% of 100=50 → total 250
+    assert(result.t == 250);
+
+    // Indices should span the full range [0, T)
+    assert(result.selected_indices[0] >= 0);
+    assert(result.selected_indices[result.t - 1] < T);
+    for (int i = 1; i < result.t; i++) {
+        assert(result.selected_indices[i] > result.selected_indices[i - 1]);
+    }
+
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    printf("    t=%d cos=%.6f (3 uneven chunks: 200+200+100)\n",
+           result.t, result.stats.avg_cosine_sim);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_chunked_with_shared_prefix() {
+    printf("  test_chunked_with_shared_prefix...\n");
+    const int T = 256, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 7200);
+    gen_data(V.data(), T * n_embd_v, 7300);
+    gen_data(Q.data(), n_q * n_embd_k, 7400);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = 64;
+    p.n_shared_prefix = 8;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    // First 8 positions (in the first chunk) should be preserved
+    for (int j = 0; j < 8; j++) {
+        bool found = false;
+        for (int k = 0; k < result.t; k++) {
+            if (result.selected_indices[k] == j) { found = true; break; }
+        }
+        assert(found);
+    }
+
+    printf("    Prefix 0-7 preserved in chunked mode: yes\n");
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_chunked_with_cheap_qref() {
+    printf("  test_chunked_with_cheap_qref...\n");
+    const int T = 512, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v);
+    gen_data(K.data(), T * n_embd_k, 7500);
+    gen_data(V.data(), T * n_embd_v, 7600);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = 128;
+    p.use_cheap_qref = 1;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), NULL,
+                        T, 0, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+    assert(result.t == 256);
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+
+    printf("    Chunked+cheap_qref: t=%d cos=%.6f\n",
+           result.t, result.stats.avg_cosine_sim);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_chunked_params_default() {
+    printf("  test_chunked_params_default...");
+    kv_compact_params p = kv_compact_params_default();
+    assert(p.chunk_size == 0);  // auto mode
+    printf(" OK\n");
+}
+
+static void test_chunked_large_T() {
+    printf("  test_chunked_large_T...\n");
+    // T=20000 would OOM without chunking (t=10000, AtA=400MB)
+    // With chunk_size=4096, each chunk's t=2048, AtA=16MB
+    const int T = 20000, n_q = 64, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+    std::vector<float> Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 7700);
+    gen_data(V.data(), T * n_embd_v, 7800);
+    gen_data(Q.data(), n_q * n_embd_k, 7900);
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = 4096;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(),
+                        T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    // 5 chunks of 4096 = 20480, but T=20000, so:
+    // 4 full chunks of 4096 + 1 chunk of 3616 = 20000
+    // Selected: 4*2048 + 1808 = 10000
+    assert(result.t == 10000);
+
+    for (int i = 0; i < result.t; i++) {
+        assert(result.selected_indices[i] >= 0);
+        assert(result.selected_indices[i] < T);
+    }
+    for (int i = 1; i < result.t; i++) {
+        assert(result.selected_indices[i] > result.selected_indices[i - 1]);
+    }
+
+    assert(std::isfinite(result.stats.avg_cosine_sim));
+    printf("    T=%d chunk=4096: t=%d cos=%.6f time=%.1fms (no OOM!)\n",
+           T, result.t, result.stats.avg_cosine_sim, result.stats.elapsed_ms);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -775,6 +1090,16 @@ int main() {
     test_layer_filter_count();
     test_layer_filter_should_compact();
     test_layer_filter_in_compaction();
+
+    printf("\n=== Chunked compaction ===\n");
+    test_chunked_params_default();
+    test_chunked_basic();
+    test_chunked_quality_vs_unchunked();
+    test_chunked_no_chunk_when_small();
+    test_chunked_uneven_chunks();
+    test_chunked_with_shared_prefix();
+    test_chunked_with_cheap_qref();
+    test_chunked_large_T();
 
     printf("\nAll tests passed!\n");
     return 0;
