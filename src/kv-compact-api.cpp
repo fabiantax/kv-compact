@@ -259,6 +259,7 @@ kv_compact_params kv_compact_params_default(void) {
     p.diversity_strength = 0.5f;
     p.n_shared_prefix = 0;
     p.use_cheap_qref = 0;
+    p.skip_beta = 1;
     p.layer_filter = NULL;
     p.layer_filter_data = NULL;
     return p;
@@ -344,9 +345,11 @@ int kv_compact(
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
         hc.scores.resize(n_q_used * T);
-        hc.exp_scores.resize(n_q_used * T);
-        hc.row_sums.resize(n_q_used);
         hc.attn_weights.resize(n_q_used * T);
+        if (!p.skip_beta) {
+            hc.exp_scores.resize(n_q_used * T);
+            hc.row_sums.resize(n_q_used);
+        }
     }
 
     // Try GPU-accelerated scoring for all heads at once.
@@ -381,14 +384,20 @@ int kv_compact(
         }
     }
 
-    // Fused post-processing: exp + softmax + per-key importance in a single pass
+    // Fused post-processing: softmax + per-key importance
+    // When skip_beta, use lighter version (no exp_scores/row_sums needed)
     for (int h = 0; h < n_head_kv; h++) {
         auto & hc = hcache[0][h];
-
         std::vector<float> head_imp(T);
-        exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
-                                     hc.row_sums.data(), hc.attn_weights.data(),
+
+        if (p.skip_beta) {
+            softmax_importance_fused(hc.scores.data(), hc.attn_weights.data(),
                                      head_imp.data(), n_q_used, T);
+        } else {
+            exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
+                                         hc.row_sums.data(), hc.attn_weights.data(),
+                                         head_imp.data(), n_q_used, T);
+        }
 
         if (p.use_sensitivity) {
             float sens = compute_head_sensitivity(hc.attn_weights.data(), n_q_used, T);
@@ -487,19 +496,24 @@ int kv_compact(
         beta_vecs[h].resize(t);
         cv_vecs[h].resize(t * d_v);
 
-        // NNLS for beta
-        std::vector<float> M(n_q_used * t);
-        for (int qi = 0; qi < n_q_used; qi++) {
-            for (int j = 0; j < t; j++) {
-                M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+        if (p.skip_beta) {
+            // Skip NNLS: beta = 0, go straight to LS value refit
+            std::fill(beta_vecs[h].begin(), beta_vecs[h].end(), 0.0f);
+        } else {
+            // NNLS for beta (Section 3.2)
+            std::vector<float> M(n_q_used * t);
+            for (int qi = 0; qi < n_q_used; qi++) {
+                for (int j = 0; j < t; j++) {
+                    M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+                }
             }
-        }
 
-        std::vector<float> w(t);
-        nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+            std::vector<float> w(t);
+            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
 
-        for (int j = 0; j < t; j++) {
-            beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+            for (int j = 0; j < t; j++) {
+                beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+            }
         }
 
         // Least squares for C_v
@@ -571,18 +585,22 @@ int kv_compact(
             for (int h = 0; h < n_head_kv; h++) {
                 const auto & hc = hcache[0][h];
 
-                std::vector<float> M(n_q_used * t);
-                for (int qi = 0; qi < n_q_used; qi++) {
-                    for (int j = 0; j < t; j++) {
-                        M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+                if (p.skip_beta) {
+                    std::fill(beta_vecs[h].begin(), beta_vecs[h].end(), 0.0f);
+                } else {
+                    std::vector<float> M(n_q_used * t);
+                    for (int qi = 0; qi < n_q_used; qi++) {
+                        for (int j = 0; j < t; j++) {
+                            M[qi * t + j] = hc.exp_scores[qi * T + selected[j]];
+                        }
                     }
-                }
 
-                std::vector<float> w(t);
-                nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
+                    std::vector<float> w(t);
+                    nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_q_used, t, p.nnls_max_iter);
 
-                for (int j = 0; j < t; j++) {
-                    beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+                    for (int j = 0; j < t; j++) {
+                        beta_vecs[h][j] = logf(std::max(1e-12f, w[j]));
+                    }
                 }
 
                 std::vector<float> X(n_q_used * t);

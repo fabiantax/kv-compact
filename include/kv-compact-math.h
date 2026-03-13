@@ -163,6 +163,38 @@ static void exp_softmax_importance_fused(
     }
 }
 
+// Lightweight fused softmax + per-column importance (no exp_out/row_sums).
+// When beta is skipped, we don't need exp_scores or row_sums.
+// Saves memory allocation and avoids unnecessary buffer writes.
+static void softmax_importance_fused(
+        const float * scores, float * softmax_out, float * importance, int m, int n) {
+    memset(importance, 0, n * sizeof(float));
+
+    for (int i = 0; i < m; i++) {
+        const float * row = scores + i * n;
+        float * sm_row  = softmax_out + i * n;
+
+        float max_val = row[0];
+        for (int j = 1; j < n; j++) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            float e = expf(row[j] - max_val);
+            sm_row[j] = e;
+            sum += e;
+        }
+
+        float inv_sum = 1.0f / (sum + 1e-12f);
+        for (int j = 0; j < n; j++) {
+            float sm = sm_row[j] * inv_sum;
+            sm_row[j] = sm;
+            if (sm > importance[j]) importance[j] = sm;
+        }
+    }
+}
+
 // Extract per-head slice from interleaved layout into contiguous buffer.
 //   src:       [rows × stride] interleaved data
 //   dst:       [rows × width] contiguous output
@@ -647,26 +679,10 @@ static compacted_head compact_head_highest_attn(
         scores[i] *= inv_sqrt_dk;
     }
 
-    // Compute exp(scores) with max-shift for mass computation
-    std::vector<float> exp_scores(scores); // copy
-    std::vector<float> row_sums(n_q);
-    exp_rows_stable(exp_scores.data(), row_sums.data(), n_q, T);
-
-    // Compute softmax attention weights for key scoring
-    std::vector<float> attn_weights(scores);
-    softmax_rows(attn_weights.data(), n_q, T);
-
-    // Score each key by max attention weight across queries (Section 3.1):
-    //   importance(j) = max_i softmax(S)_{i,j}
-    std::vector<float> key_scores(T, 0.0f);
-    for (int j = 0; j < T; j++) {
-        float max_score = 0.0f;
-        for (int i = 0; i < n_q; i++) {
-            float w = attn_weights[i * T + j];
-            if (w > max_score) max_score = w;
-        }
-        key_scores[j] = max_score;
-    }
+    // Fused softmax + importance scoring
+    std::vector<float> attn_weights(n_q * T);
+    std::vector<float> key_scores(T);
+    softmax_importance_fused(scores.data(), attn_weights.data(), key_scores.data(), n_q, T);
 
     // Select top-t keys by score
     std::vector<int> indices(T);
@@ -679,30 +695,10 @@ static compacted_head compact_head_highest_attn(
     std::sort(selected.begin(), selected.end());
     result.selected_indices = selected;
 
-    // ---- Step 2: Mass Matching / Beta (Section 3.2, Eq. 4) ----
-    // Solve NNLS: M * w ≈ m  where w_j = exp(beta_j)
-    //   M_ij = exp(q_i @ k_{sel[j]} / sqrt(d))  — design matrix
-    //   m_i  = sum_j exp(q_i @ K_j / sqrt(d))    — target partition function
-    // This preserves the total attention mass (partition function) so that
-    // softmax over selected keys + beta matches the original distribution.
+    // Beta = 0 (skip NNLS — LS value refit alone achieves equal or better quality)
+    std::fill(result.beta.begin(), result.beta.end(), 0.0f);
 
-    std::vector<float> M(n_q * t);
-    for (int i = 0; i < n_q; i++) {
-        for (int j = 0; j < t; j++) {
-            M[i * t + j] = exp_scores[i * T + selected[j]];
-        }
-    }
-
-    // Target mass: already computed as row_sums
-    std::vector<float> w(t);
-    nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
-
-    // beta = log(w)
-    for (int j = 0; j < t; j++) {
-        result.beta[j] = logf(std::max(1e-12f, w[j]));
-    }
-
-    // ---- Step 3: Value Refitting / C_v (Section 3.3, Eq. 6) ----
+    // ---- Value Refitting / C_v (Section 3.3, Eq. 6) ----
     // Solve least squares: X * C_v = Y
     //   X_ij = softmax(q_i @ k_{sel[j]} / sqrt(d) + beta_j)  — compacted attn weights
     //   Y_i  = softmax(q_i @ K / sqrt(d)) @ V                — original attn output
@@ -791,11 +787,9 @@ static compacted_layer compact_layer_all_heads(
     // Compute per-head key importance scores, then take max across heads
     std::vector<float> global_scores(T, 0.0f);
 
-    // Per-head temporary data for reuse in steps 2-3
+    // Per-head temporary data for reuse in LS step
     struct head_data {
         std::vector<float> scores;      // [n_q, T] scaled attention logits
-        std::vector<float> exp_scores;  // [n_q, T] exp with max-shift
-        std::vector<float> row_sums;    // [n_q] sum of exp per query
         std::vector<float> attn_weights;// [n_q, T] softmax attention
     };
     std::vector<head_data> hdata(n_head_kv);
@@ -810,8 +804,6 @@ static compacted_layer compact_layer_all_heads(
     for (int h = 0; h < n_head_kv; h++) {
         auto & hd = hdata[h];
         hd.scores.resize(n_q * T);
-        hd.exp_scores.resize(n_q * T);
-        hd.row_sums.resize(n_q);
         hd.attn_weights.resize(n_q * T);
 
         // Extract per-head Q_ref and K into contiguous buffers for cache-friendly matmul
@@ -823,11 +815,10 @@ static compacted_layer compact_layer_all_heads(
         mat_mul_ABt(q_buf.data(), k_buf.data(), hd.scores.data(), n_q, T, d_k);
         for (int i = 0; i < n_q * T; i++) hd.scores[i] *= inv_sqrt_dk;
 
-        // Fused: exp + softmax + per-key importance in a single pass
+        // Fused: softmax + per-key importance in a single pass
         std::vector<float> head_importance(T);
-        exp_softmax_importance_fused(hd.scores.data(), hd.exp_scores.data(),
-                                     hd.row_sums.data(), hd.attn_weights.data(),
-                                     head_importance.data(), n_q, T);
+        softmax_importance_fused(hd.scores.data(), hd.attn_weights.data(),
+                                 head_importance.data(), n_q, T);
 
         // Global score = max across heads
         for (int j = 0; j < T; j++) {
@@ -853,31 +844,15 @@ static compacted_layer compact_layer_all_heads(
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hd = hdata[h];
 
-        result.beta[h].resize(t);
+        result.beta[h].assign(t, 0.0f);
         result.C_v[h].resize(t * d_v);
 
-        // Step 2: NNLS for beta (Section 3.2, Eq. 4)
-        // M_ij = exp(q_i @ k_{sel[j]} / sqrt(d)), target = partition function
-        std::vector<float> M(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
-            for (int j = 0; j < t; j++) {
-                M[qi * t + j] = hd.exp_scores[qi * T + selected[j]];
-            }
-        }
-
-        std::vector<float> w(t);
-        nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
-
-        for (int j = 0; j < t; j++) {
-            result.beta[h][j] = logf(std::max(1e-12f, w[j]));
-        }
-
-        // Step 3: Least squares for C_v (Section 3.3, Eq. 6)
-        // X_ij = softmax(score[qi, sel[j]] + beta[j]), Y = original attn output
+        // Least squares for C_v (Section 3.3, Eq. 6)
+        // X_ij = softmax(score[qi, sel[j]]), Y = original attn output
         std::vector<float> X(n_q * t);
         for (int qi = 0; qi < n_q; qi++) {
             for (int j = 0; j < t; j++) {
-                X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
+                X[qi * t + j] = hd.scores[qi * T + selected[j]];
             }
         }
         softmax_rows(X.data(), n_q, t);

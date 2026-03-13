@@ -508,8 +508,6 @@ int main(int argc, char ** argv) {
         for (int h = 0; h < n_head_kv; h++) {
             auto & hc = lh_cache[l][h];
             hc.scores.resize(n_ref_queries * T);
-            hc.exp_scores.resize(n_ref_queries * T);
-            hc.row_sums.resize(n_ref_queries);
             hc.attn_weights.resize(n_ref_queries * T);
 
             // Extract per-head Q_ref and K into contiguous buffers for cache-friendly matmul
@@ -526,11 +524,10 @@ int main(int argc, char ** argv) {
                 hc.scores[i] *= inv_sqrt_dk;
             }
 
-            // Fused: exp + softmax + per-key importance in a single pass
+            // Fused: softmax + per-key importance in a single pass
             std::vector<float> head_importance(T);
-            exp_softmax_importance_fused(hc.scores.data(), hc.exp_scores.data(),
-                                         hc.row_sums.data(), hc.attn_weights.data(),
-                                         head_importance.data(), n_ref_queries, T);
+            softmax_importance_fused(hc.scores.data(), hc.attn_weights.data(),
+                                     head_importance.data(), n_ref_queries, T);
 
             if (sensitivity_budget) {
                 // Store per-head importance and sensitivity for weighted aggregation
@@ -622,22 +619,10 @@ int main(int argc, char ** argv) {
             beta.resize(t);
             cv.resize(t * d_v);
 
-            // Step 2: NNLS for beta
-            std::vector<float> M(n_ref_queries * t);
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                for (int j = 0; j < t; j++) {
-                    M[qi * t + j] = hc.exp_scores[qi * T + shared_selected[j]];
-                }
-            }
+            // Beta = 0 (skip NNLS — LS value refit alone achieves equal or better quality)
+            std::fill(beta.begin(), beta.end(), 0.0f);
 
-            std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t);
-
-            for (int j = 0; j < t; j++) {
-                beta[j] = logf(std::max(1e-12f, w[j]));
-            }
-
-            // Step 3: Least squares for C_v
+            // Least squares for C_v
             std::vector<float> X(n_ref_queries * t);
             for (int qi = 0; qi < n_ref_queries; qi++) {
                 for (int j = 0; j < t; j++) {
