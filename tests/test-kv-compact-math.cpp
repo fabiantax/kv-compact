@@ -2755,6 +2755,306 @@ static void test_streaming_compactor_basic_workflow() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// Spiky-head detection and bypass tests
+// ============================================================================
+
+static void test_spiky_head_detection_onehot() {
+    printf("  test_spiky_head_detection_onehot...");
+    // One-hot attention: all mass on token 0
+    const int n_q = 4, T = 10;
+    std::vector<float> attn(n_q * T, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + 0] = 1.0f;  // all queries attend to token 0
+    }
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    assert(stats.mean_entropy < 0.01f);
+    assert(stats.mean_top1_mass > 0.999f);
+    assert(is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_detection_uniform() {
+    printf("  test_spiky_head_detection_uniform...");
+    // Uniform attention: equal mass on all tokens
+    const int n_q = 4, T = 10;
+    std::vector<float> attn(n_q * T, 1.0f / T);
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    assert(stats.mean_entropy > 1.0f);  // ln(10) ≈ 2.3
+    assert(stats.mean_top1_mass < 0.2f);
+    assert(!is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_detection_near_onehot() {
+    printf("  test_spiky_head_detection_near_onehot...");
+    // Near one-hot: 99.5% on one token, 0.5% spread across rest
+    const int n_q = 4, T = 20;
+    std::vector<float> attn(n_q * T);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + 3] = 0.995f;
+        float rest = 0.005f / (T - 1);
+        for (int j = 0; j < T; j++) {
+            if (j != 3) attn[qi * T + j] = rest;
+        }
+    }
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    assert(stats.mean_entropy < 0.1f);
+    assert(stats.mean_top1_mass > 0.99f);
+    assert(is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_detection_moderate() {
+    printf("  test_spiky_head_detection_moderate...");
+    // Moderate concentration: 80% on one token (should NOT trigger)
+    const int n_q = 4, T = 10;
+    std::vector<float> attn(n_q * T);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + 0] = 0.80f;
+        float rest = 0.20f / (T - 1);
+        for (int j = 1; j < T; j++) attn[qi * T + j] = rest;
+    }
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    assert(!is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_detection_per_query_variation() {
+    printf("  test_spiky_head_detection_per_query_variation...");
+    // Different queries attend to different single tokens
+    // Still one-hot per query, so should be detected as spiky
+    const int n_q = 4, T = 10;
+    std::vector<float> attn(n_q * T, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + (qi % T)] = 1.0f;  // each query → different token
+    }
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    assert(stats.mean_entropy < 0.01f);
+    assert(stats.mean_top1_mass > 0.999f);
+    assert(is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_custom_thresholds() {
+    printf("  test_spiky_head_custom_thresholds...");
+    // 95% on one token with custom thresholds
+    const int n_q = 2, T = 10;
+    std::vector<float> attn(n_q * T);
+    for (int qi = 0; qi < n_q; qi++) {
+        attn[qi * T + 0] = 0.95f;
+        float rest = 0.05f / (T - 1);
+        for (int j = 1; j < T; j++) attn[qi * T + j] = rest;
+    }
+    auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+    // Default thresholds: should NOT trigger (top1=0.95 < 0.99)
+    assert(!is_spiky_head(stats));
+    // Relaxed thresholds: should trigger
+    assert(is_spiky_head(stats, 0.5f, 0.90f));
+    printf(" OK\n");
+}
+
+static void test_spiky_head_empty_input() {
+    printf("  test_spiky_head_empty_input...");
+    auto stats = compute_head_attention_stats(nullptr, 0, 0);
+    assert(stats.mean_entropy == 0.0f);
+    assert(stats.mean_top1_mass == 0.0f);
+    // Should not crash, and should not be spiky
+    assert(!is_spiky_head(stats));
+    printf(" OK\n");
+}
+
+// Property-based test: monotonicity of spikiness
+// More concentrated attention → lower entropy, higher top1
+static void test_spiky_property_monotonicity() {
+    printf("  test_spiky_property_monotonicity...");
+    const int n_q = 8, T = 50;
+    float prev_entropy = 100.0f;
+    float prev_top1 = 0.0f;
+
+    // Sweep concentration from 10% to 99.9%
+    for (float concentration = 0.1f; concentration <= 0.999f; concentration += 0.05f) {
+        std::vector<float> attn(n_q * T);
+        float rest = (1.0f - concentration) / (T - 1);
+        for (int qi = 0; qi < n_q; qi++) {
+            attn[qi * T + 0] = concentration;
+            for (int j = 1; j < T; j++) attn[qi * T + j] = rest;
+        }
+        auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+        assert(stats.mean_entropy <= prev_entropy + 1e-6f);
+        assert(stats.mean_top1_mass >= prev_top1 - 1e-6f);
+        prev_entropy = stats.mean_entropy;
+        prev_top1 = stats.mean_top1_mass;
+    }
+    printf(" OK\n");
+}
+
+// Property-based test: spiky bypass output matches original for one-hot attention
+static void test_spiky_bypass_output_matches_original() {
+    printf("  test_spiky_bypass_output_matches_original...");
+    // Setup: 1 head, 20 tokens, d_v=4, d_k=8
+    const int T = 20, d_k = 8, d_v = 4, n_q = 4, t = 5;
+    const int n_head_kv = 1;
+    const int n_embd_k_gqa = n_head_kv * d_k;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+
+    // Random K and V
+    std::vector<float> K(T * n_embd_k_gqa), V(T * n_embd_v_gqa);
+    for (int i = 0; i < (int)K.size(); i++) K[i] = 0.1f * ((i * 7 + 3) % 17 - 8);
+    for (int i = 0; i < (int)V.size(); i++) V[i] = 0.1f * ((i * 13 + 5) % 23 - 11);
+
+    // Select tokens 0,3,5,10,15
+    int selected[] = {0, 3, 5, 10, 15};
+
+    // Make one-hot attention: query attends to token 5 (index 2 in selected)
+    // Set K[5] to a unique direction and Q aligned with it, large scaling
+    // to ensure softmax is truly one-hot
+    for (int d = 0; d < d_k; d++) {
+        K[5 * n_embd_k_gqa + d] = (d == 0) ? 1.0f : 0.0f;  // unit vector
+    }
+    std::vector<float> Q(n_q * n_embd_k_gqa, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        Q[qi * n_embd_k_gqa + 0] = 1000.0f;  // strongly aligned with K[5]
+    }
+
+    // Compute original attention output: softmax(Q@K^T/sqrt(d_k)) @ V
+    float inv_sqrt = 1.0f / sqrtf((float)d_k);
+    std::vector<float> scores(n_q * T);
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int j = 0; j < T; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++)
+                dot += Q[qi * n_embd_k_gqa + d] * K[j * n_embd_k_gqa + d];
+            scores[qi * T + j] = dot * inv_sqrt;
+        }
+    }
+    softmax_rows(scores.data(), n_q, T);
+
+    // Original output
+    std::vector<float> orig_out(n_q * d_v, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int j = 0; j < T; j++) {
+            for (int d = 0; d < d_v; d++) {
+                orig_out[qi * d_v + d] += scores[qi * T + j] * V[j * n_embd_v_gqa + d];
+            }
+        }
+    }
+
+    // Spiky bypass: C_v = original V at selected positions, beta = 0
+    std::vector<float> cv(t * d_v);
+    fill_original_values(V.data(), selected, cv.data(), t, 0, d_v, n_embd_v_gqa);
+
+    // Compacted output: softmax(Q@K_selected^T/sqrt(d_k)) @ C_v
+    std::vector<float> comp_scores(n_q * t);
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int j = 0; j < t; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++)
+                dot += Q[qi * n_embd_k_gqa + d] * K[selected[j] * n_embd_k_gqa + d];
+            comp_scores[qi * t + j] = dot * inv_sqrt;  // beta = 0
+        }
+    }
+    softmax_rows(comp_scores.data(), n_q, t);
+
+    std::vector<float> comp_out(n_q * d_v, 0.0f);
+    for (int qi = 0; qi < n_q; qi++) {
+        for (int j = 0; j < t; j++) {
+            for (int d = 0; d < d_v; d++) {
+                comp_out[qi * d_v + d] += comp_scores[qi * t + j] * cv[j * d_v + d];
+            }
+        }
+    }
+
+    // For one-hot attention to token 5 (which is in our selection),
+    // the outputs should match closely
+    for (int qi = 0; qi < n_q; qi++) {
+        float dot = 0.0f, n_o = 0.0f, n_c = 0.0f;
+        for (int d = 0; d < d_v; d++) {
+            dot += orig_out[qi * d_v + d] * comp_out[qi * d_v + d];
+            n_o += orig_out[qi * d_v + d] * orig_out[qi * d_v + d];
+            n_c += comp_out[qi * d_v + d] * comp_out[qi * d_v + d];
+        }
+        float cos_sim = dot / (sqrtf(n_o * n_c) + 1e-8f);
+        assert(cos_sim > 0.999f);  // Near-perfect match for one-hot attention
+    }
+    printf(" OK\n");
+}
+
+// Property-based test: fill_original_values is an identity mapping
+static void test_fill_original_values_identity() {
+    printf("  test_fill_original_values_identity...");
+    const int T = 10, d_v = 4, n_head_kv = 2;
+    const int n_embd_v_gqa = n_head_kv * d_v;
+    std::vector<float> V(T * n_embd_v_gqa);
+    for (int i = 0; i < (int)V.size(); i++) V[i] = (float)i;
+
+    int selected[] = {2, 5, 8};
+    const int t = 3;
+
+    for (int h = 0; h < n_head_kv; h++) {
+        std::vector<float> cv(t * d_v);
+        fill_original_values(V.data(), selected, cv.data(), t, h, d_v, n_embd_v_gqa);
+
+        for (int j = 0; j < t; j++) {
+            for (int d = 0; d < d_v; d++) {
+                float expected = V[selected[j] * n_embd_v_gqa + h * d_v + d];
+                assert(approx_eq(cv[j * d_v + d], expected));
+            }
+        }
+    }
+    printf(" OK\n");
+}
+
+// Property-based test: entropy is zero iff distribution is one-hot
+static void test_spiky_property_entropy_zero_iff_onehot() {
+    printf("  test_spiky_property_entropy_zero_iff_onehot...");
+    const int T = 10;
+
+    // Pure one-hot: entropy should be exactly 0
+    for (int target = 0; target < T; target++) {
+        std::vector<float> attn(T, 0.0f);
+        attn[target] = 1.0f;
+        auto stats = compute_head_attention_stats(attn.data(), 1, T);
+        assert(stats.mean_entropy < 1e-6f);
+        assert(stats.mean_top1_mass > 0.999f);
+    }
+
+    // Any non-degenerate distribution: entropy > 0
+    for (float p = 0.5f; p < 0.99f; p += 0.1f) {
+        std::vector<float> attn(T);
+        attn[0] = p;
+        float rest = (1.0f - p) / (T - 1);
+        for (int j = 1; j < T; j++) attn[j] = rest;
+        auto stats = compute_head_attention_stats(attn.data(), 1, T);
+        assert(stats.mean_entropy > 0.0f);
+    }
+    printf(" OK\n");
+}
+
+// Property-based test: for truly uniform attention, all budgets should be equal
+// (spiky detection should never fire on uniform heads)
+static void test_spiky_property_never_fires_on_spread_attention() {
+    printf("  test_spiky_property_never_fires_on_spread_attention...");
+    const int n_q = 16, T = 100;
+
+    // Various spread distributions
+    float spreads[] = {0.05f, 0.1f, 0.2f, 0.3f, 0.5f};
+    for (float top_mass : spreads) {
+        std::vector<float> attn(n_q * T);
+        for (int qi = 0; qi < n_q; qi++) {
+            // Top token gets 'top_mass', rest is uniform
+            attn[qi * T + (qi % T)] = top_mass;
+            float rest = (1.0f - top_mass) / (T - 1);
+            for (int j = 0; j < T; j++) {
+                if (j != qi % T) attn[qi * T + j] = rest;
+            }
+        }
+        auto stats = compute_head_attention_stats(attn.data(), n_q, T);
+        assert(!is_spiky_head(stats));
+    }
+    printf(" OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -2873,6 +3173,22 @@ int main() {
     test_streaming_config_helpers();
     test_streaming_compactor_init();
     test_streaming_compactor_basic_workflow();
+
+    printf("\n=== Spiky-head detection ===\n");
+    test_spiky_head_detection_onehot();
+    test_spiky_head_detection_uniform();
+    test_spiky_head_detection_near_onehot();
+    test_spiky_head_detection_moderate();
+    test_spiky_head_detection_per_query_variation();
+    test_spiky_head_custom_thresholds();
+    test_spiky_head_empty_input();
+
+    printf("\n=== Spiky-head bypass properties ===\n");
+    test_spiky_property_monotonicity();
+    test_spiky_bypass_output_matches_original();
+    test_fill_original_values_identity();
+    test_spiky_property_entropy_zero_iff_onehot();
+    test_spiky_property_never_fires_on_spread_attention();
 
     printf("\nAll tests passed!\n");
     return 0;

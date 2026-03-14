@@ -412,6 +412,169 @@ int main() {
         printf("  (d_v+1=%d)\n", D_HEAD + 1);
     }
 
+    // ================================================================
+    // Spiky-head bypass benchmark
+    // ================================================================
+    printf("\n=== Spiky-Head Bypass Benchmark ===\n");
+    printf("%-10s %5s %5s  %12s %12s  %12s %12s  %10s\n",
+           "scenario", "T", "t", "cos_sim_byp", "cos_sim_fit",
+           "mse_bypass", "mse_fitted", "bypass_us");
+
+    for (int scenario = 0; scenario < 3; scenario++) {
+        const char * scenario_name = nullptr;
+        float concentration = 0.0f;
+
+        switch (scenario) {
+            case 0: scenario_name = "onehot";   concentration = 0.999f; break;
+            case 1: scenario_name = "spiky";    concentration = 0.95f;  break;
+            case 2: scenario_name = "spread";   concentration = 0.3f;   break;
+        }
+
+        for (auto & tc : cases) {
+            if (tc.T > 1024) continue;  // skip very large for speed
+
+            std::vector<float> K, V, Q_ref, Q_eval;
+            generate_data(K, V, Q_ref, Q_eval, tc.T, N_HEAD_KV, D_HEAD, D_HEAD,
+                         N_Q_REF, N_Q_EVAL);
+
+            int t = tc.T / 5;  // keep 20%
+            if (t < 4) continue;
+
+            // Make head 0's attention spiky: all queries attend to same token
+            // by modifying Q_ref to align with K[0]
+            const int n_embd_k = N_HEAD_KV * D_HEAD;
+            const int n_embd_v = N_HEAD_KV * D_HEAD;
+            const int h = 0;
+
+            // Set K[0] to a distinct direction for head h
+            for (int d = 0; d < D_HEAD; d++) {
+                K[0 * n_embd_k + h * D_HEAD + d] = (d == 0) ? 10.0f : 0.0f;
+            }
+            // Scale Q_ref to make attention concentrated
+            float q_scale = concentration > 0.99f ? 1000.0f : (concentration > 0.9f ? 50.0f : 5.0f);
+            for (int qi = 0; qi < N_Q_REF; qi++) {
+                Q_ref[qi * n_embd_k + h * D_HEAD + 0] = q_scale;
+                for (int d = 1; d < D_HEAD; d++) {
+                    Q_ref[qi * n_embd_k + h * D_HEAD + d] *= 0.01f;
+                }
+            }
+            // Same for eval queries
+            for (int qi = 0; qi < N_Q_EVAL; qi++) {
+                Q_eval[qi * n_embd_k + h * D_HEAD + 0] = q_scale;
+                for (int d = 1; d < D_HEAD; d++) {
+                    Q_eval[qi * n_embd_k + h * D_HEAD + d] *= 0.01f;
+                }
+            }
+
+            // Compute attention weights for head 0
+            std::vector<float> attn_weights(N_Q_REF * tc.T);
+            float inv_sqrt = 1.0f / sqrtf((float)D_HEAD);
+            for (int qi = 0; qi < N_Q_REF; qi++) {
+                for (int j = 0; j < tc.T; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < D_HEAD; d++) {
+                        dot += Q_ref[qi * n_embd_k + h * D_HEAD + d] *
+                               K[j * n_embd_k + h * D_HEAD + d];
+                    }
+                    attn_weights[qi * tc.T + j] = dot * inv_sqrt;
+                }
+            }
+            softmax_rows(attn_weights.data(), N_Q_REF, tc.T);
+
+            // Detect spikiness
+            auto stats = compute_head_attention_stats(attn_weights.data(), N_Q_REF, tc.T);
+            bool detected_spiky = is_spiky_head(stats);
+
+            // Run full compaction (fitted)
+            auto t0 = std::chrono::high_resolution_clock::now();
+            compaction_config cfg;
+            auto fitted = compact_layer_all_heads(
+                K.data(), V.data(), Q_ref.data(),
+                tc.T, N_Q_REF, N_HEAD_KV, D_HEAD, D_HEAD, t, cfg);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            // Run bypass: original V, beta=0
+            auto t2 = std::chrono::high_resolution_clock::now();
+            std::vector<float> bypass_cv(t * D_HEAD);
+            std::vector<float> bypass_beta(t, 0.0f);
+            fill_original_values(V.data(), fitted.selected_indices.data(),
+                                bypass_cv.data(), t, h, D_HEAD, n_embd_v);
+            auto t3 = std::chrono::high_resolution_clock::now();
+
+            // Evaluate both on eval queries: compute MSE and cos_sim
+            auto eval_output = [&](const std::vector<float> & cv_data,
+                                   const std::vector<float> & beta_data,
+                                   const std::vector<int> & sel) {
+                // Original output: attn_eval @ V
+                std::vector<float> eval_attn(N_Q_EVAL * tc.T);
+                for (int qi = 0; qi < N_Q_EVAL; qi++) {
+                    for (int j = 0; j < tc.T; j++) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < D_HEAD; d++)
+                            dot += Q_eval[qi * n_embd_k + h * D_HEAD + d] *
+                                   K[j * n_embd_k + h * D_HEAD + d];
+                        eval_attn[qi * tc.T + j] = dot * inv_sqrt;
+                    }
+                }
+                softmax_rows(eval_attn.data(), N_Q_EVAL, tc.T);
+
+                // Compacted output
+                std::vector<float> comp_scores(N_Q_EVAL * t);
+                for (int qi = 0; qi < N_Q_EVAL; qi++) {
+                    for (int j = 0; j < t; j++) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < D_HEAD; d++)
+                            dot += Q_eval[qi * n_embd_k + h * D_HEAD + d] *
+                                   K[sel[j] * n_embd_k + h * D_HEAD + d];
+                        comp_scores[qi * t + j] = dot * inv_sqrt + beta_data[j];
+                    }
+                }
+                softmax_rows(comp_scores.data(), N_Q_EVAL, t);
+
+                // Compute MSE and cos_sim
+                double total_mse = 0.0, total_cos = 0.0;
+                for (int qi = 0; qi < N_Q_EVAL; qi++) {
+                    std::vector<float> orig(D_HEAD, 0.0f), comp(D_HEAD, 0.0f);
+                    for (int j = 0; j < tc.T; j++) {
+                        for (int d = 0; d < D_HEAD; d++)
+                            orig[d] += eval_attn[qi * tc.T + j] *
+                                       V[j * n_embd_v + h * D_HEAD + d];
+                    }
+                    for (int j = 0; j < t; j++) {
+                        for (int d = 0; d < D_HEAD; d++)
+                            comp[d] += comp_scores[qi * t + j] * cv_data[j * D_HEAD + d];
+                    }
+
+                    float dot_p = 0.0f, n_o = 0.0f, n_c = 0.0f;
+                    for (int d = 0; d < D_HEAD; d++) {
+                        float diff = orig[d] - comp[d];
+                        total_mse += diff * diff / D_HEAD;
+                        dot_p += orig[d] * comp[d];
+                        n_o += orig[d] * orig[d];
+                        n_c += comp[d] * comp[d];
+                    }
+                    total_cos += dot_p / (sqrtf(n_o * n_c) + 1e-8f);
+                }
+                return std::make_pair(total_cos / N_Q_EVAL, total_mse / N_Q_EVAL);
+            };
+
+            // Extract fitted C_v for head 0
+            std::vector<float> fitted_cv(fitted.C_v[h].begin(), fitted.C_v[h].end());
+            std::vector<float> fitted_beta(fitted.beta[h].begin(), fitted.beta[h].end());
+
+            auto [cos_fit, mse_fit] = eval_output(fitted_cv, fitted_beta, fitted.selected_indices);
+            auto [cos_byp, mse_byp] = eval_output(bypass_cv, bypass_beta, fitted.selected_indices);
+
+            double bypass_us = std::chrono::duration<double, std::micro>(t3 - t2).count();
+
+            printf("%-10s %5d %5d  %12.8f %12.8f  %12.8f %12.8f  %10.0f  %s\n",
+                   scenario_name, tc.T, t,
+                   cos_byp, cos_fit, mse_byp, mse_fit,
+                   bypass_us,
+                   detected_spiky ? "SPIKY" : "normal");
+        }
+    }
+
     printf("\nBenchmark complete.\n");
     return 0;
 }

@@ -7,9 +7,19 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <numeric>
 
 namespace kvcompact {
 namespace optimized {
+
+/**
+ * Result of a compaction operation
+ */
+struct CompactionResult {
+    std::vector<size_t> selected_indices;
+    std::chrono::milliseconds compaction_time{0};
+    double quality_score = 0.0;  // e.g. mean cosine similarity
+};
 
 /**
  * Fast attention importance estimation without full NNLS
@@ -260,11 +270,9 @@ public:
 
         auto end = std::chrono::high_resolution_clock::now();
 
-        // Generate result
         CompactionResult result;
         result.selected_indices = fine_selection;
         result.compaction_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        result.quality_metrics = compute_quality(keys, values, fine_selection, /*...*/);
 
         return result;
     }

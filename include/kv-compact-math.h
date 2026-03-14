@@ -1527,6 +1527,85 @@ static float compute_head_sensitivity(const float * attn_weights, int n_q, int T
 }
 
 // ============================================================================
+// Spiky-head detection and bypass utilities
+// ============================================================================
+//
+// For heads with extremely concentrated attention (entropy ≈ 0, top-1 mass ≈ 1),
+// the C_v least-squares fitting is ill-conditioned: only one token has nonzero
+// weight in the regression, leaving all other C_v rows underdetermined. This
+// produces arbitrary values that distort output for novel queries.
+//
+// The fix (TRIZ Principle #3: Local Quality): detect spiky heads and bypass
+// NNLS+LS fitting, using original V values and zero beta instead.
+//
+// References:
+//   - Ada-KV (Feng et al., 2024, arXiv:2407.11550): spiky heads need fewer tokens
+//   - LAVa (Jiang et al., 2025): attention-aware value handling
+//   - Root cause: models with large d_k (e.g. Gemma 3 d_k=256) produce extreme
+//     attention spikiness due to softmax temperature (1/sqrt(d_k) ≈ 0.0625)
+
+struct head_attention_stats {
+    float mean_entropy;    // Average entropy across queries (nats)
+    float mean_top1_mass;  // Average top-1 attention mass across queries
+    float mean_top5_mass;  // Average top-5 attention mass across queries
+    float max_score_range; // Max (score_max - score_min) across queries
+};
+
+// Compute attention distribution statistics for one head.
+//   attn_weights: [n_q, T] softmax attention weights
+//   n_q: number of queries
+//   T: number of tokens
+static head_attention_stats compute_head_attention_stats(
+        const float * attn_weights, int n_q, int T) {
+    head_attention_stats stats = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (n_q == 0 || T == 0) return stats;
+
+    for (int qi = 0; qi < n_q; qi++) {
+        float q_entropy = 0.0f;
+        float q_top1 = 0.0f;
+
+        // Single pass: compute entropy and find top-1
+        for (int j = 0; j < T; j++) {
+            float w = attn_weights[qi * T + j];
+            if (w > 1e-12f) q_entropy -= w * logf(w);
+            if (w > q_top1) q_top1 = w;
+        }
+
+        stats.mean_entropy += q_entropy;
+        stats.mean_top1_mass += q_top1;
+    }
+
+    stats.mean_entropy /= n_q;
+    stats.mean_top1_mass /= n_q;
+
+    return stats;
+}
+
+// Determine if a head is "spiky" (one-hot attention) and should bypass C_v fitting.
+//   Default thresholds are conservative: only triggers for truly one-hot heads.
+static bool is_spiky_head(const head_attention_stats & stats,
+                          float entropy_threshold = 0.1f,
+                          float top1_threshold = 0.99f) {
+    return (stats.mean_entropy < entropy_threshold && stats.mean_top1_mass > top1_threshold);
+}
+
+// Fill C_v with original V values (identity mapping) for spiky heads.
+//   V_all: [T, n_embd_v_gqa] all values (interleaved GQA format)
+//   selected: [t] indices of selected tokens
+//   cv_out: [t, d_v] output buffer
+//   h: head index
+//   d_v: value dimension per head
+//   n_embd_v_gqa: total value embedding size (n_head_kv * d_v)
+static void fill_original_values(
+        const float * V_all, const int * selected, float * cv_out,
+        int t, int h, int d_v, int n_embd_v_gqa) {
+    for (int j = 0; j < t; j++) {
+        const float * v_row = V_all + selected[j] * n_embd_v_gqa + h * d_v;
+        memcpy(cv_out + j * d_v, v_row, d_v * sizeof(float));
+    }
+}
+
+// ============================================================================
 // Carathéodory-informed budget allocation (adjacent-concepts.md Sec 22)
 // ============================================================================
 //

@@ -80,16 +80,19 @@ if(KV_COMPACT_BUILD_TOOL)
     )
 
     # llama.cpp CLI tool (for speed testing)
-    add_executable(llama-cli ${llama_cpp_SOURCE_DIR}/tools/cli/cli.cpp)
-    target_link_libraries(llama-cli PRIVATE
-        llama
-        common
-        ggml
-    )
-    if(WIN32)
-        set_target_properties(llama-cli PROPERTIES
-            LINK_FLAGS "/SUBSYSTEM:CONSOLE"
-        )
+    if(LLAMA_CPP_DIR)
+        set(_llama_src_dir "${LLAMA_CPP_DIR}")
+    elseif(llama_cpp_SOURCE_DIR)
+        set(_llama_src_dir "${llama_cpp_SOURCE_DIR}")
+    endif()
+    if(_llama_src_dir AND EXISTS "${_llama_src_dir}/tools/cli/cli.cpp")
+        add_executable(llama-cli ${_llama_src_dir}/tools/cli/cli.cpp)
+        target_link_libraries(llama-cli PRIVATE llama common ggml)
+        if(WIN32)
+            set_target_properties(llama-cli PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+        endif()
+    else()
+        message(STATUS "Skipping llama-cli: cli.cpp not found at ${_llama_src_dir}/tools/cli/cli.cpp")
     endif()
 endif()
 
