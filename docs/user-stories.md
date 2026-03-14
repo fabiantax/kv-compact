@@ -564,6 +564,13 @@ for hybrid models is primarily MEMORY enablement (making 10 agents possible),
 not per-token speed. Pure attention models (SmolLM3, Gemma) show 3-36x
 throughput gains from compaction.
 
+**Qwen3-Coder-Next (80B.A3B) Results (2026-03-14, stock llama.cpp b8334):**
+- Per-slot: 39 tok/s constant across all KV sizes (461-3319 tokens)
+- 10 agents at ~500 tok KV: 34.5 agg tok/s (9.8 per-agent)
+- `kv_unified=true`, `n_seq_max=10` — multi-slot works (unlike Qwen3.5)
+- Multi-slot fails at 2K+ KV tokens with 5+ agents (Vulkan compute pressure)
+- Without compaction: 10 × 100K = impossible. With 200x: trivially fits.
+
 **Implementation:**
 - `bench_coding_agents.py` — v1 with full config matrix
 - `bench_agents_v2.py` — v2 with per-slot + multi-slot phases
@@ -630,3 +637,4 @@ serving on Qwen3.5 hybrid (attention + DeltaNet/SSM) models,
 | US-27 | Serving throughput benchmarks | Serving | DONE | **High** |
 | US-28 | Multi-model coding agent bench | Serving | DONE | **High** |
 | US-29 | Hybrid model bottleneck analysis | Serving | DONE | Medium |
+| US-30 | Qwen3-Coder-Next 10-agent bench | Serving | DONE | **High** |
