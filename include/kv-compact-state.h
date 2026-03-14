@@ -566,6 +566,31 @@ static void quant_q4_0_block(const float * src, uint8_t * dst) {
     }
 }
 
+// Quantize a block of 32 floats to Q4_1 format (20 bytes)
+static void quant_q4_1_block(const float * src, uint8_t * dst) {
+    // Find min and max
+    float fmin = src[0], fmax = src[0];
+    for (int i = 1; i < KV_COMPACT_QK; i++) {
+        if (src[i] < fmin) fmin = src[i];
+        if (src[i] > fmax) fmax = src[i];
+    }
+    float d = (fmax - fmin) / 15.0f;
+    uint16_t d_f16 = f32_to_f16(d);
+    uint16_t m_f16 = f32_to_f16(fmin);
+    memcpy(dst, &d_f16, 2);
+    memcpy(dst + 2, &m_f16, 2);
+
+    float id = (d != 0.0f) ? 15.0f / (fmax - fmin) : 0.0f;
+    uint8_t * qs = dst + 4;
+    for (int i = 0; i < KV_COMPACT_QK / 2; i++) {
+        float v0 = (src[2*i + 0] - fmin) * id;
+        float v1 = (src[2*i + 1] - fmin) * id;
+        uint8_t q0 = (uint8_t)std::max(0.0f, std::min(15.0f, roundf(v0)));
+        uint8_t q1 = (uint8_t)std::max(0.0f, std::min(15.0f, roundf(v1)));
+        qs[i] = q0 | (q1 << 4);
+    }
+}
+
 // Convert a row of floats to the target type, writing to dst
 // Returns number of bytes written
 static size_t convert_from_f32(const float * src, int32_t type, uint8_t * dst, int n_elements) {
@@ -590,6 +615,13 @@ static size_t convert_from_f32(const float * src, int32_t type, uint8_t * dst, i
         int block_bytes = 2 + KV_COMPACT_QK / 2;  // 18
         for (int b = 0; b < n_blocks; b++) {
             quant_q4_0_block(src + b * KV_COMPACT_QK, dst + b * block_bytes);
+        }
+        return n_blocks * block_bytes;
+    } else if (type == KV_COMPACT_GGML_TYPE_Q4_1) {
+        int n_blocks = n_elements / KV_COMPACT_QK;
+        int block_bytes = 4 + KV_COMPACT_QK / 2;  // 20
+        for (int b = 0; b < n_blocks; b++) {
+            quant_q4_1_block(src + b * KV_COMPACT_QK, dst + b * block_bytes);
         }
         return n_blocks * block_bytes;
     }

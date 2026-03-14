@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "kv-compact-api.h"
+#include "kv-compact-state.h"
 
 static void gen_data(float * out, int n, int seed) {
     for (int i = 0; i < n; i++) {
@@ -1872,6 +1873,376 @@ static void test_reasoning_multi_round() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Quantized KV support tests (B4)
+// ============================================================================
+
+// Helper: generate quantized KV data from float32 source
+static void gen_quantized(const float * src, int type, int n_elements,
+                          std::vector<uint8_t> & out) {
+    size_t row_bytes = kv_quant_row_bytes(type, n_elements);
+    out.resize(row_bytes);
+    kv_quantize_row(src, type, n_elements, out.data());
+}
+
+static void test_quant_row_elements() {
+    printf("  test_quant_row_elements...");
+    // F32: 128 elements = 512 bytes
+    assert(kv_quant_row_elements(KV_TYPE_F32, 512) == 128);
+    // F16: 128 elements = 256 bytes
+    assert(kv_quant_row_elements(KV_TYPE_F16, 256) == 128);
+    // Q8_0: 4 blocks * 34 bytes = 136 bytes → 128 elements
+    assert(kv_quant_row_elements(KV_TYPE_Q8_0, 136) == 128);
+    // Q4_0: 4 blocks * 18 bytes = 72 bytes → 128 elements
+    assert(kv_quant_row_elements(KV_TYPE_Q4_0, 72) == 128);
+    // Q4_1: 4 blocks * 20 bytes = 80 bytes → 128 elements
+    assert(kv_quant_row_elements(KV_TYPE_Q4_1, 80) == 128);
+    printf(" OK\n");
+}
+
+static void test_quant_row_bytes() {
+    printf("  test_quant_row_bytes...");
+    assert(kv_quant_row_bytes(KV_TYPE_F32, 128) == 512);
+    assert(kv_quant_row_bytes(KV_TYPE_F16, 128) == 256);
+    assert(kv_quant_row_bytes(KV_TYPE_Q8_0, 128) == 136);   // 4 * 34
+    assert(kv_quant_row_bytes(KV_TYPE_Q4_0, 128) == 72);    // 4 * 18
+    assert(kv_quant_row_bytes(KV_TYPE_Q4_1, 128) == 80);    // 4 * 20
+    printf(" OK\n");
+}
+
+static void test_quant_round_trip_q8_0() {
+    printf("  test_quant_round_trip_q8_0...");
+    const int n = 128;
+    std::vector<float> original(n), recovered(n);
+    gen_data(original.data(), n, 42);
+
+    std::vector<uint8_t> quantized;
+    gen_quantized(original.data(), KV_TYPE_Q8_0, n, quantized);
+
+    size_t row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n);
+    assert(quantized.size() == row_bytes);
+
+    kv_dequantize_row(quantized.data(), KV_TYPE_Q8_0, row_bytes, recovered.data(), n);
+
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(original[i] - recovered[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf(" max_err=%.6f", max_err);
+    assert(max_err < 0.02f);  // Q8_0 is very precise
+    printf(" OK\n");
+}
+
+static void test_quant_round_trip_q4_0() {
+    printf("  test_quant_round_trip_q4_0...");
+    const int n = 128;
+    std::vector<float> original(n), recovered(n);
+    gen_data(original.data(), n, 43);
+
+    std::vector<uint8_t> quantized;
+    gen_quantized(original.data(), KV_TYPE_Q4_0, n, quantized);
+
+    size_t row_bytes = kv_quant_row_bytes(KV_TYPE_Q4_0, n);
+    kv_dequantize_row(quantized.data(), KV_TYPE_Q4_0, row_bytes, recovered.data(), n);
+
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(original[i] - recovered[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf(" max_err=%.6f", max_err);
+    assert(max_err < 0.2f);  // Q4_0 has lower precision
+    printf(" OK\n");
+}
+
+static void test_quant_round_trip_q4_1() {
+    printf("  test_quant_round_trip_q4_1...");
+    const int n = 128;
+    std::vector<float> original(n), recovered(n);
+    gen_data(original.data(), n, 44);
+
+    std::vector<uint8_t> quantized;
+    gen_quantized(original.data(), KV_TYPE_Q4_1, n, quantized);
+
+    size_t row_bytes = kv_quant_row_bytes(KV_TYPE_Q4_1, n);
+    kv_dequantize_row(quantized.data(), KV_TYPE_Q4_1, row_bytes, recovered.data(), n);
+
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(original[i] - recovered[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf(" max_err=%.6f", max_err);
+    assert(max_err < 0.2f);  // Q4_1 similar precision to Q4_0
+    printf(" OK\n");
+}
+
+static void test_quantized_compaction_q8_0() {
+    printf("  test_quantized_compaction_q8_0...\n");
+
+    const int T = 128, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // Generate float data
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 100);
+    gen_data(V_f32.data(), T * n_embd_v, 200);
+    gen_data(Q.data(), n_q * n_embd_k, 300);
+
+    // Quantize K and V to Q8_0
+    size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+    std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q.data() + i * k_row_bytes);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                        V_q.data() + i * v_row_bytes);
+    }
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = -1;
+
+    kv_compact_quant_result result = {};
+    int rc = kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                   KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                                   k_row_bytes, v_row_bytes,
+                                   T, n_q, n_head_kv, d_k, d_v,
+                                   &p, &result);
+    assert(rc == 0);
+    assert(result.base.t == 64);
+    assert(result.K_out != NULL);
+    assert(result.V_out != NULL);
+    assert(result.k_type == KV_TYPE_Q8_0);
+    assert(result.v_type == KV_TYPE_Q8_0);
+    assert(result.k_row_bytes == k_row_bytes);
+    assert(result.v_row_bytes == v_row_bytes);
+
+    printf("    Q8_0: t=%d cos=%.6f mse=%.8f\n",
+           result.base.t, result.base.stats.avg_cosine_sim, result.base.stats.avg_mse);
+    assert(result.base.stats.avg_cosine_sim > 0.99f);
+
+    // Verify output K/V can be dequantized back
+    std::vector<float> k_check(n_embd_k);
+    kv_dequantize_row(result.K_out, KV_TYPE_Q8_0, k_row_bytes, k_check.data(), n_embd_k);
+    assert(std::isfinite(k_check[0]));
+
+    kv_compact_quant_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_quantized_compaction_q4_0() {
+    printf("  test_quantized_compaction_q4_0...\n");
+
+    const int T = 128, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 400);
+    gen_data(V_f32.data(), T * n_embd_v, 500);
+    gen_data(Q.data(), n_q * n_embd_k, 600);
+
+    size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q4_0, n_embd_k);
+    size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q4_0, n_embd_v);
+    std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q4_0, n_embd_k,
+                        K_q.data() + i * k_row_bytes);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q4_0, n_embd_v,
+                        V_q.data() + i * v_row_bytes);
+    }
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = -1;
+
+    kv_compact_quant_result result = {};
+    int rc = kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                   KV_TYPE_Q4_0, KV_TYPE_Q4_0,
+                                   k_row_bytes, v_row_bytes,
+                                   T, n_q, n_head_kv, d_k, d_v,
+                                   &p, &result);
+    assert(rc == 0);
+
+    printf("    Q4_0: t=%d cos=%.6f mse=%.8f\n",
+           result.base.t, result.base.stats.avg_cosine_sim, result.base.stats.avg_mse);
+    assert(result.base.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_quant_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_quantized_compaction_mixed_types() {
+    // K in Q8_0, V in Q4_0 (mixed quantization)
+    printf("  test_quantized_compaction_mixed_types...\n");
+
+    const int T = 64, n_q = 16, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 700);
+    gen_data(V_f32.data(), T * n_embd_v, 800);
+    gen_data(Q.data(), n_q * n_embd_k, 900);
+
+    size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q4_0, n_embd_v);
+    std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q.data() + i * k_row_bytes);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q4_0, n_embd_v,
+                        V_q.data() + i * v_row_bytes);
+    }
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = -1;
+
+    kv_compact_quant_result result = {};
+    int rc = kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                   KV_TYPE_Q8_0, KV_TYPE_Q4_0,
+                                   k_row_bytes, v_row_bytes,
+                                   T, n_q, n_head_kv, d_k, d_v,
+                                   &p, &result);
+    assert(rc == 0);
+    assert(result.k_type == KV_TYPE_Q8_0);
+    assert(result.v_type == KV_TYPE_Q4_0);
+
+    printf("    mixed K=Q8_0/V=Q4_0: t=%d cos=%.6f\n",
+           result.base.t, result.base.stats.avg_cosine_sim);
+    assert(result.base.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_quant_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_quantized_compaction_cheap_qref() {
+    // Quantized compaction with auto-generated Q_ref
+    printf("  test_quantized_compaction_cheap_qref...\n");
+
+    const int T = 128, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v);
+    gen_data(K_f32.data(), T * n_embd_k, 1000);
+    gen_data(V_f32.data(), T * n_embd_v, 1100);
+
+    size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+    std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q.data() + i * k_row_bytes);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                        V_q.data() + i * v_row_bytes);
+    }
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.use_cheap_qref = 1;
+    p.chunk_size = -1;
+
+    kv_compact_quant_result result = {};
+    int rc = kv_compact_quantized(K_q.data(), V_q.data(), NULL,
+                                   KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                                   k_row_bytes, v_row_bytes,
+                                   T, 0, n_head_kv, d_k, d_v,
+                                   &p, &result);
+    assert(rc == 0);
+
+    printf("    cheap_qref Q8_0: t=%d cos=%.6f\n",
+           result.base.t, result.base.stats.avg_cosine_sim);
+    assert(result.base.stats.avg_cosine_sim > 0.98f);
+
+    kv_compact_quant_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_quantized_error_handling() {
+    printf("  test_quantized_error_handling...");
+
+    kv_compact_quant_result result = {};
+
+    // NULL inputs
+    assert(kv_compact_quantized(NULL, NULL, NULL, KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                                 34, 34, 10, 0, 1, 32, 32, NULL, &result) == -1);
+
+    // Dimension mismatch: 1 head * 32 dims = 32 elements,
+    // but 34 bytes Q8_0 = 1 block = 32 elements → OK
+    // Use 68 bytes = 2 blocks = 64 elements but claim d_k=32 with 1 head → mismatch
+    assert(kv_compact_quantized((const uint8_t *)"", (const uint8_t *)"", NULL,
+                                 KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                                 68, 34,  // k has 64 elems but n_head_kv*d_k = 32
+                                 10, 0, 1, 32, 32, NULL, &result) == -4);
+
+    printf(" OK\n");
+}
+
+static void test_quantized_output_integrity() {
+    // Verify requantized output survives a second dequant→compact cycle
+    printf("  test_quantized_output_integrity...\n");
+
+    const int T = 64, n_q = 16, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 1200);
+    gen_data(V_f32.data(), T * n_embd_v, 1300);
+    gen_data(Q.data(), n_q * n_embd_k, 1400);
+
+    size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+    std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q.data() + i * k_row_bytes);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                        V_q.data() + i * v_row_bytes);
+    }
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.chunk_size = -1;
+
+    // First compaction
+    kv_compact_quant_result r1 = {};
+    int rc = kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                   KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                                   k_row_bytes, v_row_bytes,
+                                   T, n_q, n_head_kv, d_k, d_v,
+                                   &p, &r1);
+    assert(rc == 0);
+
+    // Second compaction on the output
+    kv_compact_quant_result r2 = {};
+    rc = kv_compact_quantized(r1.K_out, r1.V_out, Q.data(),
+                               KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                               k_row_bytes, v_row_bytes,
+                               r1.base.t, n_q, n_head_kv, d_k, d_v,
+                               &p, &r2);
+    assert(rc == 0);
+
+    printf("    round 1: t=%d cos=%.6f\n", r1.base.t, r1.base.stats.avg_cosine_sim);
+    printf("    round 2: t=%d cos=%.6f\n", r2.base.t, r2.base.stats.avg_cosine_sim);
+    assert(r2.base.stats.avg_cosine_sim > 0.98f);
+
+    kv_compact_quant_result_free(&r1);
+    kv_compact_quant_result_free(&r2);
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-api:\n\n");
 
@@ -1958,6 +2329,19 @@ int main() {
     test_reasoning_with_chunked();
     test_reasoning_with_diversity();
     test_reasoning_multi_round();
+
+    printf("\n=== Quantized KV support (B4) ===\n");
+    test_quant_row_elements();
+    test_quant_row_bytes();
+    test_quant_round_trip_q8_0();
+    test_quant_round_trip_q4_0();
+    test_quant_round_trip_q4_1();
+    test_quantized_compaction_q8_0();
+    test_quantized_compaction_q4_0();
+    test_quantized_compaction_mixed_types();
+    test_quantized_compaction_cheap_qref();
+    test_quantized_error_handling();
+    test_quantized_output_integrity();
 
     printf("\nAll tests passed!\n");
     return 0;

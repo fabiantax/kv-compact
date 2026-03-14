@@ -23,6 +23,7 @@
 
 #include "kv-compact-api.h"
 #include "kv-compact-math.h"
+#include "kv-compact-state.h"
 
 #include <climits>
 
@@ -1256,6 +1257,150 @@ static void bench_reasoning_compression() {
 
 // ============================================================================
 
+// ============================================================================
+// Quantized KV compaction benchmark (B4)
+// ============================================================================
+
+static void bench_quantized_compaction() {
+    printf("=== Quantized KV Compaction (B4) ===\n\n");
+
+    const int T = 512, n_q = 32, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // Generate reference float data
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 3000);
+    gen_data(V_f32.data(), T * n_embd_v, 3001);
+    gen_data(Q.data(), n_q * n_embd_k, 3002);
+
+    // ---- Quality comparison: F32 vs Q8_0 vs Q4_0 vs Q4_1 ----
+    printf("  Quality comparison (T=%d, ratio=50%%):\n\n", T);
+    printf("  type      cos_sim       mse           time_ms    K_bytes    V_bytes\n");
+    printf("  ------    --------    ----------      --------   --------   --------\n");
+
+    // F32 baseline
+    {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+        kv_compact_result result = {};
+        kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        size_t k_bytes = (size_t)T * n_embd_k * 4;
+        size_t v_bytes = (size_t)T * n_embd_v * 4;
+        printf("  F32       %.6f    %.8f    %7.1f    %6zu    %6zu\n",
+               result.stats.avg_cosine_sim, result.stats.avg_mse,
+               result.stats.elapsed_ms, k_bytes, v_bytes);
+        kv_compact_result_free(&result);
+    }
+
+    // Quantized types
+    int types[] = { KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * names[] = { "Q8_0", "Q4_0", "Q4_1" };
+
+    for (int ti = 0; ti < 3; ti++) {
+        int type = types[ti];
+        size_t k_row_bytes = kv_quant_row_bytes(type, n_embd_k);
+        size_t v_row_bytes = kv_quant_row_bytes(type, n_embd_v);
+
+        std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+        for (int i = 0; i < T; i++) {
+            kv_quantize_row(K_f32.data() + i * n_embd_k, type, n_embd_k,
+                            K_q.data() + i * k_row_bytes);
+            kv_quantize_row(V_f32.data() + i * n_embd_v, type, n_embd_v,
+                            V_q.data() + i * v_row_bytes);
+        }
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+
+        kv_compact_quant_result result = {};
+        kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                              type, type, k_row_bytes, v_row_bytes,
+                              T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        size_t k_bytes = T * k_row_bytes;
+        size_t v_bytes = T * v_row_bytes;
+        printf("  %s      %.6f    %.8f    %7.1f    %6zu    %6zu\n",
+               names[ti],
+               result.base.stats.avg_cosine_sim, result.base.stats.avg_mse,
+               result.base.stats.elapsed_ms, k_bytes, v_bytes);
+
+        kv_compact_quant_result_free(&result);
+    }
+
+    // ---- Compression ratio sweep: Q8_0 vs F32 ----
+    printf("\n  Compression ratio sweep (T=%d, Q8_0 vs F32):\n\n", T);
+    printf("  ratio     f32_cos       q8_cos        f32_mse       q8_mse\n");
+    printf("  ------    --------      --------      ----------    ----------\n");
+
+    float ratios[] = { 0.5f, 0.3f, 0.2f, 0.1f, 0.05f };
+    size_t k_row_bytes_q8 = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes_q8 = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+    std::vector<uint8_t> K_q8(T * k_row_bytes_q8), V_q8(T * v_row_bytes_q8);
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q8.data() + i * k_row_bytes_q8);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                        V_q8.data() + i * v_row_bytes_q8);
+    }
+
+    for (float ratio : ratios) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = ratio;
+        p.chunk_size = -1;
+
+        kv_compact_result r_f32 = {};
+        kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &r_f32);
+
+        kv_compact_quant_result r_q8 = {};
+        kv_compact_quantized(K_q8.data(), V_q8.data(), Q.data(),
+                              KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                              k_row_bytes_q8, v_row_bytes_q8,
+                              T, n_q, n_head_kv, d_k, d_v, &p, &r_q8);
+
+        printf("  %3.0f%%      %.6f      %.6f      %.8f    %.8f\n",
+               ratio * 100.0f,
+               r_f32.stats.avg_cosine_sim,
+               r_q8.base.stats.avg_cosine_sim,
+               r_f32.stats.avg_mse,
+               r_q8.base.stats.avg_mse);
+
+        kv_compact_result_free(&r_f32);
+        kv_compact_quant_result_free(&r_q8);
+    }
+
+    // ---- Memory savings table ----
+    printf("\n  Memory savings (T=%d, ratio=50%%):\n\n", T);
+    printf("  type      original_KB   compacted_KB   savings%%   effective_compression\n");
+    printf("  ------    -----------   ------------   --------   ---------------------\n");
+
+    int all_types[] = { KV_TYPE_F32, KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * all_names[] = { "F32", "Q8_0", "Q4_0", "Q4_1" };
+    for (int ti = 0; ti < 4; ti++) {
+        int type = all_types[ti];
+        size_t k_rb = kv_quant_row_bytes(type, n_embd_k);
+        size_t v_rb = kv_quant_row_bytes(type, n_embd_v);
+        size_t orig = T * (k_rb + v_rb);
+        int t_kept = T / 2;  // 50% ratio
+        size_t comp = (size_t)t_kept * (k_rb + v_rb);
+        float savings = 100.0f * (1.0f - (float)comp / (float)orig);
+        float f32_orig = (float)T * (n_embd_k + n_embd_v) * 4;
+        float effective = f32_orig / (float)comp;
+        printf("  %s       %7.1f       %7.1f       %5.1f%%       %.1fx\n",
+               all_names[ti],
+               (float)orig / 1024.0f,
+               (float)comp / 1024.0f,
+               savings,
+               effective);
+    }
+    printf("\n");
+}
+
 int main() {
     printf("bench-kv-compact-quality\n");
     printf("========================\n\n");
@@ -1269,6 +1414,7 @@ int main() {
     bench_chunked_quality();
     bench_chunked_throughput_scaling();
     bench_reasoning_compression();
+    bench_quantized_compaction();
 
     printf("All quality benchmarks completed.\n");
     return 0;

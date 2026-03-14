@@ -298,6 +298,85 @@ int kv_compact_multi_round(
 // Free all memory allocated by kv_compact()
 void kv_compact_result_free(kv_compact_result * result);
 
+// ============================================================================
+// Quantized KV support (B4) — dequant → compact → requant
+// ============================================================================
+
+// KV cache data types (compatible with ggml_type values)
+typedef enum {
+    KV_TYPE_F32  = 0,   // 32-bit float (4 bytes/element)
+    KV_TYPE_F16  = 1,   // 16-bit float (2 bytes/element)
+    KV_TYPE_Q4_0 = 2,   // 4-bit quantized (18 bytes/block of 32 elements)
+    KV_TYPE_Q4_1 = 3,   // 4-bit quantized with min (20 bytes/block of 32 elements)
+    KV_TYPE_Q8_0 = 8    // 8-bit quantized (34 bytes/block of 32 elements)
+} kv_data_type;
+
+#define KV_COMPACT_BLOCK_SIZE 32  // elements per quantization block
+
+// Result with requantized output data.
+// Extends kv_compact_result with requantized K and V buffers.
+typedef struct kv_compact_quant_result {
+    kv_compact_result  base;         // standard compaction result (indices, beta, C_v, stats)
+    int                k_type;       // output K type (same as input)
+    int                v_type;       // output V type (same as input)
+    uint8_t *          K_out;        // [t × k_row_bytes] requantized selected K rows
+    uint8_t *          V_out;        // [t × v_row_bytes] requantized C_v rows
+    size_t             k_row_bytes;  // bytes per K row in quantized format
+    size_t             v_row_bytes;  // bytes per V row in quantized format
+} kv_compact_quant_result;
+
+// Compact quantized KV cache: dequantize → compact (float32) → requantize.
+//
+// Accepts raw quantized K/V data and produces compacted quantized output.
+// Internally dequantizes to float32, runs standard compaction, then
+// requantizes the result back to the original format.
+//
+//   K_quant:    raw quantized K data [T rows × k_row_bytes]
+//   V_quant:    raw quantized V data [T rows × v_row_bytes]
+//   Q_ref_all:  reference queries in float32 [n_q × n_head_kv × d_k]
+//               (NULL with use_cheap_qref=1 to auto-generate from K)
+//   k_type:     quantization type for K (KV_TYPE_*)
+//   v_type:     quantization type for V (KV_TYPE_*)
+//   k_row_bytes: bytes per K row in the quantized format
+//   v_row_bytes: bytes per V row in the quantized format
+//   T, n_q, n_head_kv, d_k, d_v: same as kv_compact()
+//   params:     compaction parameters (NULL for defaults)
+//   result:     output (caller must call kv_compact_quant_result_free when done)
+//
+// Returns 0 on success, non-zero on error.
+int kv_compact_quantized(
+    const uint8_t * K_quant,
+    const uint8_t * V_quant,
+    const float   * Q_ref_all,
+    int k_type, int v_type,
+    size_t k_row_bytes, size_t v_row_bytes,
+    int T, int n_q, int n_head_kv, int d_k, int d_v,
+    const kv_compact_params * params,
+    kv_compact_quant_result * result);
+
+// Free all memory allocated by kv_compact_quantized()
+void kv_compact_quant_result_free(kv_compact_quant_result * result);
+
+// ============================================================================
+// Quantization utilities (exposed for callers who manage their own buffers)
+// ============================================================================
+
+// Dequantize a row of quantized data to float32.
+// Returns number of float elements written.
+int kv_dequantize_row(const uint8_t * src, int type, size_t row_bytes,
+                      float * dst, int max_elements);
+
+// Quantize a row of float32 data to the target format.
+// Returns number of bytes written to dst.
+size_t kv_quantize_row(const float * src, int type, int n_elements,
+                       uint8_t * dst);
+
+// Get the number of float elements in a quantized row.
+int kv_quant_row_elements(int type, size_t row_bytes);
+
+// Get bytes per row for a given type and element count.
+size_t kv_quant_row_bytes(int type, int n_elements);
+
 // Count how many layers pass the filter (utility for callers doing multi-layer compaction)
 static inline int kv_compact_count_layers(
         kv_layer_filter_fn filter, void * filter_data, int n_layers) {

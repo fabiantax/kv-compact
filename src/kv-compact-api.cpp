@@ -1047,4 +1047,133 @@ void kv_compact_result_free(kv_compact_result * result) {
     result->n_head_kv = 0;
 }
 
+// ============================================================================
+// Quantized KV support (B4)
+// ============================================================================
+
+} // extern "C" — close before C++ headers
+
+// Include state header for quant/dequant primitives (C++ templates)
+#include "kv-compact-state.h"
+
+extern "C" {
+
+// Type-to-block-size mapping
+static int quant_block_bytes(int type) {
+    return parsed_kv_state::type_size(type);
+}
+
+int kv_quant_row_elements(int type, size_t row_bytes) {
+    return parsed_kv_state::n_elements_per_row(type, row_bytes);
+}
+
+size_t kv_quant_row_bytes(int type, int n_elements) {
+    if (type == KV_TYPE_F32)  return (size_t)n_elements * 4;
+    if (type == KV_TYPE_F16)  return (size_t)n_elements * 2;
+    if (parsed_kv_state::is_quantized(type)) {
+        int n_blocks = n_elements / KV_COMPACT_BLOCK_SIZE;
+        return (size_t)n_blocks * quant_block_bytes(type);
+    }
+    return (size_t)n_elements * 4;  // fallback
+}
+
+int kv_dequantize_row(const uint8_t * src, int type, size_t row_bytes,
+                      float * dst, int max_elements) {
+    int n = parsed_kv_state::n_elements_per_row(type, row_bytes);
+    if (n > max_elements) n = max_elements;
+    parsed_kv_state::convert_to_f32(src, type, dst, n);
+    return n;
+}
+
+size_t kv_quantize_row(const float * src, int type, int n_elements,
+                       uint8_t * dst) {
+    return convert_from_f32(src, type, dst, n_elements);
+}
+
+int kv_compact_quantized(
+    const uint8_t * K_quant,
+    const uint8_t * V_quant,
+    const float   * Q_ref_all,
+    int k_type, int v_type,
+    size_t k_row_bytes, size_t v_row_bytes,
+    int T, int n_q, int n_head_kv, int d_k, int d_v,
+    const kv_compact_params * params,
+    kv_compact_quant_result * result) {
+
+    if (!K_quant || !V_quant || !result) return -1;
+    if (T <= 0 || n_head_kv <= 0 || d_k <= 0 || d_v <= 0) return -2;
+
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // Validate dimensions match row bytes
+    int k_elems = kv_quant_row_elements(k_type, k_row_bytes);
+    int v_elems = kv_quant_row_elements(v_type, v_row_bytes);
+    if (k_elems != n_embd_k || v_elems != n_embd_v) return -4;
+
+    // ---- Phase 1: Dequantize to float32 ----
+    std::vector<float> K_f32((size_t)T * n_embd_k);
+    std::vector<float> V_f32((size_t)T * n_embd_v);
+
+    for (int i = 0; i < T; i++) {
+        parsed_kv_state::convert_to_f32(
+            K_quant + (size_t)i * k_row_bytes, k_type,
+            K_f32.data() + (size_t)i * n_embd_k, n_embd_k);
+        parsed_kv_state::convert_to_f32(
+            V_quant + (size_t)i * v_row_bytes, v_type,
+            V_f32.data() + (size_t)i * n_embd_v, n_embd_v);
+    }
+
+    // ---- Phase 2: Compact (standard float32 pipeline) ----
+    memset(&result->base, 0, sizeof(result->base));
+    int rc = kv_compact(K_f32.data(), V_f32.data(), Q_ref_all,
+                        T, n_q, n_head_kv, d_k, d_v,
+                        params, &result->base);
+    if (rc != 0) return rc;
+
+    int t = result->base.t;
+
+    // ---- Phase 3: Requantize selected K and refitted V ----
+    result->k_type = k_type;
+    result->v_type = v_type;
+    result->k_row_bytes = k_row_bytes;
+    result->v_row_bytes = v_row_bytes;
+
+    result->K_out = (uint8_t *)malloc((size_t)t * k_row_bytes);
+    result->V_out = (uint8_t *)malloc((size_t)t * v_row_bytes);
+
+    // K: requantize selected original K rows
+    for (int j = 0; j < t; j++) {
+        int orig_idx = result->base.selected_indices[j];
+        convert_from_f32(K_f32.data() + (size_t)orig_idx * n_embd_k,
+                         k_type,
+                         result->K_out + (size_t)j * k_row_bytes,
+                         n_embd_k);
+    }
+
+    // V: assemble full row from per-head C_v, then requantize
+    std::vector<float> v_row(n_embd_v);
+    for (int j = 0; j < t; j++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            memcpy(v_row.data() + h * d_v,
+                   result->base.C_v[h] + (size_t)j * d_v,
+                   d_v * sizeof(float));
+        }
+        convert_from_f32(v_row.data(), v_type,
+                         result->V_out + (size_t)j * v_row_bytes,
+                         n_embd_v);
+    }
+
+    return 0;
+}
+
+void kv_compact_quant_result_free(kv_compact_quant_result * result) {
+    if (!result) return;
+    kv_compact_result_free(&result->base);
+    free(result->K_out);
+    result->K_out = NULL;
+    free(result->V_out);
+    result->V_out = NULL;
+}
+
 } // extern "C"
