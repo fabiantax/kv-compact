@@ -515,6 +515,88 @@ than a uniform allocation.
 
 ---
 
+## Epic 9: Serving Throughput Benchmarks
+
+### US-27: Continuous batching throughput benchmarks — DONE
+
+**As a** developer measuring the real-world serving impact of KV compaction,
+**I want** benchmark scripts that test aggregate throughput (tok/s) under
+continuous batching with varying slot counts and compression ratios,
+**so that** I can quantify the throughput multiplier from compaction.
+
+**Acceptance criteria:**
+- Fixed memory budget benchmark: same total ctx, vary slots via compaction ✅
+- Per-ratio scaling: 1x through 50x compression at 1K and 10K prompts ✅
+- Measures aggregate tok/s across all concurrent slots ✅
+- Server restart per scenario for clean measurement ✅
+- Prompt generation: realistic coding prompts at various token counts ✅
+
+**Results (SmolLM3 3B, 2026-03-14):**
+- 1K context: 5x compact → 3.1x aggregate throughput (140 vs 46 tok/s)
+- 10K context: 50x compact → 35.8x aggregate throughput (318 vs 8.9 tok/s)
+
+**Implementation:**
+- `run-server-compact-bench.sh` — fixed 16K budget, 4→64 slots
+- `run-compact-scaling.sh` — single server, all ratios for 1K/10K
+- `bench_server.py` — Python concurrent request harness
+- `bench_10k_scaling.py` — 24K budget, 2→80 slots
+- `gen-prompts.py` — generates prompt payloads at various sizes
+
+---
+
+### US-28: Multi-model coding agent benchmark — DONE
+
+**As a** developer evaluating compaction for realistic coding agent workloads,
+**I want** benchmarks simulating 10 coding agents with 100K context each,
+tested across Qwen3.5-4B, 9B, and 35B-A3B models,
+**so that** I can understand the feasibility and throughput of multi-agent serving.
+
+**Acceptance criteria:**
+- Realistic coding prompt generator (Python/Rust/TS/Go code) ✅
+- Per-slot speed measurement at various KV sizes ✅
+- Model comparison across Qwen3.5 family ✅
+- OOM detection and graceful failure reporting ✅
+- Projection of 10-agent aggregate throughput ✅
+
+**Key Finding:** Qwen3.5 models are hybrid (attention + DeltaNet/SSM).
+Recurrent layers (75-80% of compute) don't use KV cache. Compaction benefit
+for hybrid models is primarily MEMORY enablement (making 10 agents possible),
+not per-token speed. Pure attention models (SmolLM3, Gemma) show 3-36x
+throughput gains from compaction.
+
+**Implementation:**
+- `bench_coding_agents.py` — v1 with full config matrix
+- `bench_agents_v2.py` — v2 with per-slot + multi-slot phases
+- `bench_agents_v3.py` — v3 reliable single-server varying prompt size
+
+---
+
+### US-29: Hybrid model serving bottleneck analysis — DONE
+
+**As a** researcher identifying optimization opportunities for hybrid models,
+**I want** analysis of the architectural bottlenecks that limit multi-agent
+serving on Qwen3.5 hybrid (attention + DeltaNet/SSM) models,
+**so that** I can prioritize the most impactful optimizations.
+
+**Acceptance criteria:**
+- Identify n_seq_max limitation from recurrent state ✅
+- Measure per-slot speed vs KV cache size across models ✅
+- Arxiv survey of relevant optimization papers ✅
+- Actionable recommendations for next steps ✅
+
+**Key Bottlenecks Identified:**
+1. `n_seq_max` limited by recurrent state (1-2 for Qwen3.5)
+2. GDN state (2MB/layer) round-trips through HBM every token (memory-bound)
+3. KV cache memory prevents 10×100K without compaction (150-262 GB)
+
+**Most Promising Papers:**
+- AIRE-Prune (2602.00534): 60% SSM state pruning, 0.29% accuracy drop
+- Apt-Serve (2504.07494): hybrid cache scheduling, 8.8x throughput
+- LongFlow (2603.11504): fused FlashAttn+eviction kernel, 11.8x throughput
+- Marconi (2411.19379): prefix caching for hybrid LLMs
+
+---
+
 ## Summary Matrix
 
 | # | Story | Epic | Status | Priority |
@@ -545,3 +627,6 @@ than a uniform allocation.
 | US-24 | Integration into main path | Sublinear | TODO | **Critical** |
 | US-25 | Optimization benchmarks | Sublinear | PARTIAL | **High** |
 | US-26 | Optimization docs | Sublinear | DONE | Low |
+| US-27 | Serving throughput benchmarks | Serving | DONE | **High** |
+| US-28 | Multi-model coding agent bench | Serving | DONE | **High** |
+| US-29 | Hybrid model bottleneck analysis | Serving | DONE | Medium |
