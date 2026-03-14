@@ -275,6 +275,7 @@ kv_compact_params kv_compact_params_default(void) {
     p.n_threads = 0;
     p.layer_filter = NULL;
     p.layer_filter_data = NULL;
+    p.reasoning = NULL;
     return p;
 }
 
@@ -401,6 +402,14 @@ int kv_compact(
             }
             if (chunk_p.n_shared_prefix > chunk_T) {
                 chunk_p.n_shared_prefix = chunk_T;
+            }
+
+            // R-KV: adjust token offset so classifier sees global positions
+            kv_compact_reasoning chunk_reasoning;
+            if (chunk_p.reasoning) {
+                chunk_reasoning = *chunk_p.reasoning;
+                chunk_reasoning.token_offset += start;
+                chunk_p.reasoning = &chunk_reasoning;
             }
 
             chunk_rc[c] = kv_compact(
@@ -576,6 +585,24 @@ int kv_compact(
     if (p.use_sensitivity) {
         accumulate_weighted_importance(per_head_imp, sensitivities,
                                        T, n_head_kv, global_importance.data());
+    }
+
+    // ---- R-KV reasoning weighting (Feature A4) ----
+    // Multiply per-token importance by the reasoning-class weight so that
+    // thinking tokens are down-weighted (selected less) and answer tokens
+    // are preserved.  This runs in O(T) — negligible overhead.
+    if (p.reasoning && p.reasoning->classifier) {
+        int pos_offset = p.reasoning->token_offset;
+        for (int j = 0; j < T; j++) {
+            int tok_type = p.reasoning->classifier(j + pos_offset, p.reasoning->classifier_data);
+            float w = 1.0f;  // default: answer
+            if (tok_type == KV_TOKEN_THINKING) {
+                w = p.reasoning->thinking_weight;
+            } else if (tok_type == KV_TOKEN_TRANSITION) {
+                w = p.reasoning->transition_weight;
+            }
+            global_importance[j] *= w;
+        }
     }
 
     // Key selection: OMP, diversity-aware, or standard

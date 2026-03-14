@@ -1094,6 +1094,167 @@ static void bench_method_comparison_extreme() {
 // ============================================================================
 // Main
 // ============================================================================
+// R-KV Reasoning compression benchmark (A4)
+// ============================================================================
+
+// Classifier: first think_pct% thinking, 5% transition, rest answer.
+struct rkv_bench_ctx { int T; int think_pct; };
+static int rkv_bench_classifier(int pos, void * data) {
+    const rkv_bench_ctx * ctx = (const rkv_bench_ctx *)data;
+    int think_end = (ctx->T * ctx->think_pct) / 100;
+    int trans_end = think_end + (ctx->T * 5) / 100;
+    if (pos < think_end) return KV_TOKEN_THINKING;
+    if (pos < trans_end) return KV_TOKEN_TRANSITION;
+    return KV_TOKEN_ANSWER;
+}
+
+static void bench_reasoning_compression() {
+    printf("=== R-KV Reasoning Compression (A4) ===\n\n");
+
+    // Test: how much thinking is suppressed at various weights/ratios
+    printf("  Thinking weight sweep (T=512, 70%% thinking, ratio=50%%):\n\n");
+    printf("  weight    think_sel%%   answer_sel%%    cos_sim       mse         time_ms\n");
+    printf("  ------    ----------   -----------    --------    --------      --------\n");
+
+    const int T = 512, n_q = 32, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 2026);
+    gen_data(V.data(), T * n_embd_v, 2027);
+    gen_data(Q.data(), n_q * n_embd_k, 2028);
+
+    rkv_bench_ctx ctx = { T, 70 };
+    int think_end = (T * 70) / 100;
+    int trans_end = think_end + (T * 5) / 100;
+
+    float weights[] = { 1.0f, 0.7f, 0.5f, 0.3f, 0.1f, 0.0f };
+    for (float w : weights) {
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx;
+        reasoning.thinking_weight = w;
+        reasoning.transition_weight = (w + 1.0f) / 2.0f;
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.reasoning = (w < 1.0f) ? &reasoning : NULL;  // 1.0 = baseline
+        p.chunk_size = -1;
+
+        kv_compact_result result = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        int think_sel = 0, answer_sel = 0;
+        for (int j = 0; j < result.t; j++) {
+            if (result.selected_indices[j] < think_end) think_sel++;
+            if (result.selected_indices[j] >= trans_end) answer_sel++;
+        }
+
+        printf("  %.1f       %5.1f%%       %5.1f%%       %.6f    %.6f    %7.1f\n",
+               w,
+               100.0f * think_sel / result.t,
+               100.0f * answer_sel / result.t,
+               result.stats.avg_cosine_sim,
+               result.stats.avg_mse,
+               result.stats.elapsed_ms);
+
+        kv_compact_result_free(&result);
+    }
+
+    // Test: varying thinking proportion
+    printf("\n  Thinking proportion sweep (T=512, weight=0.3, ratio=50%%):\n\n");
+    printf("  think%%    think_sel%%   answer_sel%%    cos_sim       mse\n");
+    printf("  ------    ----------   -----------    --------    --------\n");
+
+    int think_pcts[] = { 90, 80, 70, 50, 30 };
+    for (int tp : think_pcts) {
+        rkv_bench_ctx ctx2 = { T, tp };
+        int te = (T * tp) / 100;
+        int tre = te + (T * 5) / 100;
+
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx2;
+        reasoning.thinking_weight = 0.3f;
+        reasoning.transition_weight = 0.7f;
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.reasoning = &reasoning;
+        p.chunk_size = -1;
+
+        kv_compact_result result = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        int think_sel = 0, answer_sel = 0;
+        for (int j = 0; j < result.t; j++) {
+            if (result.selected_indices[j] < te) think_sel++;
+            if (result.selected_indices[j] >= tre) answer_sel++;
+        }
+
+        printf("  %3d%%      %5.1f%%       %5.1f%%       %.6f    %.6f\n",
+               tp,
+               100.0f * think_sel / result.t,
+               100.0f * answer_sel / result.t,
+               result.stats.avg_cosine_sim,
+               result.stats.avg_mse);
+
+        kv_compact_result_free(&result);
+    }
+
+    // Compression ratio sweep with R-KV
+    printf("\n  Compression ratio sweep (T=512, 70%% thinking, weight=0.3):\n\n");
+    printf("  ratio     std_cos     rkv_cos     std_think%%  rkv_think%%  think_reduction\n");
+    printf("  ------    --------    --------    ----------  ----------  ---------------\n");
+
+    float ratios[] = { 0.5f, 0.3f, 0.2f, 0.1f };
+    for (float ratio : ratios) {
+        rkv_bench_ctx ctx3 = { T, 70 };
+
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx3;
+        reasoning.thinking_weight = 0.3f;
+        reasoning.transition_weight = 0.7f;
+
+        // Standard
+        kv_compact_params p_std = kv_compact_params_default();
+        p_std.target_ratio = ratio;
+        p_std.chunk_size = -1;
+        kv_compact_result r_std = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_std, &r_std);
+
+        // R-KV
+        kv_compact_params p_rkv = p_std;
+        p_rkv.reasoning = &reasoning;
+        kv_compact_result r_rkv = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_rkv, &r_rkv);
+
+        int std_think = 0, rkv_think = 0;
+        for (int j = 0; j < r_std.t; j++)
+            if (r_std.selected_indices[j] < think_end) std_think++;
+        for (int j = 0; j < r_rkv.t; j++)
+            if (r_rkv.selected_indices[j] < think_end) rkv_think++;
+
+        float reduction = (std_think > 0)
+            ? 100.0f * (1.0f - (float)rkv_think / std_think) : 0.0f;
+
+        printf("  %3.0f%%      %.6f    %.6f    %5.1f%%       %5.1f%%       %5.1f%%\n",
+               ratio * 100.0f,
+               r_std.stats.avg_cosine_sim,
+               r_rkv.stats.avg_cosine_sim,
+               100.0f * std_think / r_std.t,
+               100.0f * rkv_think / r_rkv.t,
+               reduction);
+
+        kv_compact_result_free(&r_std);
+        kv_compact_result_free(&r_rkv);
+    }
+    printf("\n");
+}
+
+// ============================================================================
 
 int main() {
     printf("bench-kv-compact-quality\n");
@@ -1107,6 +1268,7 @@ int main() {
     bench_method_comparison_extreme();
     bench_chunked_quality();
     bench_chunked_throughput_scaling();
+    bench_reasoning_compression();
 
     printf("All quality benchmarks completed.\n");
     return 0;

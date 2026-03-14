@@ -87,6 +87,46 @@ static inline int kv_layer_filter_explicit(int layer_idx, int n_layers, void * u
 }
 
 // ============================================================================
+// Reasoning token classification (R-KV — Feature A4)
+// ============================================================================
+
+// Token types for reasoning-aware compression.
+// Reasoning models (Qwen 3.5, DeepSeek-R1) produce long chains of thinking
+// tokens that are highly redundant in the KV cache.  R-KV classifies each
+// cached position and applies differential importance weighting so thinking
+// tokens compress more aggressively while answer tokens are preserved.
+typedef enum {
+    KV_TOKEN_ANSWER     = 0,   // regular / answer token (default, preserved)
+    KV_TOKEN_THINKING   = 1,   // reasoning / thinking token (compress aggressively)
+    KV_TOKEN_TRANSITION = 2    // boundary between thinking and answer
+} kv_token_type;
+
+// Callback to classify a cached token position.
+// Called once per position during key selection.
+//
+//   token_pos: 0-based position in the KV cache [0, T)
+//   user_data: opaque pointer passed through from kv_compact_reasoning
+//
+// Returns a kv_token_type value.  Positions not classified default to ANSWER.
+typedef int (*kv_token_classifier_fn)(int token_pos, void * user_data);
+
+// Reasoning-aware compression configuration.
+// Attach to kv_compact_params.reasoning to enable.
+typedef struct kv_compact_reasoning {
+    kv_token_classifier_fn  classifier;     // NULL = disabled
+    void *                  classifier_data;
+
+    // Importance multipliers applied during key selection.
+    // Lower values → more aggressive compression of that token class.
+    float  thinking_weight;       // default 0.3  — thinking tokens 3.3x less important
+    float  transition_weight;     // default 0.7  — boundary tokens moderately important
+    // Answer tokens are always weight 1.0 (the reference scale).
+
+    int    token_offset;          // internal: added to pos before calling classifier
+                                  // (set automatically by chunked compaction)
+} kv_compact_reasoning;
+
+// ============================================================================
 // Parameters
 // ============================================================================
 
@@ -166,6 +206,12 @@ typedef struct kv_compact_params {
     // Default: NULL (compact all layers — equivalent to kv_layer_filter_all)
     kv_layer_filter_fn  layer_filter;
     void *              layer_filter_data;
+
+    // Reasoning-aware compression (R-KV — Feature A4)
+    // When non-NULL, applies differential importance weighting by token type.
+    // Thinking tokens are compressed more aggressively; answer tokens are preserved.
+    // Default: NULL (all tokens treated equally)
+    kv_compact_reasoning * reasoning;
 } kv_compact_params;
 
 // ============================================================================

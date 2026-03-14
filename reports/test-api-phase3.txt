@@ -1,0 +1,155 @@
+test-kv-compact-api:
+
+=== Parameter defaults ===
+  test_params_default... OK
+
+=== Basic compaction ===
+  test_basic_compaction... OK
+  test_target_count_override... OK
+  test_no_compression_needed... OK
+  test_null_params_uses_defaults... OK
+
+=== Error handling ===
+  test_error_handling... OK
+
+=== Sensitivity weighting ===
+  test_sensitivity_weighted... OK
+
+=== Quality across ratios ===
+  test_quality_across_ratios...
+    20%: cos=0.999784 mse=0.00021565 agree=89.1% time=21.0ms
+    50%: cos=1.000000 mse=0.00000086 agree=100.0% time=30.8ms
+    80%: cos=1.000000 mse=0.00000014 agree=100.0% time=47.4ms
+  OK
+
+=== Multi-round compaction (US-9) ===
+  test_multi_round_basic...
+    Round results (vs original data):
+      Round 1: cos=1.000000 mse=0.00000091
+      Round 2: cos=0.999529 mse=0.00046071
+      Round 3: cos=0.999524 mse=0.00068217
+    Final (vs original): cos=0.998987 mse=0.00120591
+    Final cosine sim: 0.998987
+  OK
+  test_multi_round_quality_degradation...
+    1 rounds (70% total retention): t=179 cos=1.000000
+    2 rounds (49% total retention): t=125 cos=1.000000
+    3 rounds (34% total retention): t=87 cos=0.999998
+  OK
+
+=== Iterative refinement ===
+  test_iterative_refinement...
+    No refinement:   cos=0.999753 mse=0.00028390 time=20.4ms
+    2 refine rounds: cos=0.999834 mse=0.00022261 time=32.1ms
+  OK
+
+=== Diversity-aware selection ===
+  test_diversity_aware_selection...
+    Standard:  cos=0.997326 mse=0.00230981
+    Diversity: cos=0.999759 mse=0.00019139
+    Selections differ: yes
+  OK
+
+=== Shared prefix ===
+  test_shared_prefix...
+    Prefix positions 0-7 preserved: yes
+    cos=0.999999 mse=0.00000111
+  OK
+  test_shared_prefix_with_diversity...
+  OK
+
+=== Cheap Q_ref generation ===
+  test_cheap_qref...
+    Real Q_ref:  cos=1.000000 mse=0.00000082 time=31.4ms
+    Cheap Q_ref: cos=0.999984 mse=0.00001293 time=30.2ms
+  OK
+  test_cheap_qref_multi_round...
+    t=62 cos=0.999995
+  OK
+
+=== Safety ===
+  test_double_free_safe... OK
+
+=== Layer filter (A1: Hybrid layer awareness) ===
+  test_layer_filter_all... OK
+  test_layer_filter_periodic... OK
+  test_layer_filter_explicit... OK
+  test_layer_filter_count... OK
+  test_layer_filter_should_compact... OK
+  test_layer_filter_in_compaction...
+    cos=0.999999 (filter in params doesn't break single-layer API)
+  OK
+
+=== Score aggregation methods ===
+  test_score_method_rms...
+    max=0.999999 rms=0.999999 mean=0.999997 OK
+
+=== OMP key selection ===
+  test_omp_basic...
+    OMP+beta: cos=0.999986 mse=0.00001489 OK
+  test_omp_fast...
+    OMP-fast(k=4,int=2): cos=1.000000 OK
+  test_omp_vs_highest_attn...
+    OMP:          cos=0.999985 mse=0.00001420
+    HighestAttn:  cos=0.999125 mse=0.00080675 OK
+
+=== NNLS solver methods ===
+  test_nnls_method_pgd...
+    PGD(iters=0): cos=0.999936
+    Lawson-Hanson: cos=0.999790 OK
+  test_nnls_pgd_with_iters...
+    PGD(iters=50): cos=0.993578 OK
+
+=== Extreme compression ratios (50x = 2%) ===
+  test_extreme_compression_ratios...
+    Ratio     HighestAttn (skip_beta)       OMP (skip_beta)               OMP (+beta)                 
+    -----     ------------------------      ------------------------      ------------------------    
+     50.0%    cos=1.0000 mse=0.000000 250.7ms  cos=1.0000 mse=0.000000 527.0ms  cos=1.0000 mse=0.000000 851.5ms
+     20.0%    cos=1.0000 mse=0.000001 97.3ms  cos=1.0000 mse=0.000001 109.6ms  cos=1.0000 mse=0.000007 157.9ms
+     10.0%    cos=0.9985 mse=0.001318 74.9ms  cos=1.0000 mse=0.000020 82.7ms  cos=0.9998 mse=0.000284 87.1ms
+      5.0%    cos=0.8937 mse=0.067449 67.8ms  cos=0.9999 mse=0.000168 70.3ms  cos=0.9958 mse=0.004049 72.4ms
+      2.0%    cos=0.7753 mse=0.122284 66.6ms  cos=0.9962 mse=0.004070 70.7ms  cos=0.9863 mse=0.016268 70.3ms
+  OK
+  test_extreme_compression_spiky (realistic attention)...
+    Ratio     HighestAttn (skip_beta)       OMP (skip_beta)               OMP (+beta)                 
+    -----     ------------------------      ------------------------      ------------------------    
+     50.0%    cos=1.0000 mse=0.000044 249.9ms  cos=1.0000 mse=0.000083 523.1ms  cos=1.0000 mse=0.001186 968.5ms
+     20.0%    cos=1.0000 mse=0.000150 94.5ms  cos=1.0000 mse=0.000294 112.1ms  cos=1.0000 mse=0.000652 152.2ms
+     10.0%    cos=0.8568 mse=0.003440 76.2ms  cos=0.9793 mse=0.000483 78.1ms  cos=1.0000 mse=0.000550 86.2ms
+      5.0%    cos=0.7920 mse=0.007268 68.1ms  cos=0.9532 mse=0.000673 72.4ms  cos=1.0000 mse=0.000511 71.5ms
+      2.0%    cos=0.7818 mse=0.011876 65.9ms  cos=0.9375 mse=0.000965 67.2ms  cos=1.0000 mse=0.000329 69.4ms
+  OK
+
+=== Chunked compaction ===
+  test_chunked_params_default... OK
+  test_chunked_basic...
+    t=256 cos=1.000000 mse=0.00000036 time=69.5ms
+  OK
+  test_chunked_quality_vs_unchunked...
+    Unchunked: cos=1.000000 mse=0.00000029 time=81.7ms
+    Chunked:   cos=0.999915 mse=0.00007180 time=31.8ms
+  OK
+  test_chunked_no_chunk_when_small...
+    Auto vs disabled identical: yes (t=64)
+  OK
+  test_chunked_uneven_chunks...
+    t=250 cos=1.000000 (3 uneven chunks: 200+200+100)
+  OK
+  test_chunked_with_shared_prefix...
+    Prefix 0-7 preserved in chunked mode: yes
+  OK
+  test_chunked_with_cheap_qref...
+    Chunked+cheap_qref: t=256 cos=0.999974
+  OK
+  test_chunked_100k...
+    T=100000 auto-chunk: t=50000 cos=0.999982 time=6.7s (no OOM!)
+  OK
+  test_chunked_1M...
+    T=1000000 auto-chunk: t=500000 cos=0.999963 time=24.8s (1M context!)
+  OK
+  test_chunked_parallel_vs_sequential...
+    Sequential: t=2048 cos=1.000000 time=2384.4ms
+    Parallel:   t=2048 cos=1.000000 time=838.4ms
+  OK
+
+All tests passed!

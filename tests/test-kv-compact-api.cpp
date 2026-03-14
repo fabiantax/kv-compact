@@ -1571,6 +1571,307 @@ static void test_extreme_compression_spiky() {
     printf("  OK\n");
 }
 
+// ============================================================================
+// Reasoning-aware compression tests (A4: R-KV)
+// ============================================================================
+
+// Classifier: first 70% thinking, next 5% transition, last 25% answer.
+struct reasoning_ctx { int T; };
+static int mock_classifier(int pos, void * data) {
+    const reasoning_ctx * ctx = (const reasoning_ctx *)data;
+    int think_end  = (ctx->T * 70) / 100;
+    int trans_end  = think_end + (ctx->T * 5) / 100;
+    if (pos < think_end) return KV_TOKEN_THINKING;
+    if (pos < trans_end) return KV_TOKEN_TRANSITION;
+    return KV_TOKEN_ANSWER;
+}
+
+static void test_reasoning_disabled_by_default() {
+    printf("  test_reasoning_disabled_by_default...");
+    kv_compact_params p = kv_compact_params_default();
+    assert(p.reasoning == NULL);
+    printf(" OK\n");
+}
+
+static void test_reasoning_thinking_compressed_more() {
+    // With reasoning weighting, thinking tokens should be under-represented
+    // in the selection compared to standard (uniform) compression.
+    printf("  test_reasoning_thinking_compressed_more...\n");
+
+    const int T = 200, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 42);
+    gen_data(V.data(), T * n_embd_v, 43);
+    gen_data(Q.data(), n_q * n_embd_k, 44);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.3f;
+    reasoning.transition_weight = 0.7f;
+
+    // Standard compaction
+    kv_compact_params p_std = kv_compact_params_default();
+    p_std.target_ratio = 0.3f;
+    p_std.chunk_size = -1;
+    kv_compact_result r_std = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_std, &r_std);
+
+    // Reasoning-aware compaction
+    kv_compact_params p_rkv = p_std;
+    p_rkv.reasoning = &reasoning;
+    kv_compact_result r_rkv = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_rkv, &r_rkv);
+
+    // Count how many selected tokens fall in the thinking region [0, think_end)
+    int think_end = (T * 70) / 100;
+    int std_thinking = 0, rkv_thinking = 0;
+    int std_answer = 0, rkv_answer = 0;
+    int trans_end = think_end + (T * 5) / 100;
+
+    for (int j = 0; j < r_std.t; j++) {
+        if (r_std.selected_indices[j] < think_end) std_thinking++;
+        if (r_std.selected_indices[j] >= trans_end) std_answer++;
+    }
+    for (int j = 0; j < r_rkv.t; j++) {
+        if (r_rkv.selected_indices[j] < think_end) rkv_thinking++;
+        if (r_rkv.selected_indices[j] >= trans_end) rkv_answer++;
+    }
+
+    printf("    Standard: %d/%d thinking, %d/%d answer\n",
+           std_thinking, r_std.t, std_answer, r_std.t);
+    printf("    R-KV:     %d/%d thinking, %d/%d answer\n",
+           rkv_thinking, r_rkv.t, rkv_answer, r_rkv.t);
+
+    // R-KV should select fewer thinking tokens and more answer tokens
+    assert(rkv_thinking < std_thinking);
+    assert(rkv_answer > std_answer);
+
+    kv_compact_result_free(&r_std);
+    kv_compact_result_free(&r_rkv);
+    printf("  OK\n");
+}
+
+static void test_reasoning_answer_quality_preserved() {
+    // With reasoning weighting, overall quality should remain high because
+    // answer tokens (which carry the important information) are preserved.
+    printf("  test_reasoning_answer_quality_preserved...\n");
+
+    const int T = 256, n_q = 32, n_head_kv = 4, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 100);
+    gen_data(V.data(), T * n_embd_v, 200);
+    gen_data(Q.data(), n_q * n_embd_k, 300);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.3f;
+    reasoning.transition_weight = 0.7f;
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.reasoning = &reasoning;
+    p.chunk_size = -1;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    printf("    cos=%.6f mse=%.8f agree=%.1f%%\n",
+           result.stats.avg_cosine_sim, result.stats.avg_mse,
+           result.stats.avg_agreement * 100.0f);
+
+    // Quality should still be very good
+    assert(result.stats.avg_cosine_sim > 0.995f);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_reasoning_weight_zero_drops_thinking() {
+    // With thinking_weight=0, all thinking tokens should be excluded
+    // (assuming enough answer tokens exist to fill the budget).
+    printf("  test_reasoning_weight_zero_drops_thinking...\n");
+
+    const int T = 100, n_q = 16, n_head_kv = 2, d_k = 16, d_v = 16;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 77);
+    gen_data(V.data(), T * n_embd_v, 78);
+    gen_data(Q.data(), n_q * n_embd_k, 79);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.0f;  // completely suppress
+    reasoning.transition_weight = 0.0f;
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.25f;  // keep 25 out of 100
+    p.reasoning = &reasoning;
+    p.chunk_size = -1;
+
+    kv_compact_result result = {};
+    kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+    // All selected should be in the answer region [75, 100)
+    int think_end = (T * 70) / 100;
+    int thinking_selected = 0;
+    for (int j = 0; j < result.t; j++) {
+        if (result.selected_indices[j] < think_end) thinking_selected++;
+    }
+    printf("    thinking_selected=%d/%d (should be 0)\n", thinking_selected, result.t);
+    assert(thinking_selected == 0);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_reasoning_with_chunked() {
+    // R-KV should work correctly with chunked compaction.
+    printf("  test_reasoning_with_chunked...\n");
+
+    const int T = 1024, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 500);
+    gen_data(V.data(), T * n_embd_v, 600);
+    gen_data(Q.data(), n_q * n_embd_k, 700);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.3f;
+    reasoning.transition_weight = 0.7f;
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.5f;
+    p.reasoning = &reasoning;
+    // Let auto-chunking kick in
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    int think_end = (T * 70) / 100;
+    int think_sel = 0, answer_sel = 0;
+    for (int j = 0; j < result.t; j++) {
+        if (result.selected_indices[j] < think_end) think_sel++;
+        else answer_sel++;
+    }
+
+    // Thinking should be under-represented relative to its 70% share
+    float think_frac = (float)think_sel / result.t;
+    printf("    chunked T=%d: t=%d, thinking=%.0f%% of selected (was 70%% of input)\n",
+           T, result.t, think_frac * 100.0f);
+    printf("    cos=%.6f\n", result.stats.avg_cosine_sim);
+    assert(think_frac < 0.70f);  // must be below the 70% baseline
+    assert(result.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_reasoning_with_diversity() {
+    // R-KV combined with diversity selection.
+    printf("  test_reasoning_with_diversity...\n");
+
+    const int T = 128, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 88);
+    gen_data(V.data(), T * n_embd_v, 89);
+    gen_data(Q.data(), n_q * n_embd_k, 90);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.3f;
+    reasoning.transition_weight = 0.7f;
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.4f;
+    p.reasoning = &reasoning;
+    p.use_diversity = 1;
+    p.diversity_strength = 0.5f;
+    p.chunk_size = -1;
+
+    kv_compact_result result = {};
+    int rc = kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+    assert(rc == 0);
+
+    int think_end = (T * 70) / 100;
+    int think_sel = 0;
+    for (int j = 0; j < result.t; j++) {
+        if (result.selected_indices[j] < think_end) think_sel++;
+    }
+
+    float think_frac = (float)think_sel / result.t;
+    printf("    diversity+R-KV: thinking=%.0f%% of selected, cos=%.6f\n",
+           think_frac * 100.0f, result.stats.avg_cosine_sim);
+    assert(think_frac < 0.70f);
+    assert(result.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
+static void test_reasoning_multi_round() {
+    // R-KV with multi-round compaction.
+    printf("  test_reasoning_multi_round...\n");
+
+    const int T = 256, n_q = 32, n_head_kv = 2, d_k = 32, d_v = 32;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 111);
+    gen_data(V.data(), T * n_embd_v, 222);
+    gen_data(Q.data(), n_q * n_embd_k, 333);
+
+    reasoning_ctx ctx = { T };
+    kv_compact_reasoning reasoning = {};
+    reasoning.classifier = mock_classifier;
+    reasoning.classifier_data = &ctx;
+    reasoning.thinking_weight = 0.3f;
+    reasoning.transition_weight = 0.7f;
+
+    kv_compact_params p = kv_compact_params_default();
+    p.target_ratio = 0.7f;
+    p.reasoning = &reasoning;
+    p.chunk_size = -1;
+
+    kv_compact_result result = {};
+    kv_compact_stats round_stats[2];
+    int rc = kv_compact_multi_round(K.data(), V.data(), Q.data(),
+                                    T, n_q, n_head_kv, d_k, d_v,
+                                    &p, 2, &result, round_stats);
+    assert(rc == 0);
+    printf("    2 rounds: t=%d cos=%.6f\n", result.t, result.stats.avg_cosine_sim);
+    assert(result.stats.avg_cosine_sim > 0.99f);
+
+    kv_compact_result_free(&result);
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-api:\n\n");
 
@@ -1648,6 +1949,15 @@ int main() {
     test_chunked_100k();
     test_chunked_1M();
     test_chunked_parallel_vs_sequential();
+
+    printf("\n=== Reasoning-aware compression (A4: R-KV) ===\n");
+    test_reasoning_disabled_by_default();
+    test_reasoning_thinking_compressed_more();
+    test_reasoning_answer_quality_preserved();
+    test_reasoning_weight_zero_drops_thinking();
+    test_reasoning_with_chunked();
+    test_reasoning_with_diversity();
+    test_reasoning_multi_round();
 
     printf("\nAll tests passed!\n");
     return 0;
