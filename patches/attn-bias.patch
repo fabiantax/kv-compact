@@ -1,0 +1,178 @@
+diff --git a/include/llama.h b/include/llama.h
+index 1111111..2222222 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -765,6 +765,18 @@ extern "C" {
+     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+     //
++    // Attention bias
++    //
++
++    // Set a per-cell additive attention bias for KV cache compaction.
++    // The bias is added to QK^T logits before softmax (via the attention mask).
++    // This implements the beta term from attention-matching compaction:
++    //   softmax(q @ k_j / sqrt(d) + bias_j) instead of softmax(q @ k_j / sqrt(d))
++    // bias_data: array of n floats, one per cell starting at cell 0
++    // Call after llama_state_seq_set_data() to set biases for the compacted cache.
++    LLAMA_API void llama_memory_set_attn_bias(llama_memory_t mem, llama_seq_id seq_id, const float * bias_data, int32_t n);
++
++    //
+     // State / sessions
+     //
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1111111..2222222 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3209,6 +3209,14 @@ llama_pos llama_memory_seq_pos_max(
+     return mem->seq_pos_max(seq_id);
+ }
+
++void llama_memory_set_attn_bias(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++         const float * bias_data,
++             int32_t   n) {
++    mem->set_attn_bias(seq_id, bias_data, n);
++}
++
+ bool llama_memory_can_shift(llama_memory_t mem) {
+     if (!mem) {
+         return false;
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 1111111..2222222 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -33,6 +33,7 @@ public:
+     void reset() {
+         for (uint32_t i = 0; i < pos.size(); ++i) {
+             pos[i]   = -1;
++            bias[i]  = 0.0f;
+             ext[i].reset();
+             shift[i] =  0;
+             seq[i].reset();
+@@ -62,6 +63,7 @@ public:
+     void resize(uint32_t n) {
+         pos.resize(n);
+         ext.resize(n);
++        bias.resize(n, 0.0f);
+         shift.resize(n);
+         seq.resize(n);
+
+@@ -127,6 +129,7 @@ public:
+
+             res.pos[j] = pos[idx];
+             res.ext[j] = ext[idx];
++            res.bias[j] = bias[idx];
+             res.seq[j] = seq[idx];
+
+             assert(shift[idx] == 0);
+@@ -146,6 +149,7 @@ public:
+
+             res.pos[j] = pos[idx];
+             res.ext[j] = ext[idx];
++            res.bias[j] = bias[idx];
+             res.seq[j] = seq[idx];
+
+             assert(shift[idx] == 0);
+@@ -175,6 +179,7 @@ public:
+
+             pos[idx] = other.pos[j];
+             ext[idx] = other.ext[j];
++            bias[idx] = other.bias[j];
+             seq[idx] = other.seq[j];
+
+             if (pos[idx] != -1) {
+@@ -189,6 +194,14 @@ public:
+         return pos[i];
+     }
+
++    float get_bias(uint32_t i) const {
++        return bias[i];
++    }
++
++    void set_bias(uint32_t i, float b) {
++        bias[i] = b;
++    }
++
+     llama_pos get_shift(uint32_t i) const {
+         assert(i < shift.size());
+
+@@ -461,6 +474,9 @@ private:
+
+     std::vector<llama_pos> pos;
+
++    // per-cell additive attention bias (added to QK^T logits via the mask)
++    std::vector<float> bias;
++
+     // stores extra info per cell
+     std::vector<llama_kv_cell_ext> ext;
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 1111111..2222222 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1402,7 +1402,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float *
+                 if (alibi) {
+                     data[idst + j] = -std::abs(p0 - p1);
+                 } else {
+-                    data[idst + j] = 0.0f;
++                    // Add per-cell attention bias (used by KV cache compaction).
++                    // For non-compacted cells, bias is 0.0f (no effect).
++                    data[idst + j] = cells.get_bias(j);
+                 }
+
+                 continue;
+@@ -1501,6 +1503,25 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch *
+     }
+ }
+
++void llama_kv_cache::set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) {
++    if (n <= 0 || !bias_data) {
++        return;
++    }
++
++    // find which stream this sequence maps to
++    const uint32_t stream = seq_to_stream.at(seq_id);
++    auto & cells = v_cells.at(stream);
++
++    // set bias for cells 0..n-1 in this stream
++    // typically called after state restore, so cells 0..n-1 are the compacted cells
++    const int32_t n_set = std::min(n, (int32_t)cells.size());
++    for (int32_t i = 0; i < n_set; i++) {
++        cells.set_bias(i, bias_data[i]);
++    }
++}
++
+ void llama_kv_cache::set_input_s_mask(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+     GGML_UNUSED(dst);
+     GGML_UNUSED(ubatch);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1111111..2222222 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -174,6 +174,8 @@ public:
+
+     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
++    void set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) override;
++
+ protected:
+     const llama_model & model;
+     const llama_hparams & hparams;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 1111111..2222222 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -67,6 +67,10 @@ struct llama_memory_i {
+
+     // note: track the most recent state because it is very common to restore the latest state
+     virtual bool get_can_shift() const = 0;
++
++    // attention bias support (default no-op for non-KV caches)
++    virtual void set_attn_bias(llama_seq_id /*seq_id*/, const float * /*bias_data*/, int32_t /*n*/) {
++    }
+ };
+
+ // a registry for the supported llama_memory implementations

@@ -1,0 +1,41 @@
+@using Microsoft.AspNetCore.Components.Web
+@using KVCompact.Shared.Models
+
+<div class="chat-message @MessageClass">
+    <div class="message-header">
+        <span class="message-role">@Message.Role</span>
+        <span class="message-time">@Message.Timestamp.ToString("HH:mm:ss")</span>
+    </div>
+    <div class="message-content">
+        @if (Message.IsStreaming)
+        {
+            <StreamingText Text="@Message.Content" />
+        }
+        else
+        {
+            @Message.Content
+        }
+    </div>
+    @if (ShowMetadata)
+    {
+        <div class="message-metadata">
+            <small>Tokens: @Message.TokenCount | Cached: @(Message.UseCache ? "Yes" : "No")</small>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter]
+    public ChatMessage Message { get; set; } = default!;
+
+    [Parameter]
+    public bool ShowMetadata { get; set; } = false;
+
+    private string MessageClass => Message.Role switch
+    {
+        "user" => "message-user",
+        "assistant" => "message-assistant",
+        "system" => "message-system",
+        _ => "message-unknown"
+    };
+}
