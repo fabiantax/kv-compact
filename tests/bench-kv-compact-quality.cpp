@@ -1401,6 +1401,192 @@ static void bench_quantized_compaction() {
     printf("\n");
 }
 
+// ============================================================================
+// Quantized throughput benchmark — tokens/second at various scales
+// ============================================================================
+
+static void bench_quantized_throughput() {
+    printf("=== Quantized KV Throughput (B4) ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+    const int n_warmup = 1;
+    const int n_runs = 3;
+
+    int sizes[] = { 256, 512, 1024, 2048, 4096 };
+    int all_types[] = { KV_TYPE_F32, KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * all_names[] = { "F32 ", "Q8_0", "Q4_0", "Q4_1" };
+
+    printf("  Throughput (tokens/sec) at 50%% compression, %d heads, d=%d:\n\n", n_head_kv, d_k);
+    printf("  T       ");
+    for (int ti = 0; ti < 4; ti++) printf("%-12s", all_names[ti]);
+    printf("\n  ------  ");
+    for (int ti = 0; ti < 4; ti++) printf("----------  ");
+    printf("\n");
+
+    for (int T : sizes) {
+        int n_q = std::min(T / 4, 64);
+
+        // Generate float data once
+        std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+        gen_data(K_f32.data(), T * n_embd_k, 5000 + T);
+        gen_data(V_f32.data(), T * n_embd_v, 5001 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 5002 + T);
+
+        printf("  %-6d  ", T);
+
+        for (int ti = 0; ti < 4; ti++) {
+            int type = all_types[ti];
+
+            if (type == KV_TYPE_F32) {
+                // F32 baseline
+                kv_compact_params p = kv_compact_params_default();
+                p.target_ratio = 0.5f;
+                p.chunk_size = -1;
+
+                // Warmup
+                for (int w = 0; w < n_warmup; w++) {
+                    kv_compact_result r = {};
+                    kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                               T, n_q, n_head_kv, d_k, d_v, &p, &r);
+                    kv_compact_result_free(&r);
+                }
+
+                double total_ms = 0;
+                for (int r = 0; r < n_runs; r++) {
+                    kv_compact_result res = {};
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                               T, n_q, n_head_kv, d_k, d_v, &p, &res);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    kv_compact_result_free(&res);
+                }
+                double avg_ms = total_ms / n_runs;
+                double toks_per_sec = T / (avg_ms / 1000.0);
+                printf("%-12.0f", toks_per_sec);
+            } else {
+                // Quantized
+                size_t k_row_bytes = kv_quant_row_bytes(type, n_embd_k);
+                size_t v_row_bytes = kv_quant_row_bytes(type, n_embd_v);
+                std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+                for (int i = 0; i < T; i++) {
+                    kv_quantize_row(K_f32.data() + i * n_embd_k, type, n_embd_k,
+                                    K_q.data() + i * k_row_bytes);
+                    kv_quantize_row(V_f32.data() + i * n_embd_v, type, n_embd_v,
+                                    V_q.data() + i * v_row_bytes);
+                }
+
+                kv_compact_params p = kv_compact_params_default();
+                p.target_ratio = 0.5f;
+                p.chunk_size = -1;
+
+                // Warmup
+                for (int w = 0; w < n_warmup; w++) {
+                    kv_compact_quant_result r = {};
+                    kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                          type, type, k_row_bytes, v_row_bytes,
+                                          T, n_q, n_head_kv, d_k, d_v, &p, &r);
+                    kv_compact_quant_result_free(&r);
+                }
+
+                double total_ms = 0;
+                for (int r = 0; r < n_runs; r++) {
+                    kv_compact_quant_result res = {};
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                          type, type, k_row_bytes, v_row_bytes,
+                                          T, n_q, n_head_kv, d_k, d_v, &p, &res);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    kv_compact_quant_result_free(&res);
+                }
+                double avg_ms = total_ms / n_runs;
+                double toks_per_sec = T / (avg_ms / 1000.0);
+                printf("%-12.0f", toks_per_sec);
+            }
+        }
+        printf("\n");
+    }
+
+    // ---- Phase breakdown: dequant vs compact vs requant ----
+    printf("\n  Phase breakdown (T=2048, Q8_0, 50%% ratio):\n\n");
+    {
+        int T = 2048, n_q = 64;
+        size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+        size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+
+        std::vector<float> K_f32_l(T * n_embd_k), V_f32_l(T * n_embd_v), Q_l(n_q * n_embd_k);
+        gen_data(K_f32_l.data(), T * n_embd_k, 6000);
+        gen_data(V_f32_l.data(), T * n_embd_v, 6001);
+        gen_data(Q_l.data(), n_q * n_embd_k, 6002);
+
+        std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+        for (int i = 0; i < T; i++) {
+            kv_quantize_row(K_f32_l.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                            K_q.data() + i * k_row_bytes);
+            kv_quantize_row(V_f32_l.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                            V_q.data() + i * v_row_bytes);
+        }
+
+        // Phase 1: Dequant
+        std::vector<float> K_deq(T * n_embd_k), V_deq(T * n_embd_v);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < T; i++) {
+            kv_dequantize_row(K_q.data() + i * k_row_bytes, KV_TYPE_Q8_0, k_row_bytes,
+                              K_deq.data() + i * n_embd_k, n_embd_k);
+            kv_dequantize_row(V_q.data() + i * v_row_bytes, KV_TYPE_Q8_0, v_row_bytes,
+                              V_deq.data() + i * n_embd_v, n_embd_v);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double dequant_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Phase 2: Compact
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+        kv_compact_result result = {};
+        t0 = std::chrono::high_resolution_clock::now();
+        kv_compact(K_deq.data(), V_deq.data(), Q_l.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &result);
+        t1 = std::chrono::high_resolution_clock::now();
+        double compact_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Phase 3: Requant
+        int t_kept = result.t;
+        std::vector<uint8_t> K_out(t_kept * k_row_bytes), V_out(t_kept * v_row_bytes);
+        std::vector<float> v_row(n_embd_v);
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int j = 0; j < t_kept; j++) {
+            int orig = result.selected_indices[j];
+            kv_quantize_row(K_deq.data() + orig * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                            K_out.data() + j * k_row_bytes);
+            for (int h = 0; h < n_head_kv; h++) {
+                memcpy(v_row.data() + h * d_v, result.C_v[h] + j * d_v, d_v * sizeof(float));
+            }
+            kv_quantize_row(v_row.data(), KV_TYPE_Q8_0, n_embd_v,
+                            V_out.data() + j * v_row_bytes);
+        }
+        t1 = std::chrono::high_resolution_clock::now();
+        double requant_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double total = dequant_ms + compact_ms + requant_ms;
+
+        printf("  phase       time_ms    %%_total\n");
+        printf("  ---------   --------   --------\n");
+        printf("  dequant     %7.2f    %5.1f%%\n", dequant_ms, 100.0 * dequant_ms / total);
+        printf("  compact     %7.2f    %5.1f%%\n", compact_ms, 100.0 * compact_ms / total);
+        printf("  requant     %7.2f    %5.1f%%\n", requant_ms, 100.0 * requant_ms / total);
+        printf("  TOTAL       %7.2f    100.0%%\n", total);
+        printf("  throughput: %.0f tok/s (end-to-end)\n", T / (total / 1000.0));
+
+        kv_compact_result_free(&result);
+    }
+
+    printf("\n");
+}
+
 int main() {
     printf("bench-kv-compact-quality\n");
     printf("========================\n\n");
@@ -1415,6 +1601,7 @@ int main() {
     bench_chunked_throughput_scaling();
     bench_reasoning_compression();
     bench_quantized_compaction();
+    bench_quantized_throughput();
 
     printf("All quality benchmarks completed.\n");
     return 0;
