@@ -1,0 +1,74 @@
+The following is a diverse text sample for analyzing MoE expert routing patterns.
+
+Chapter 1: Mathematics and Logic
+
+The Riemann hypothesis, one of the most important unsolved problems in mathematics, concerns the distribution of prime numbers. It states that all non-trivial zeros of the Riemann zeta function have a real part equal to 1/2. The zeta function is defined as ζ(s) = Σ(n=1 to ∞) 1/n^s for complex numbers s with real part greater than 1.
+
+Consider the following proof by contradiction: Assume √2 is rational, so √2 = p/q where p and q are integers with no common factors. Then 2 = p²/q², so p² = 2q². This means p² is even, so p must be even. Write p = 2k. Then 4k² = 2q², giving q² = 2k², so q is also even. But this contradicts our assumption that p and q have no common factors.
+
+Chapter 2: Programming and Technology
+
+Modern GPU architectures use Single Instruction, Multiple Thread (SIMT) execution. In AMD's RDNA 3.5 architecture, each Compute Unit (CU) contains 2 SIMD units, each executing 32 threads in lockstep (wave32). The local data share (LDS) provides 32KB of shared memory per workgroup, enabling fast inter-thread communication.
+
+```python
+import torch
+import torch.nn.functional as F
+
+class MixtureOfExperts(torch.nn.Module):
+    def __init__(self, n_experts=64, d_model=4096, d_ff=11008, top_k=6):
+        super().__init__()
+        self.gate = torch.nn.Linear(d_model, n_experts)
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(d_model, d_ff),
+                torch.nn.GELU(),
+                torch.nn.Linear(d_ff, d_model)
+            ) for _ in range(n_experts)
+        ])
+        self.top_k = top_k
+
+    def forward(self, x):
+        logits = self.gate(x)
+        weights, indices = torch.topk(F.softmax(logits, dim=-1), self.top_k)
+        output = torch.zeros_like(x)
+        for i in range(self.top_k):
+            expert_idx = indices[:, :, i]
+            expert_weight = weights[:, :, i].unsqueeze(-1)
+            for j in range(len(self.experts)):
+                mask = (expert_idx == j)
+                if mask.any():
+                    output[mask] += expert_weight[mask] * self.experts[j](x[mask])
+        return output
+```
+
+Chapter 3: History and Culture
+
+The Renaissance, spanning roughly from the 14th to the 17th century, marked a period of cultural rebirth in Europe. Leonardo da Vinci, perhaps the quintessential Renaissance figure, was not only a painter of masterworks like the Mona Lisa and The Last Supper, but also an inventor, scientist, and anatomist. His notebooks contain designs for flying machines, armored vehicles, and solar power systems that were centuries ahead of their time.
+
+The printing press, invented by Johannes Gutenberg around 1440, revolutionized the dissemination of knowledge. Before its invention, books were copied by hand, making them extremely expensive and rare. The printing press made it possible to produce books quickly and cheaply, leading to an explosion in literacy and the spread of new ideas that would fuel the Protestant Reformation and the Scientific Revolution.
+
+Chapter 4: Natural Sciences
+
+Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize foods from carbon dioxide and water. The light-dependent reactions occur in the thylakoid membranes and convert light energy into ATP and NADPH. The Calvin cycle, occurring in the stroma, uses these energy molecules to fix CO₂ into glucose through a series of enzyme-catalyzed reactions.
+
+In quantum mechanics, the wave function ψ(x,t) describes the quantum state of a particle. The Schrödinger equation, iℏ∂ψ/∂t = Ĥψ, governs how this wave function evolves over time. The probability of finding the particle at position x is given by |ψ(x,t)|². The uncertainty principle states that we cannot simultaneously know both the position and momentum of a particle with arbitrary precision: Δx·Δp ≥ ℏ/2.
+
+Chapter 5: Creative Writing
+
+The old lighthouse keeper watched as the storm clouds gathered on the horizon. For forty years, he had tended the beacon atop this rocky promontory, guiding ships safely through the treacherous waters below. Tonight would test his resolve like never before.
+
+"Margaret," he whispered to the photograph on his desk, "it's going to be a rough one."
+
+The wind began to howl, rattling the windows of the keeper's quarters. Rain lashed against the glass in sheets, and the temperature dropped precipitously. He climbed the spiral staircase to the lamp room, his knees protesting with each step. The Fresnel lens, a magnificent assembly of prisms and glass panels, caught the lamplight and cast it far out to sea.
+
+Chapter 6: Medical Science
+
+The human immune system employs both innate and adaptive defense mechanisms. Innate immunity provides immediate, non-specific protection through physical barriers (skin, mucous membranes), chemical defenses (stomach acid, lysozyme), and cellular components (neutrophils, macrophages, natural killer cells). Adaptive immunity develops over time and provides highly specific responses through T lymphocytes and B lymphocytes, which can recognize and remember specific pathogens.
+
+mRNA vaccines represent a breakthrough in immunology. Unlike traditional vaccines that use weakened or inactivated pathogens, mRNA vaccines deliver instructions for cells to produce a specific viral protein (such as the SARS-CoV-2 spike protein). The immune system then recognizes this protein as foreign and mounts a response, creating antibodies and memory cells for future protection.
+
+Chapter 7: Economics and Finance
+
+Supply and demand are the fundamental forces that determine prices in a market economy. When demand exceeds supply, prices rise; when supply exceeds demand, prices fall. This price mechanism serves as a signal, directing resources to where they are most valued. The concept of elasticity measures how sensitive supply or demand is to changes in price, income, or other variables.
+
+Modern portfolio theory, developed by Harry Markowitz in 1952, demonstrates that investors can optimize their portfolios by considering the relationship between risk and return. The efficient frontier represents the set of portfolios that offer the highest expected return for a given level of risk. Diversification across uncorrelated assets can reduce portfolio risk without sacrificing expected returns.

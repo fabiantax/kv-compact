@@ -280,7 +280,7 @@ static void extract_head_contiguous(
 // dense NNLS problems encountered here (t ~ 10-500 variables).
 //
 // Returns solution in w
-static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200) {
+static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200, float tol = 0.0f) {
     // Precompute A^T * A and A^T * b
     std::vector<float> AtA(n * n);
     std::vector<float> Atb(n);
@@ -442,6 +442,13 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
             float sum = 0.0f;
             for (int j = 0; j < n; j++) sum += AtA[i * n + j] * w[j];
             grad[i] = sum - Atb[i];
+        }
+
+        // Early stop: check gradient norm periodically
+        if (tol > 0.0f && (iter % 10 == 9)) {
+            float grad_norm = 0.0f;
+            for (int i = 0; i < n; i++) grad_norm += grad[i] * grad[i];
+            if (grad_norm < tol * tol * n) break;
         }
     }
 
@@ -970,6 +977,10 @@ struct compacted_layer {
     // Per-head results: beta[h] is [t], C_v[h] is [t * d_v]
     std::vector<std::vector<float>> beta;  // [n_head_kv][t]
     std::vector<std::vector<float>> C_v;   // [n_head_kv][t * d_v]
+
+    // Per-head budget allocation from greedy exchange [n_head_kv]
+    // If empty, uniform budget t was used for all heads
+    std::vector<int> per_head_budgets;
 };
 
 // Compact a single KV head using the Highest Attention Keys method.
@@ -1061,6 +1072,115 @@ static compacted_head compact_head_highest_attn(
     least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
 
     return result;
+}
+
+// ============================================================================
+// Greedy Budget Exchange (Paper §5)
+// ============================================================================
+//
+// Non-uniform per-head budget allocation that greedily exchanges budget units
+// from compression-tolerant heads to compression-sensitive heads.
+//
+// Algorithm:
+//   1. Start with uniform allocation: t_h = total_budget / n_heads
+//   2. Iteratively:
+//      a. Find donor = head whose last key has lowest marginal value
+//      b. Find recipient = head whose next key has highest marginal value
+//      c. If gain > loss: transfer 1 budget unit, continue
+//      d. Else: converged
+//
+// Marginal value model: sensitivity[h] / t_h  (diminishing returns)
+// This is equivalent to water-filling: budget ∝ sqrt(sensitivity) at optimum.
+//
+static std::vector<int> greedy_budget_exchange(
+        const float * sensitivity,
+        int n_heads,
+        int total_budget,
+        int min_per_head = 2,
+        int max_per_head = 0) {
+
+    if (n_heads <= 0 || total_budget <= 0) return {};
+    if (n_heads == 1) return {total_budget};
+
+    min_per_head = std::max(1, min_per_head);
+    if (max_per_head <= 0) max_per_head = total_budget;
+
+    // Ensure feasible: min_per_head * n_heads <= total_budget
+    if (min_per_head * n_heads > total_budget) {
+        min_per_head = total_budget / n_heads;
+        if (min_per_head < 1) min_per_head = 1;
+    }
+
+    // Start uniform
+    std::vector<int> budget(n_heads, total_budget / n_heads);
+    int remaining = total_budget - n_heads * (total_budget / n_heads);
+
+    // Distribute remainder to most sensitive heads
+    std::vector<int> order(n_heads);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+        [&](int a, int b) { return sensitivity[a] > sensitivity[b]; });
+    for (int i = 0; i < remaining; i++) {
+        budget[order[i]]++;
+    }
+
+    // Enforce minimum
+    for (int h = 0; h < n_heads; h++) {
+        budget[h] = std::max(budget[h], min_per_head);
+    }
+    // Re-balance if minimums caused overflow
+    int excess = 0;
+    for (int h = 0; h < n_heads; h++) excess += budget[h];
+    excess -= total_budget;
+    if (excess > 0) {
+        for (int i = n_heads - 1; i >= 0 && excess > 0; i--) {
+            int h = order[i];
+            int can_remove = budget[h] - min_per_head;
+            int remove = std::min(can_remove, excess);
+            budget[h] -= remove;
+            excess -= remove;
+        }
+    }
+
+    // Greedy exchange iterations
+    const int max_iters = n_heads * 20;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        // Find donor: head whose last key has lowest marginal value
+        int donor = -1;
+        float min_marginal = 1e30f;
+        for (int h = 0; h < n_heads; h++) {
+            if (budget[h] <= min_per_head) continue;
+            float marginal = sensitivity[h] / (float)budget[h];
+            if (marginal < min_marginal) {
+                min_marginal = marginal;
+                donor = h;
+            }
+        }
+
+        // Find recipient: head whose next key has highest marginal value
+        int recipient = -1;
+        float max_marginal = 0.0f;
+        for (int h = 0; h < n_heads; h++) {
+            if (h == donor) continue;
+            if (budget[h] >= max_per_head) continue;
+            float marginal = sensitivity[h] / (float)(budget[h] + 1);
+            if (marginal > max_marginal) {
+                max_marginal = marginal;
+                recipient = h;
+            }
+        }
+
+        // Exchange if beneficial
+        if (donor >= 0 && recipient >= 0 && max_marginal > min_marginal) {
+            budget[donor]--;
+            budget[recipient]++;
+        } else {
+            break;  // Converged
+        }
+    }
+
+    return budget;
 }
 
 // Compact all KV heads within a single layer using shared key selection.

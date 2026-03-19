@@ -59,6 +59,15 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(bench-quant-throughput tests/bench-quant-throughput.cpp)
     target_link_libraries(bench-quant-throughput PRIVATE kv-compact-api)
+
+    add_executable(test-moe-cache tests/test-moe-cache.cpp)
+    target_link_libraries(test-moe-cache PRIVATE kv-compact-math)
+
+    add_executable(test-budget-exchange tests/test-budget-exchange.cpp)
+    target_link_libraries(test-budget-exchange PRIVATE kv-compact-math)
+
+    add_executable(bench-expert-cache tests/bench-expert-cache.cpp)
+    target_link_libraries(bench-expert-cache PRIVATE kv-compact-math)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
