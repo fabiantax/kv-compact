@@ -8,8 +8,8 @@
 
 | Kernel | Count | Total us | % | Category |
 |--------|-------|----------|---|----------|
-| `MUL_MAT_VEC q5_K m=8192 n=1 k=2048` | 30 | 5666 | **34.2%** | **Shared expert FFN** |
-| `MUL_MAT_VEC q4_K m=2048 n=1 k=4096` | 31 | 3979 | 24.0% | **Attention QKV** |
+| `MUL_MAT_VEC q5_K m=8192 n=1 k=2048` | 30 | 5666 | **34.2%** | **Attention QKV** (blk.*.attn_qkv, [2048,8192] Q5_K) |
+| `MUL_MAT_VEC q4_K m=2048 n=1 k=4096` | 31 | 3979 | 24.0% | **SSM/DeltaNet gate** (blk.*.attn_gate, [2048,4096] Q4_K) |
 | `MUL_MAT_ID_VEC q4_K m=512 n=8 k=2048 n_expert=256` | 80 | 2186 | 13.2% | MoE gate_up |
 | `MUL_MAT_ID_MUL q6_K m=2048 n=8 k=512 n_expert=256` | 20 | 829 | 5.0% | MoE down (Q6_K) |
 | `MUL_MAT_ID_MUL q4_K m=2048 n=8 k=512 n_expert=256` | 20 | 526 | 3.2% | MoE down (Q4_K) |
@@ -24,20 +24,23 @@
 
 | Category | % of Time | Cacheable? | Multi-slot scaling |
 |----------|-----------|------------|-------------------|
-| **Shared expert FFN** | 34.2% | No (runs every token) | Batches well (GEMM) |
-| **Attention QKV** | 24.0% | No (weight read) | Batches well |
+| **Attention QKV** (was mislabeled "Shared expert") | 34.2% | No (weight read) | Batches well (GEMM) |
+| **SSM/DeltaNet gate** (was mislabeled "Attention QKV") | 24.0% | No (weight read) | Batches well |
 | **MoE experts** | 21.4% | **YES — cache-aware routing** | Batches if same experts |
 | **SSM/DeltaNet** | ~10% | No (sequential state) | Does NOT batch |
 | **Router + overhead** | ~10% | No | Negligible |
 
 ## Key Insights
 
-### 1. Shared Expert is the #1 Bottleneck (34.2%)
-The shared expert FFN (`q5_K m=8192 n=1 k=2048`) runs on EVERY token regardless
-of MoE routing. It's 34% of per-token time. No amount of expert caching helps here.
+### 1. Attention QKV is the #1 Bottleneck (34.2%)
+**CORRECTION (2026-03-20):** Previously mislabeled as "Shared expert FFN".
+The `q5_K m=8192 n=1 k=2048` kernel is `blk.*.attn_qkv.weight` [2048,8192] Q5_K —
+the attention QKV projection in 30 MoE layers. Shared expert is tiny ([512,2048] Q6_K,
+0.82 MiB/layer). The actual shared expert time is negligible.
 
-**Optimization:** Quantize shared experts to Q4_K (from Q5_K) for ~40% bandwidth
-reduction. Or fuse the shared expert into the MoE dispatch.
+**Optimization:** Requantize `attn_qkv` from Q5_K to Q4_K (~20% bandwidth reduction
+on 34% of time = ~7% overall throughput gain). Trade-off: slight quality loss on
+attention precision.
 
 ### 2. MoE Experts are Only 21.4% — Less Than Expected
 The expert caching plan estimated MoE dispatch as the primary bottleneck.
