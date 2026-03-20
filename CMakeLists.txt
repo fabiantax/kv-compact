@@ -40,6 +40,7 @@ if(KV_COMPACT_BUILD_TOOL)
         # Use a local llama.cpp checkout
         message(STATUS "Using local llama.cpp: ${LLAMA_CPP_DIR}")
         set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+        set(llama_cpp_SOURCE_DIR ${LLAMA_CPP_DIR})
         add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
     else()
         # Fetch from GitHub
