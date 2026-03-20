@@ -1,0 +1,61 @@
+@using Microsoft.AspNetCore.Components.Web
+@using KVCompact.Shared.Models
+
+<div class="compaction-monitor">
+    <h3>KV Cache Compaction Status</h3>
+
+    @if (Metrics != null)
+    {
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Original Tokens</div>
+                <div class="metric-value">@Metrics.OriginalTokenCount</div>
+            </div>
+
+            <div class="metric-card">
+                <div class="metric-label">Compacted Tokens</div>
+                <div class="metric-value compacted">@Metrics.CompactedTokenCount</div>
+            </div>
+
+            <div class="metric-card">
+                <div class="metric-label">Compression Ratio</div>
+                <div class="metric-value">@Metrics.CompressionRatio.ToString("F2")x</div>
+            </div>
+
+            <div class="metric-card">
+                <div class="metric-label">Compaction Time</div>
+                <div class="metric-value">@Metrics.CompactionTimeMs.ToString("F2") ms</div>
+            </div>
+
+            <div class="metric-card">
+                <div class="metric-label">Quality (Cosine Sim)</div>
+                <div class="metric-value @(Metrics.QualityScore > 0.95 ? "excellent" : Metrics.QualityScore > 0.9 ? "good" : "fair")">
+                    @Metrics.QualityScore.ToString("F4")
+                </div>
+            </div>
+
+            <div class="metric-card">
+                <div class="metric-label">Memory Saved</div>
+                <div class="metric-value">@Metrics.MemorySavedMB.ToString("F2") MB</div>
+            </div>
+        </div>
+
+        <div class="progress-section">
+            <label>Layer Progress</label>
+            <progress value="@Metrics?.ProcessedLayers" max="@Metrics?.TotalLayers" class="progress-bar"></progress>
+            <span>@Metrics?.ProcessedLayers / @Metrics?.TotalLayers layers</span>
+        </div>
+    }
+    else
+    {
+        <p class="text-muted">Waiting for compaction data...</p>
+    }
+</div>
+
+@code {
+    [Parameter]
+    public CompactionMetrics? Metrics { get; set; }
+
+    [Parameter]
+    public EventCallback<CompactionMetrics> MetricsChanged { get; set; }
+}
