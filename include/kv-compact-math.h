@@ -13,12 +13,12 @@
 //   Step 3 (Value Refitting):  least-squares C_v           — Paper §3
 //   Nonuniform head budgets:   per-head sensitivity        — Paper §5
 //   Attention bias injection:  β into softmax              — Paper §2, §8
+//   Greedy budget exchange:    calibrated per-head weights  — Paper §5
 //
 // Paper pipeline (NOT implemented):
 //   OMP key selection:         Approach B (greedy+NNLS)    — Paper §3 (expensive, 104-565s)
 //   Reference query gen:       repeat-prefill / self-study — Paper §4 (requires model inference)
 //   On-policy compaction:      layer-sequential Q_ref      — Paper §4
-//   Greedy budget exchange:    precomputed per-model       — Paper §5 (requires calibration data)
 //   Online compaction:         compress-during-generation  — Paper §7 (requires runtime hooks)
 //
 // Additional algorithms from docs/adjacent-concepts.md (all implemented):
@@ -45,6 +45,7 @@ enum key_select_mode {
     KEY_SELECT_SUBMODULAR  = 1,  // adjacent-concepts Sec 21: greedy submodular (BumbleBee)
     KEY_SELECT_TOKEN_MERGE = 2,  // adjacent-concepts Sec 20: pairwise merge (ToMe/D2O)
     KEY_SELECT_KMEANS      = 3,  // adjacent-concepts Sec 16: Lloyd's centroid keys
+    KEY_SELECT_L2          = 4,  // L2 norm importance: O(T*d) key scoring (sublinear US-19)
 };
 
 // ============================================================================
@@ -243,9 +244,10 @@ static int nnls_solve_early_stop(const float * A, const float * b, float * w,
 
 // Beta fitting strategy for mass matching (Paper Step 2, Section 3.2)
 enum beta_fit_mode {
-    BETA_FIT_NNLS        = 0,  // Paper baseline: projected gradient NNLS
-    BETA_FIT_SINKHORN    = 1,  // adjacent-concepts Sec 6: Sinkhorn (entropic OT)
-    BETA_FIT_CLOSED_FORM = 2,  // Closed-form: O(n_q * t) with no iterations
+    BETA_FIT_NNLS            = 0,  // Paper baseline: projected gradient NNLS
+    BETA_FIT_SINKHORN        = 1,  // adjacent-concepts Sec 6: Sinkhorn (entropic OT)
+    BETA_FIT_CLOSED_FORM     = 2,  // Closed-form: O(n_q * t) with no iterations
+    BETA_FIT_NNLS_EARLY_STOP = 3,  // NNLS with early stopping (sublinear US-20)
 };
 
 // Closed-form beta computation: eliminates NNLS entirely
@@ -498,6 +500,14 @@ struct streaming_config {
     beta_fit_mode   fit_mode    = BETA_FIT_NNLS;
     int n_alt_rounds = 2;
 
+    // Budget exchange (Paper §5): calibrate per-head sensitivity weights
+    bool use_budget_exchange = false;     // Enable greedy budget exchange
+    int  exchange_recalibrate = 0;        // Recalibrate every N rounds (0 = once)
+
+    // Layer-wise budgets (sublinear US-22): per-layer target_t override
+    // If non-null, points to [n_layers] target sizes (overrides target_size())
+    const int * layer_budgets = nullptr;
+
     // Advanced options (from 2026 papers)
     float attention_threshold = 0.9f;     // TCA-Attention: min attention to keep token
     float drift_threshold = 0.1f;         // Deep Forcing: trigger if attention drifts
@@ -593,6 +603,10 @@ class streaming_compactor {
 
     // Cache of selected indices from last compaction (for position mapping)
     mutable std::vector<int> selected_indices_cache;
+
+    // Cached budget exchange sensitivity weights (reused across rounds)
+    std::vector<float> exchange_weights;
+    int exchange_calibrated_round = -1;  // Round when weights were last computed
 
 public:
     explicit streaming_compactor(const streaming_config & config)
@@ -707,6 +721,8 @@ public:
                 head.clear();
             }
         }
+        exchange_weights.clear();
+        exchange_calibrated_round = -1;
     }
 
     // Get compacted state for a specific layer/head
@@ -1458,15 +1474,33 @@ static compacted_head compact_head_highest_attn(
     std::vector<float> attn_weights(scores);
     softmax_rows(attn_weights.data(), n_q, T);
 
-    // Score each key: max attention weight across queries
+    // Score each key
     std::vector<float> key_scores(T, 0.0f);
-    for (int j = 0; j < T; j++) {
-        float max_score = 0.0f;
-        for (int i = 0; i < n_q; i++) {
-            float w = attn_weights[i * T + j];
-            if (w > max_score) max_score = w;
+    if (select_mode == KEY_SELECT_L2) {
+        // L2 importance: key_norm * mean(|Q·K|) — O(n_q*T*d_k), avoids softmax
+        for (int j = 0; j < T; j++) {
+            float key_norm = 0.0f;
+            for (int d = 0; d < d_k; d++) {
+                key_norm += K[j * d_k + d] * K[j * d_k + d];
+            }
+            key_norm = sqrtf(key_norm + 1e-12f);
+
+            float qk_sum = 0.0f;
+            for (int i = 0; i < n_q; i++) {
+                qk_sum += fabsf(scores[i * T + j]);  // reuse pre-computed scores
+            }
+            key_scores[j] = key_norm * (qk_sum / n_q);
         }
-        key_scores[j] = max_score;
+    } else {
+        // Default: max attention weight across queries
+        for (int j = 0; j < T; j++) {
+            float max_score = 0.0f;
+            for (int i = 0; i < n_q; i++) {
+                float w = attn_weights[i * T + j];
+                if (w > max_score) max_score = w;
+            }
+            key_scores[j] = max_score;
+        }
     }
 
     // Select top-t keys
@@ -1501,6 +1535,8 @@ static compacted_head compact_head_highest_attn(
         std::vector<float> w(t);
         if (fit_mode == BETA_FIT_SINKHORN) {
             sinkhorn_beta_fit(M.data(), row_sums.data(), w.data(), n_q, t);
+        } else if (fit_mode == BETA_FIT_NNLS_EARLY_STOP) {
+            nnls_solve_early_stop(M.data(), row_sums.data(), w.data(), n_q, t);
         } else {
             nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
         }
@@ -1733,6 +1769,325 @@ static std::vector<int> compute_caratheodory_budgets(
     return budgets;
 }
 
+// ============================================================================
+// Greedy budget exchange (Paper §5)
+// ============================================================================
+//
+// Ref: "Fast KV Compaction via Attention Matching" §5 — "the most impactful
+//      ablation." One-time calibration measuring actual reconstruction error
+//      per head at various budgets produces optimal per-head allocation.
+//
+// The current heuristic (compute_head_sensitivity) measures coverage — fraction
+// of attention mass outside top-t keys. A head can have 90% coverage but still
+// reconstruct poorly. Error-curve-based calibration replaces this with weights
+// derived from actual reconstruction MSE.
+//
+// Hard constraint: llama.cpp's KV state format ties position metadata to the
+// layer — all heads share the same selected_indices. The exchange produces
+// calibrated sensitivity weights that flow through cfg.head_sensitivity,
+// biasing shared key selection toward heads that need more budget.
+
+// Extract contiguous per-head data from interleaved GQA layout
+//
+//   all:       [rows, n_head * d] interleaved across heads
+//   head:      [rows, d] contiguous per-head output
+//   rows:      number of rows (T for K/V, n_q for Q)
+//   n_head:    number of heads in the interleaved dimension
+//   d:         dimension per head
+//   h:         head index to extract
+//
+static void extract_head_data(
+        const float * all, float * head,
+        int rows, int n_head, int d, int h) {
+    const int stride = n_head * d;
+    for (int i = 0; i < rows; i++) {
+        memcpy(head + i * d,
+               all + i * stride + h * d,
+               d * sizeof(float));
+    }
+}
+
+// Compute per-head reconstruction error at various budget levels
+//
+// Measures MSE between full attention output and compacted reconstruction
+// for a single KV head at each budget level. Used for calibrated sensitivity
+// via the greedy budget exchange algorithm (Paper §5).
+//
+//   K_h:     [T, d_k] key matrix for this head (contiguous)
+//   V_h:     [T, d_v] value matrix for this head (contiguous)
+//   Q_h:     [n_q, d_k] reference queries for this head (contiguous)
+//   T:       number of tokens
+//   n_q:     number of reference queries
+//   d_k:     key dimension
+//   d_v:     value dimension
+//   budgets: sorted list of budget levels to evaluate
+//
+// Returns: [budgets.size()] MSE values, one per budget level
+//
+static std::vector<float> compute_head_error_curve(
+        const float * K_h, const float * V_h, const float * Q_h,
+        int T, int n_q, int d_k, int d_v,
+        const std::vector<int> & budgets) {
+
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+
+    // Compute full attention: scores = Q @ K^T / sqrt(d_k)
+    std::vector<float> scores(n_q * T);
+    mat_mul_ABt(Q_h, K_h, scores.data(), n_q, T, d_k);
+    for (int i = 0; i < n_q * T; i++) {
+        scores[i] *= inv_sqrt_dk;
+    }
+
+    std::vector<float> attn_weights(scores);
+    softmax_rows(attn_weights.data(), n_q, T);
+
+    // Y_full = attn_weights @ V_h  [n_q, d_v]
+    std::vector<float> Y_full(n_q * d_v, 0.0f);
+    for (int i = 0; i < n_q; i++) {
+        for (int j = 0; j < T; j++) {
+            float w_ij = attn_weights[i * T + j];
+            for (int d = 0; d < d_v; d++) {
+                Y_full[i * d_v + d] += w_ij * V_h[j * d_v + d];
+            }
+        }
+    }
+
+    // Evaluate MSE at each budget level
+    std::vector<float> mse_values(budgets.size());
+
+    for (size_t b = 0; b < budgets.size(); b++) {
+        int t_b = budgets[b];
+
+        if (t_b >= T) {
+            mse_values[b] = 0.0f;
+            continue;
+        }
+
+        // Compact at this budget
+        auto compacted = compact_head_highest_attn(
+            K_h, V_h, Q_h, T, n_q, d_k, d_v, t_b);
+
+        // Reconstruct: Y_comp = softmax(scores_sel + beta) @ C_v
+        std::vector<float> X(n_q * t_b);
+        for (int i = 0; i < n_q; i++) {
+            for (int j = 0; j < t_b; j++) {
+                X[i * t_b + j] = scores[i * T + compacted.selected_indices[j]]
+                               + compacted.beta[j];
+            }
+        }
+        softmax_rows(X.data(), n_q, t_b);
+
+        // MSE = sum((Y_comp - Y_full)^2) / (n_q * d_v)
+        float mse = 0.0f;
+        for (int i = 0; i < n_q; i++) {
+            for (int d = 0; d < d_v; d++) {
+                float y_comp = 0.0f;
+                for (int j = 0; j < t_b; j++) {
+                    y_comp += X[i * t_b + j] * compacted.C_v[j * d_v + d];
+                }
+                float diff = y_comp - Y_full[i * d_v + d];
+                mse += diff * diff;
+            }
+        }
+        mse_values[b] = mse / (n_q * d_v);
+    }
+
+    return mse_values;
+}
+
+// Configuration for greedy budget exchange
+struct budget_exchange_config {
+    int   n_budget_levels = 8;      // Error curve sample points
+    float budget_min_frac = 0.25f;  // Min budget as fraction of t_avg
+    float budget_max_frac = 2.0f;   // Max budget as fraction of t_avg
+    int   max_iterations  = 200;    // Safety limit
+    float min_improvement = 1e-6f;  // Convergence threshold
+};
+
+// Result of greedy budget exchange
+struct budget_exchange_result {
+    std::vector<float> sensitivity_weights;       // [n_head_kv] for cfg.head_sensitivity
+    std::vector<int>   optimal_budgets;            // [n_head_kv] per-head token counts
+    std::vector<std::vector<float>> error_curves;  // [n_head_kv][n_levels] raw curves
+    std::vector<int>   budget_levels;              // [n_levels] budget sample points
+    int   iterations;
+    float initial_error;
+    float final_error;
+};
+
+// Piecewise linear interpolation on an error curve
+//
+//   errors: [n_levels] MSE values at each budget level
+//   levels: [n_levels] sorted budget sample points
+//   budget: target budget to interpolate at
+//
+static float interp_error(
+        const std::vector<float> & errors,
+        const std::vector<int> & levels,
+        int budget) {
+    if (budget <= levels.front()) return errors.front();
+    if (budget >= levels.back())  return errors.back();
+
+    for (size_t i = 0; i + 1 < levels.size(); i++) {
+        if (budget <= levels[i + 1]) {
+            float frac = (float)(budget - levels[i])
+                       / (float)(levels[i + 1] - levels[i]);
+            return errors[i] + frac * (errors[i + 1] - errors[i]);
+        }
+    }
+    return errors.back();
+}
+
+// Greedy budget exchange: find optimal per-head token allocation
+//
+// Starts with uniform allocation, then iteratively transfers tokens from
+// heads with low marginal benefit to heads with high marginal benefit.
+// Produces calibrated sensitivity weights for cfg.head_sensitivity.
+//
+//   K_all:        [T, n_head_kv * d_k] all heads concatenated
+//   V_all:        [T, n_head_kv * d_v] all heads concatenated
+//   Q_ref_all:    [n_q, n_head_kv * d_k] reference queries (all heads)
+//   T:            number of tokens
+//   n_q:          number of reference queries
+//   n_head_kv:    number of KV heads
+//   d_k:          key dimension per head
+//   d_v:          value dimension per head
+//   total_budget: total tokens across all heads (= t_avg * n_head_kv)
+//   cfg:          exchange parameters
+//
+static budget_exchange_result greedy_budget_exchange(
+        const float * K_all, const float * V_all, const float * Q_ref_all,
+        int T, int n_q, int n_head_kv, int d_k, int d_v,
+        int total_budget,
+        const budget_exchange_config & cfg = {}) {
+
+    budget_exchange_result result;
+    result.error_curves.resize(n_head_kv);
+
+    const int t_avg = total_budget / n_head_kv;
+
+    // Step 1: Generate budget sample points
+    std::vector<int> levels;
+    {
+        int lo = std::max(1, (int)(t_avg * cfg.budget_min_frac));
+        int hi = std::min(T, (int)(t_avg * cfg.budget_max_frac));
+
+        for (int i = 0; i < cfg.n_budget_levels; i++) {
+            int val = lo + (hi - lo) * i / std::max(1, cfg.n_budget_levels - 1);
+            levels.push_back(val);
+        }
+
+        // Ensure t_avg is included
+        if (std::find(levels.begin(), levels.end(), t_avg) == levels.end()) {
+            levels.push_back(t_avg);
+        }
+        std::sort(levels.begin(), levels.end());
+        levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    }
+    result.budget_levels = levels;
+
+    // Step 2: Measure error curves per head
+    for (int h = 0; h < n_head_kv; h++) {
+        std::vector<float> K_h(T * d_k), V_h(T * d_v), Q_h(n_q * d_k);
+        extract_head_data(K_all, K_h.data(), T, n_head_kv, d_k, h);
+        extract_head_data(V_all, V_h.data(), T, n_head_kv, d_v, h);
+        extract_head_data(Q_ref_all, Q_h.data(), n_q, n_head_kv, d_k, h);
+
+        result.error_curves[h] = compute_head_error_curve(
+            K_h.data(), V_h.data(), Q_h.data(),
+            T, n_q, d_k, d_v, levels);
+    }
+
+    // Step 3: Initialize uniform budgets
+    result.optimal_budgets.resize(n_head_kv, t_avg);
+    int remainder = total_budget - t_avg * n_head_kv;
+
+    // Distribute remainder to highest-error heads
+    if (remainder > 0) {
+        std::vector<std::pair<float, int>> head_errors(n_head_kv);
+        for (int h = 0; h < n_head_kv; h++) {
+            head_errors[h] = {
+                interp_error(result.error_curves[h], levels, t_avg), h
+            };
+        }
+        std::sort(head_errors.begin(), head_errors.end(),
+                  [](const auto & a, const auto & b) {
+                      return a.first > b.first;
+                  });
+        for (int i = 0; i < remainder; i++) {
+            result.optimal_budgets[head_errors[i].second]++;
+        }
+    }
+
+    // Compute initial total error
+    result.initial_error = 0.0f;
+    for (int h = 0; h < n_head_kv; h++) {
+        result.initial_error += interp_error(
+            result.error_curves[h], levels, result.optimal_budgets[h]);
+    }
+
+    // Step 4: Greedy exchange loop
+    result.iterations = 0;
+    for (int iter = 0; iter < cfg.max_iterations; iter++) {
+        float best_gain = 0.0f;
+        int best_donor = -1, best_recipient = -1;
+
+        for (int donor = 0; donor < n_head_kv; donor++) {
+            if (result.optimal_budgets[donor] <= 1) continue;
+
+            float err_cur = interp_error(
+                result.error_curves[donor], levels,
+                result.optimal_budgets[donor]);
+            float err_minus = interp_error(
+                result.error_curves[donor], levels,
+                result.optimal_budgets[donor] - 1);
+            float cost = err_minus - err_cur;
+
+            for (int recip = 0; recip < n_head_kv; recip++) {
+                if (recip == donor) continue;
+                if (result.optimal_budgets[recip] >= T) continue;
+
+                float err_r_cur = interp_error(
+                    result.error_curves[recip], levels,
+                    result.optimal_budgets[recip]);
+                float err_r_plus = interp_error(
+                    result.error_curves[recip], levels,
+                    result.optimal_budgets[recip] + 1);
+                float benefit = err_r_cur - err_r_plus;
+
+                if (benefit - cost > best_gain) {
+                    best_gain = benefit - cost;
+                    best_donor = donor;
+                    best_recipient = recip;
+                }
+            }
+        }
+
+        if (best_gain < cfg.min_improvement) break;
+
+        result.optimal_budgets[best_donor]--;
+        result.optimal_budgets[best_recipient]++;
+        result.iterations++;
+    }
+
+    // Compute final total error
+    result.final_error = 0.0f;
+    for (int h = 0; h < n_head_kv; h++) {
+        result.final_error += interp_error(
+            result.error_curves[h], levels, result.optimal_budgets[h]);
+    }
+
+    // Convert optimal budgets to sensitivity weights
+    float mean_budget = (float) total_budget / n_head_kv;
+    result.sensitivity_weights.resize(n_head_kv);
+    for (int h = 0; h < n_head_kv; h++) {
+        result.sensitivity_weights[h] = std::max(
+            0.01f, (float) result.optimal_budgets[h] / mean_budget);
+    }
+
+    return result;
+}
+
 // Compact all KV heads within a single layer using shared key selection
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
@@ -1891,14 +2246,34 @@ static compacted_layer compact_layer_all_heads(
         memcpy(hd.attn_weights.data(), hd.scores.data(), n_q * T * sizeof(float));
         softmax_rows(hd.attn_weights.data(), n_q, T);
 
-        // Per-key max attention weight across queries
-        for (int j = 0; j < T; j++) {
-            float max_w = 0.0f;
-            for (int qi = 0; qi < n_q; qi++) {
-                float w = hd.attn_weights[qi * T + j];
-                if (w > max_w) max_w = w;
+        // Per-key importance scoring
+        if (select_mode == KEY_SELECT_L2) {
+            // L2 importance: key_norm * mean(|Q·K|)
+            const float * K_h = K_all + h * d_k;
+            for (int j = 0; j < T; j++) {
+                float key_norm = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    float kv = K_h[j * n_embd_k_gqa + d];
+                    key_norm += kv * kv;
+                }
+                key_norm = sqrtf(key_norm + 1e-12f);
+
+                float qk_sum = 0.0f;
+                for (int qi = 0; qi < n_q; qi++) {
+                    qk_sum += fabsf(hd.scores[qi * T + j]);
+                }
+                per_head_importance[h * T + j] = key_norm * (qk_sum / n_q);
             }
-            per_head_importance[h * T + j] = max_w;
+        } else {
+            // Default: max attention weight across queries
+            for (int j = 0; j < T; j++) {
+                float max_w = 0.0f;
+                for (int qi = 0; qi < n_q; qi++) {
+                    float w = hd.attn_weights[qi * T + j];
+                    if (w > max_w) max_w = w;
+                }
+                per_head_importance[h * T + j] = max_w;
+            }
         }
     }
 
@@ -1993,6 +2368,8 @@ static compacted_layer compact_layer_all_heads(
             std::vector<float> w(t);
             if (fit_mode == BETA_FIT_SINKHORN) {
                 sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+            } else if (fit_mode == BETA_FIT_NNLS_EARLY_STOP) {
+                nnls_solve_early_stop(M.data(), hd.row_sums.data(), w.data(), n_q, t);
             } else {
                 nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
             }
@@ -2131,8 +2508,10 @@ bool streaming_compactor::compact_layer_impl(
 
     if (compactable_size <= 0) return false;  // Nothing to compact
 
-    // Target compacted size for middle zone
-    int target_t = cfg.target_size();
+    // Target compacted size for middle zone (layer-wise override if available)
+    int target_t = (cfg.layer_budgets && layer_idx < (int)layer_heads.size())
+                   ? cfg.layer_budgets[layer_idx]
+                   : cfg.target_size();
     if (target_t >= compactable_size) return false;  // Already small enough
 
     // Pointers to compactable zone (GQA format)
@@ -2145,7 +2524,29 @@ bool streaming_compactor::compact_layer_impl(
     ccfg.select_mode = cfg.select_mode;
     ccfg.fit_mode = cfg.fit_mode;
     ccfg.n_alt_rounds = cfg.n_alt_rounds;
-    ccfg.head_sensitivity = nullptr;  // TODO: layer-adaptive budgets
+    ccfg.head_sensitivity = nullptr;
+
+    // Budget exchange (Paper §5): calibrate per-head sensitivity weights
+    if (cfg.use_budget_exchange && n_heads_kv > 1) {
+        bool need_calibration =
+            exchange_calibrated_round < 0 ||
+            (cfg.exchange_recalibrate > 0 &&
+             round_number - exchange_calibrated_round >= cfg.exchange_recalibrate);
+
+        if (need_calibration) {
+            int total_budget = target_t * n_heads_kv;
+            auto ex = greedy_budget_exchange(
+                K_compact, V_compact, Q_ref,
+                T_compact, n_ref, n_heads_kv, d_k, d_v,
+                total_budget);
+            exchange_weights = ex.sensitivity_weights;
+            exchange_calibrated_round = round_number;
+        }
+
+        if (!exchange_weights.empty()) {
+            ccfg.head_sensitivity = exchange_weights.data();
+        }
+    }
 
     // Call existing compaction on the compactable zone
     compacted_layer result = compact_layer_all_heads(

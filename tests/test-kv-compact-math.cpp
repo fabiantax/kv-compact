@@ -2977,6 +2977,470 @@ static void test_streaming_compactor_basic_workflow() {
     printf(" OK\n");
 }
 
+// ============================================================================
+// Sublinear optimizations (US-24)
+// ============================================================================
+
+static void test_l2_key_selection() {
+    printf("  test_l2_key_selection...");
+
+    // Same test data as compaction tests but with L2 selection mode
+    const int T = 16, n_q = 4, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = sinf((float)(i * 3 + d * 7)) * 2.0f;
+            V[i * d_v + d] = cosf((float)(i * 5 + d * 11)) * 1.5f;
+        }
+    }
+    for (int i = 0; i < n_q; i++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[i * d_k + d] = cosf((float)(i * 2 + d * 5)) * 2.0f;
+        }
+    }
+
+    auto result = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t,
+        2, KEY_SELECT_L2);
+
+    assert((int)result.selected_indices.size() == t);
+    // Verify indices are valid and sorted
+    for (int j = 0; j < t; j++) {
+        assert(result.selected_indices[j] >= 0 && result.selected_indices[j] < T);
+        if (j > 0) assert(result.selected_indices[j] > result.selected_indices[j - 1]);
+    }
+    // Beta and C_v should be finite
+    for (int j = 0; j < t; j++) {
+        assert(std::isfinite(result.beta[j]));
+        for (int d = 0; d < d_v; d++) {
+            assert(std::isfinite(result.C_v[j * d_v + d]));
+        }
+    }
+    printf(" OK\n");
+}
+
+static void test_l2_multi_head() {
+    printf("  test_l2_multi_head...");
+
+    const int T = 16, n_q = 4, d_k = 4, d_v = 4, n_heads = 2, t = 8;
+    const int n_embd_k = n_heads * d_k;
+    const int n_embd_v = n_heads * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+
+    for (int i = 0; i < T; i++) {
+        for (int h = 0; h < n_heads; h++) {
+            for (int d = 0; d < d_k; d++) {
+                K[i * n_embd_k + h * d_k + d] = sinf((float)(i * 3 + h * 17 + d * 7));
+            }
+            for (int d = 0; d < d_v; d++) {
+                V[i * n_embd_v + h * d_v + d] = cosf((float)(i * 5 + h * 13 + d * 11));
+            }
+        }
+    }
+    for (int i = 0; i < n_q; i++) {
+        for (int h = 0; h < n_heads; h++) {
+            for (int d = 0; d < d_k; d++) {
+                Q[i * n_embd_k + h * d_k + d] = cosf((float)(i * 2 + h * 19 + d * 5));
+            }
+        }
+    }
+
+    compaction_config cfg;
+    cfg.select_mode = KEY_SELECT_L2;
+
+    auto result = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(), T, n_q, n_heads, d_k, d_v, t, cfg);
+
+    assert((int)result.selected_indices.size() == t);
+    assert(result.n_head_kv == n_heads);
+    for (int h = 0; h < n_heads; h++) {
+        assert((int)result.beta[h].size() == t);
+        assert((int)result.C_v[h].size() == t * d_v);
+    }
+    printf(" OK\n");
+}
+
+static void test_nnls_early_stop_mode() {
+    printf("  test_nnls_early_stop_mode...");
+
+    const int T = 16, n_q = 4, d_k = 4, d_v = 4, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            K[i * d_k + d] = sinf((float)(i * 3 + d * 7)) * 2.0f;
+            V[i * d_v + d] = cosf((float)(i * 5 + d * 11)) * 1.5f;
+        }
+    }
+    for (int i = 0; i < n_q; i++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[i * d_k + d] = cosf((float)(i * 2 + d * 5)) * 2.0f;
+        }
+    }
+
+    // Compact with early-stop NNLS
+    auto result_es = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t,
+        2, KEY_SELECT_MAX_ATTN, BETA_FIT_NNLS_EARLY_STOP);
+
+    // Compact with standard NNLS for comparison
+    auto result_std = compact_head_highest_attn(
+        K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, t,
+        2, KEY_SELECT_MAX_ATTN, BETA_FIT_NNLS);
+
+    // Both should select the same keys (same scoring)
+    assert(result_es.selected_indices == result_std.selected_indices);
+
+    // Both should produce finite betas
+    for (int j = 0; j < t; j++) {
+        assert(std::isfinite(result_es.beta[j]));
+    }
+    printf(" OK\n");
+}
+
+static void test_layer_wise_budgets() {
+    printf("  test_layer_wise_budgets...");
+
+    const int n_heads = 2, d_k = 4, d_v = 4;
+    const int T = 40, n_ref = 4;
+    const int pin = 4, recent = 4;
+    const int budget = 20;
+
+    // Test 1: Layer 0 uses custom budget = 8 (vs default target_size = 12)
+    {
+        streaming_config cfg;
+        cfg.budget = budget;
+        cfg.trigger = 30;
+        cfg.pin_prefix = pin;
+        cfg.recent_window = recent;
+
+        int layer_budgets[] = {8};
+        cfg.layer_budgets = layer_budgets;
+
+        streaming_compactor compactor(cfg);
+        compactor.init(1, n_heads, d_k, d_v);
+
+        const int n_embd_k = n_heads * d_k;
+        const int n_embd_v = n_heads * d_v;
+        std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_ref * n_embd_k);
+
+        for (int i = 0; i < T; i++) {
+            for (int d = 0; d < n_embd_k; d++)
+                K[i * n_embd_k + d] = sinf((float)(i * 7 + d * 3));
+            for (int d = 0; d < n_embd_v; d++)
+                V[i * n_embd_v + d] = cosf((float)(i * 5 + d * 11));
+        }
+        for (int i = 0; i < n_ref; i++) {
+            for (int d = 0; d < n_embd_k; d++)
+                Q[i * n_embd_k + d] = cosf((float)(i * 3 + d * 7));
+        }
+
+        compactor.add_tokens(T);
+        bool ok = compactor.compact_layer(
+            K.data(), V.data(), Q.data(), n_ref, 0, n_heads, d_k, d_v);
+        assert(ok);
+        assert(compactor.get_state(0, 0).n_compacted == 8);
+    }
+
+    // Test 2: Without layer_budgets, uses default target_size = 12
+    {
+        streaming_config cfg;
+        cfg.budget = budget;
+        cfg.trigger = 30;
+        cfg.pin_prefix = pin;
+        cfg.recent_window = recent;
+
+        streaming_compactor compactor(cfg);
+        compactor.init(1, n_heads, d_k, d_v);
+
+        const int n_embd_k = n_heads * d_k;
+        const int n_embd_v = n_heads * d_v;
+        std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_ref * n_embd_k);
+
+        for (int i = 0; i < T; i++) {
+            for (int d = 0; d < n_embd_k; d++)
+                K[i * n_embd_k + d] = sinf((float)(i * 7 + d * 3));
+            for (int d = 0; d < n_embd_v; d++)
+                V[i * n_embd_v + d] = cosf((float)(i * 5 + d * 11));
+        }
+        for (int i = 0; i < n_ref; i++) {
+            for (int d = 0; d < n_embd_k; d++)
+                Q[i * n_embd_k + d] = cosf((float)(i * 3 + d * 7));
+        }
+
+        compactor.add_tokens(T);
+        bool ok = compactor.compact_layer(
+            K.data(), V.data(), Q.data(), n_ref, 0, n_heads, d_k, d_v);
+        assert(ok);
+        assert(compactor.get_state(0, 0).n_compacted == cfg.target_size());
+    }
+
+    printf(" OK\n");
+}
+
+static void test_streaming_budget_exchange() {
+    printf("  test_streaming_budget_exchange...");
+
+    // Small dimensions for fast test
+    const int n_heads_kv = 2, d_k = 4, d_v = 4;
+    const int T = 40;  // Compactable zone size
+    const int n_ref = 4;
+    const int pin = 4, recent = 4;
+    const int budget = 20;  // target_t = budget - pin - recent = 12
+
+    streaming_config cfg;
+    cfg.budget = budget;
+    cfg.trigger = 30;
+    cfg.pin_prefix = pin;
+    cfg.recent_window = recent;
+    cfg.use_budget_exchange = true;
+
+    streaming_compactor compactor(cfg);
+    compactor.init(1, n_heads_kv, d_k, d_v);
+
+    // Generate test data: [T, n_heads_kv * d_k]
+    const int n_embd_k = n_heads_kv * d_k;
+    const int n_embd_v = n_heads_kv * d_v;
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_ref * n_embd_k);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            K[i * n_embd_k + 0 * d_k + d] = (d == 0) ? 3.0f : 0.0f;
+            K[i * n_embd_k + 1 * d_k + d] = sinf((float)(i * 7 + d * 13)) * 2.0f;
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * n_embd_v + 0 * d_v + d] = (i < 4 && d == 0) ? 2.0f : 0.1f;
+            V[i * n_embd_v + 1 * d_v + d] = cosf((float)(i * 11 + d * 5)) * 1.5f;
+        }
+    }
+    for (int i = 0; i < n_ref; i++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[i * n_embd_k + 0 * d_k + d] = (d == 0) ? 2.5f : 0.0f;
+            Q[i * n_embd_k + 1 * d_k + d] = cosf((float)(i * 5 + d * 9)) * 2.0f;
+        }
+    }
+
+    compactor.add_tokens(T);
+    assert(compactor.needs_compaction());
+
+    // Compact with budget exchange
+    bool compacted = compactor.compact_layer(
+        K.data(), V.data(), Q.data(), n_ref, 0, n_heads_kv, d_k, d_v);
+
+    assert(compacted);
+    assert(compactor.round() == 1);
+
+    // Verify per-head state was produced
+    auto & h0 = compactor.get_state(0, 0);
+    auto & h1 = compactor.get_state(0, 1);
+    assert(!h0.is_empty());
+    assert(!h1.is_empty());
+    assert(h0.n_compacted == cfg.target_size());
+    assert(h1.n_compacted == cfg.target_size());
+
+    printf(" OK\n");
+}
+
+// ============================================================================
+// Greedy budget exchange (Paper §5)
+// ============================================================================
+
+// Shared test data builder for budget exchange tests
+// T=24, n_q=8, d_k=4, d_v=4, 2 heads
+// Head 0 (sharp): orthogonal keys — easy to compress
+// Head 1 (broad): near-uniform keys — hard to compress
+struct budget_exchange_test_data {
+    static const int T = 24;
+    static const int n_q = 8;
+    static const int d_k = 4;
+    static const int d_v = 4;
+    static const int n_head_kv = 2;
+
+    std::vector<float> K_all;   // [T, n_head_kv * d_k]
+    std::vector<float> V_all;   // [T, n_head_kv * d_v]
+    std::vector<float> Q_all;   // [n_q, n_head_kv * d_k]
+
+    budget_exchange_test_data()
+        : K_all(T * n_head_kv * d_k, 0.0f)
+        , V_all(T * n_head_kv * d_v, 0.0f)
+        , Q_all(n_q * n_head_kv * d_k, 0.0f) {
+
+        const int stride_k = n_head_kv * d_k;
+        const int stride_v = n_head_kv * d_v;
+
+        for (int i = 0; i < T; i++) {
+            // Head 0 (sharp): concentrated attention on a few keys
+            // First 4 tokens have strong keys along dim 0, rest are near-zero
+            for (int d = 0; d < d_k; d++) {
+                if (i < 4) {
+                    K_all[i * stride_k + 0 * d_k + d] = (d == 0) ? 3.0f : 0.0f;
+                } else {
+                    K_all[i * stride_k + 0 * d_k + d] = 0.01f;
+                }
+            }
+
+            // Head 1 (broad): diverse keys → attention spread across many tokens
+            // Each key is a unique direction using varied sinusoidal components
+            for (int d = 0; d < d_k; d++) {
+                K_all[i * stride_k + 1 * d_k + d] =
+                    sinf((float)(i * 7 + d * 13 + 3)) * 2.0f;
+            }
+
+            // Values: distinct per-token information
+            for (int d = 0; d < d_v; d++) {
+                V_all[i * stride_v + 0 * d_v + d] = (i < 4 && d == i % d_v) ? 2.0f : 0.1f;
+                V_all[i * stride_v + 1 * d_v + d] =
+                    cosf((float)(i * 11 + d * 5 + 1)) * 1.5f;
+            }
+        }
+
+        for (int i = 0; i < n_q; i++) {
+            for (int d = 0; d < d_k; d++) {
+                // Head 0 queries: all point in the same direction → concentrated
+                Q_all[i * stride_k + 0 * d_k + d] = (d == 0) ? 2.5f : 0.0f;
+                // Head 1 queries: diverse directions → spread attention
+                Q_all[i * stride_k + 1 * d_k + d] =
+                    cosf((float)(i * 5 + d * 9 + 2)) * 2.0f;
+            }
+        }
+    }
+};
+
+static void test_error_curve_monotonic() {
+    printf("  test_error_curve_monotonic...");
+    budget_exchange_test_data td;
+
+    // Extract head 1 (broad — more interesting error curve)
+    std::vector<float> K_h(td.T * td.d_k), V_h(td.T * td.d_v), Q_h(td.n_q * td.d_k);
+    extract_head_data(td.K_all.data(), K_h.data(), td.T, td.n_head_kv, td.d_k, 1);
+    extract_head_data(td.V_all.data(), V_h.data(), td.T, td.n_head_kv, td.d_v, 1);
+    extract_head_data(td.Q_all.data(), Q_h.data(), td.n_q, td.n_head_kv, td.d_k, 1);
+
+    std::vector<int> budgets = {2, 4, 6, 8, 12, 16, 20, 24};
+    auto errors = compute_head_error_curve(
+        K_h.data(), V_h.data(), Q_h.data(),
+        td.T, td.n_q, td.d_k, td.d_v, budgets);
+
+    // More budget should give equal or lower error (with tolerance for noise)
+    for (size_t i = 0; i + 1 < errors.size(); i++) {
+        assert(errors[i] >= errors[i + 1] - 1e-4f);
+    }
+    printf(" OK\n");
+}
+
+static void test_error_curve_zero_at_full() {
+    printf("  test_error_curve_zero_at_full...");
+    budget_exchange_test_data td;
+
+    std::vector<float> K_h(td.T * td.d_k), V_h(td.T * td.d_v), Q_h(td.n_q * td.d_k);
+    extract_head_data(td.K_all.data(), K_h.data(), td.T, td.n_head_kv, td.d_k, 0);
+    extract_head_data(td.V_all.data(), V_h.data(), td.T, td.n_head_kv, td.d_v, 0);
+    extract_head_data(td.Q_all.data(), Q_h.data(), td.n_q, td.n_head_kv, td.d_k, 0);
+
+    // Full budget = perfect reconstruction
+    std::vector<int> budgets = {td.T};
+    auto errors = compute_head_error_curve(
+        K_h.data(), V_h.data(), Q_h.data(),
+        td.T, td.n_q, td.d_k, td.d_v, budgets);
+
+    assert(errors[0] < 1e-5f);
+    printf(" OK\n");
+}
+
+static void test_greedy_exchange_convergence() {
+    printf("  test_greedy_exchange_convergence...");
+    budget_exchange_test_data td;
+
+    int total_budget = 8 * td.n_head_kv;  // t_avg = 8 (3x compression)
+    budget_exchange_config cfg;
+    cfg.max_iterations = 200;
+
+    auto result = greedy_budget_exchange(
+        td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+        td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v,
+        total_budget, cfg);
+
+    assert(result.iterations < cfg.max_iterations);
+    printf(" OK (converged in %d iterations)\n", result.iterations);
+}
+
+static void test_greedy_exchange_budget_conservation() {
+    printf("  test_greedy_exchange_budget_conservation...");
+    budget_exchange_test_data td;
+
+    int total_budget = 8 * td.n_head_kv;
+    auto result = greedy_budget_exchange(
+        td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+        td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v,
+        total_budget);
+
+    int sum = 0;
+    for (int h = 0; h < td.n_head_kv; h++) {
+        sum += result.optimal_budgets[h];
+    }
+    assert(sum == total_budget);
+    printf(" OK\n");
+}
+
+static void test_greedy_exchange_nonuniform() {
+    printf("  test_greedy_exchange_nonuniform...");
+    budget_exchange_test_data td;
+
+    int total_budget = 8 * td.n_head_kv;
+    auto result = greedy_budget_exchange(
+        td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+        td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v,
+        total_budget);
+
+    // Head 1 (broad, near-uniform keys) should get more budget than head 0 (sharp)
+    assert(result.optimal_budgets[1] >= result.optimal_budgets[0]);
+    printf(" OK (sharp=%d, broad=%d)\n",
+           result.optimal_budgets[0], result.optimal_budgets[1]);
+}
+
+static void test_greedy_exchange_improves_total_error() {
+    printf("  test_greedy_exchange_improves_total_error...");
+    budget_exchange_test_data td;
+
+    int total_budget = 8 * td.n_head_kv;
+    auto result = greedy_budget_exchange(
+        td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+        td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v,
+        total_budget);
+
+    // Exchange should not increase total error
+    assert(result.final_error <= result.initial_error + 1e-8f);
+    printf(" OK (initial=%.6f, final=%.6f)\n",
+           result.initial_error, result.final_error);
+}
+
+static void test_sensitivity_weights_reasonable() {
+    printf("  test_sensitivity_weights_reasonable...");
+    budget_exchange_test_data td;
+
+    int total_budget = 8 * td.n_head_kv;
+    auto result = greedy_budget_exchange(
+        td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+        td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v,
+        total_budget);
+
+    // All weights must be positive
+    for (int h = 0; h < td.n_head_kv; h++) {
+        assert(result.sensitivity_weights[h] > 0.0f);
+    }
+
+    // Mean should be close to 1.0 (weights = budget[h] / mean_budget)
+    float sum = 0.0f;
+    for (int h = 0; h < td.n_head_kv; h++) {
+        sum += result.sensitivity_weights[h];
+    }
+    float mean = sum / td.n_head_kv;
+    assert(fabsf(mean - 1.0f) < 0.15f);
+
+    printf(" OK (mean=%.3f)\n", mean);
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -3103,6 +3567,23 @@ int main() {
     test_streaming_config_helpers();
     test_streaming_compactor_init();
     test_streaming_compactor_basic_workflow();
+
+    test_streaming_budget_exchange();
+
+    printf("\n=== Sublinear optimizations (US-24) ===\n");
+    test_l2_key_selection();
+    test_l2_multi_head();
+    test_nnls_early_stop_mode();
+    test_layer_wise_budgets();
+
+    printf("\n=== Greedy budget exchange (Paper §5) ===\n");
+    test_error_curve_monotonic();
+    test_error_curve_zero_at_full();
+    test_greedy_exchange_convergence();
+    test_greedy_exchange_budget_conservation();
+    test_greedy_exchange_nonuniform();
+    test_greedy_exchange_improves_total_error();
+    test_sensitivity_weights_reasonable();
 
     printf("\nAll tests passed!\n");
     return 0;
