@@ -1,17 +1,20 @@
 # Handover: kv-compact
 
 **Date:** 2026-03-13
-**Branch:** `claude/list-branch-changes-qdPyO`
-**Last commit:** f15bb12 (feat: add closed-form beta computation)
+**Branch:** `pr2-profiling-infrastructure`
+**Last commit:** 9140ef4 (feat(examples): add code samples and profiling tools)
 
 ---
 
 ## ⚠️ CORRECTION: AMD GPU SYSTEM
 
 **Your Hardware:**
-- CPU: AMD Ryzen 9 3955WX (16 cores/32 threads, 128GB RAM)
-- GPU: **AMD Radeon 7xxxS series** (e.g., RX 7600S/7700S/7800S)
+- CPU: AMD Ryzen AI Max+ 395 (Strix Halo)
+- APU/GPU: **AMD Radeon 8060S** (gfx1151, RDNA 3.5, 40 CUs)
+- RAM: 68GB usable LPDDR5X (~212 GB/s bandwidth)
+- NPU: XDNA 2 (for future ONNX/DirectML acceleration)
 - **API:** HIP/ROCm (NOT CUDA!)
+- OS: Windows 11 Pro
 
 **See:** `HANDOVER-AMD-GPU.md` for detailed AMD GPU guide
 
@@ -22,7 +25,7 @@
 ### Option A: CPU-Only First ✅ RECOMMENDED
 
 **Why:** Guaranteed performance, zero risk
-**Expected:** 40-50 tg/s (1.6x better than laptop)
+**Expected:** 7-10 tg/s baseline (Qwen3.5-35B-A3B, tg128)
 
 ```bash
 # Build CPU-only version
@@ -30,10 +33,10 @@ mkdir build && cd build
 cmake .. -DKV_COMPACT_ENABLE_PROFILING=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release -j 32
 
-# Test Ryzen 3955WX performance
+# Test Ryzen AI Max+ 395 performance
 cd Release
-./llama-kv-compact.exe -m ../../../models/Qwen3.5-0.8B-Q4_K_M.gguf \
-  -c 8192 -n 512 -p "test" --perf
+./llama-kv-compact.exe -m ../../../models/Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  -c 8192 -n 128 -p "test" --perf
 ```
 
 ### Option B: Try Windows HIP ⚡ EXPERIMENTAL
@@ -103,17 +106,18 @@ cd llama-cuda-bin
 nvidia-smi -l 1  # Should show >50% utilization
 ```
 
-### Expected Performance on AMD Ryzen 3955WX + Radeon 7xxxS
+### Expected Performance on AMD Ryzen AI Max+ 395 + Radeon 8060S
 
-| Configuration | GTX 1050 Ti (Current) | Ryzen 3955WX CPU | Radeon GPU (Windows HIP) | Radeon GPU (Linux ROCm) |
-|--------------|----------------------|------------------|-------------------------|------------------------|
-| No Compaction | 31 tg/s | **40-50 tg/s** | 40-80 tg/s ⚠️ | 100-150 tg/s ✅ |
-| With Compaction | 31 tg/s | **50+ tg/s** | 50-100 tg/s ⚠️ | 120-180 tg/s ✅ |
+| Configuration | Vulkan (Warm GPU) | HIP (Windows) | CPU-only |
+|--------------|-------------------|---------------|----------|
+| Qwen3.5-35B-A3B Q4_K_M (tg128) | **67 tg/s** | 56 tg/s | 7 tg/s |
+| Notes | SSM shader optimized | Shared memory tiled | Baseline |
 
-**Recommendations:**
-- **Start with CPU-only:** Guaranteed 40-50 tg/s, zero risk
-- **Try Windows HIP:** Experimental, may provide 2-3x speedup
-- **Linux ROCm for max performance:** Best GPU support, 3-5x speedup
+**Key Findings:**
+- Vulkan HIP backend: +150% over CPU
+- GPU shared memory is 32 KB (not 64 KB) — TILE_K=64 for Vulkan
+- **Avoid**: UMA HostVisible allocations (-2 tg/s regression), zero-copy mmap (BROKEN)
+- **See**: `skills/qwen35-optimization.md` for detailed tuning guide
 
 ---
 

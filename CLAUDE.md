@@ -1,5 +1,23 @@
 # kv-compact
 
+## Todo List (Mandatory)
+
+This project REQUIRES maintaining a task list via `TaskCreate`/`TaskList`/`TaskUpdate`. Always:
+1. Create tasks for multi-step work before starting
+2. Mark tasks `in_progress` when beginning work
+3. Mark tasks `completed` when done
+4. Clean up stale tasks at session end
+
+**Current Session Tasks:**
+- See `TaskList` output for active tasks
+- Tasks persist across conversation compression
+
+**Previous Session Status:**
+- Session compaction auto-saves context
+- Check MEMORY.md for project memory
+
+---
+
 ## Session Handover
 
 See `HANDOVER.md` for full project state, what's done/not done, and recommended
@@ -73,3 +91,141 @@ This project uses fab-swarm nano-agents for fast operations. **Prefer these tool
 - Complex regex with context → `Grep`
 - Need to reason about contents → `Read`
 - Multi-step file operations → Built-in tools
+
+---
+
+## llama-cli Process Management
+
+### Problem: Stuck llama-cli.exe Processes
+
+Multiple llama-cli.exe processes can become stuck, consuming memory and GPU resources. This happens when:
+- Benchmarks are interrupted (Ctrl+C not properly handled)
+- GPU backend fails to release shared memory
+- Multiple instances run simultaneously
+- Process exits but orphaned child processes remain
+
+### Prevention
+
+**Before running benchmarks:**
+```bash
+# Check for existing processes
+ps aux | grep -i llama | grep -v grep
+
+# If any exist, kill them first
+taskkill.exe /IM llama-cli.exe /F
+```
+
+**Use safe benchmark parameters:**
+```bash
+# Use shorter token counts for testing
+-n 32    # Instead of -n 512 for quick tests
+-c 2048  # Reasonable context size
+
+# Add timeout flag (if supported)
+--timeout 300
+```
+
+**Run one benchmark at a time:**
+- Wait for completion before starting next
+- Check process status between runs
+
+### Recovery: Killing Stuck Processes
+
+**Method 1: Task Manager (GUI)**
+```
+1. Ctrl+Shift+Esc → Open Task Manager
+2. Go to "Details" tab
+3. Find llama-cli.exe
+4. Right-click → End Task
+```
+
+**Method 2: PowerShell (Admin)**
+```powershell
+# Kill all llama processes
+Get-Process | Where-Object {$_.ProcessName -like '*llama*'} | Stop-Process -Force
+
+# Or by specific PID
+Stop-Process -Id 1084 -Force
+```
+
+**Method 3: Bash (Git Bash/WSL)**
+```bash
+# Try normal kill first
+pkill -9 llama-cli
+
+# If that fails, use Windows command
+taskkill.exe /IM llama-cli.exe /F
+
+# Kill by process group (for orphaned processes)
+ps aux | grep -i llama | awk '{print $2}' | xargs kill -9
+```
+
+**Method 4: Force Kill Process Group**
+```bash
+# Find the process group ID
+ps aux | grep -i llama
+
+# Kill the entire process group
+kill -9 -<PGID>  # e.g., kill -9 -1047
+```
+
+### Verification
+
+```bash
+# Confirm all processes are gone
+ps aux | grep -i llama | grep -v grep | wc -l
+
+# Should output: 0
+```
+
+### If All Else Fails
+
+**Restart GPU driver (Windows):**
+```powershell
+# As Administrator
+Restart-Computer -Force  # Last resort
+```
+
+### Helper Scripts
+
+Use the provided wrapper scripts to automate process management:
+
+**Windows Batch:**
+```cmd
+scripts\safe-llama-run.bat -m model.gguf -c 2048 -n 32 -p "test"
+```
+
+**Git Bash:**
+```bash
+./scripts/safe-llama-run.sh -m model.gguf -c 2048 -n 32 -p "test"
+```
+
+These scripts automatically:
+1. Check for existing llama-cli processes
+2. Kill any stuck processes before running
+3. Verify clean exit after completion
+
+**Or use GPU cleanup tools:**
+- AMD: Reset GPU from AMD Software
+- NVIDIA: `nvidia-smi --gpu-reset` (if available)
+
+### Workflow Integration
+
+**Before ANY llama-cli command:**
+```bash
+# 1. Check existing processes
+if ps aux | grep -i llama | grep -v grep > /dev/null; then
+    echo "Warning: Existing llama-cli processes found!"
+    echo "Kill them first: taskkill.exe /IM llama-cli.exe /F"
+    # Optionally auto-kill:
+    taskkill.exe /IM llama-cli.exe /F
+fi
+
+# 2. Run benchmark
+./llama-cli.exe ...
+
+# 3. Verify clean exit
+ps aux | grep -i llama | grep -v grep
+```
+
+---
