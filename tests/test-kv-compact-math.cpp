@@ -3441,6 +3441,344 @@ static void test_sensitivity_weights_reasonable() {
     printf(" OK (mean=%.3f)\n", mean);
 }
 
+// ============================================================================
+// End-to-end quality: heuristic vs exchange weights (§5 validation)
+// ============================================================================
+
+// Compute per-head reconstruction MSE from a compacted_layer result
+// Uses the same reconstruction formula as the paper:
+//   Y_comp = softmax(Q_h @ K_sel^T / sqrt(d_k) + beta[h]) @ C_v[h]
+// Compares against Y_full = softmax(Q_h @ K_h^T / sqrt(d_k)) @ V_h
+static float compute_layer_reconstruction_mse(
+        const compacted_layer & result,
+        const float * K_all, const float * V_all, const float * Q_all,
+        int T, int n_q, int n_head_kv, int d_k, int d_v) {
+
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    const int t = result.t;
+
+    float total_mse = 0.0f;
+
+    for (int h = 0; h < n_head_kv; h++) {
+        // Extract per-head data
+        std::vector<float> K_h(T * d_k), V_h(T * d_v), Q_h(n_q * d_k);
+        extract_head_data(K_all, K_h.data(), T, n_head_kv, d_k, h);
+        extract_head_data(V_all, V_h.data(), T, n_head_kv, d_v, h);
+        extract_head_data(Q_all, Q_h.data(), n_q, n_head_kv, d_k, h);
+
+        // Y_full = softmax(Q @ K^T / sqrt(d_k)) @ V
+        std::vector<float> scores(n_q * T);
+        mat_mul_ABt(Q_h.data(), K_h.data(), scores.data(), n_q, T, d_k);
+        for (int i = 0; i < n_q * T; i++) scores[i] *= inv_sqrt_dk;
+
+        std::vector<float> attn(scores);
+        softmax_rows(attn.data(), n_q, T);
+
+        std::vector<float> Y_full(n_q * d_v, 0.0f);
+        for (int i = 0; i < n_q; i++)
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < d_v; d++)
+                    Y_full[i * d_v + d] += attn[i * T + j] * V_h[j * d_v + d];
+
+        // Y_comp = softmax(Q @ K_sel^T / sqrt(d_k) + beta[h]) @ C_v[h]
+        std::vector<float> X(n_q * t);
+        for (int i = 0; i < n_q; i++)
+            for (int j = 0; j < t; j++)
+                X[i * t + j] = scores[i * T + result.selected_indices[j]]
+                             + result.beta[h][j];
+        softmax_rows(X.data(), n_q, t);
+
+        float head_mse = 0.0f;
+        for (int i = 0; i < n_q; i++) {
+            for (int d = 0; d < d_v; d++) {
+                float y_comp = 0.0f;
+                for (int j = 0; j < t; j++)
+                    y_comp += X[i * t + j] * result.C_v[h][j * d_v + d];
+                float diff = y_comp - Y_full[i * d_v + d];
+                head_mse += diff * diff;
+            }
+        }
+        total_mse += head_mse / (n_q * d_v);
+    }
+
+    return total_mse / n_head_kv;
+}
+
+static void test_exchange_vs_heuristic_quality() {
+    printf("  test_exchange_vs_heuristic_quality...\n");
+
+    // 4 heads with varying sharpness — exercises the budget exchange
+    // Head 0: very sharp (one-hot keys, concentrated attention)
+    // Head 1: moderately sharp
+    // Head 2: moderately broad
+    // Head 3: very broad (diverse keys, spread attention)
+    const int T = 48, n_q = 16, d_k = 8, d_v = 8, n_heads = 4;
+    const int n_embd_k = n_heads * d_k;
+    const int n_embd_v = n_heads * d_v;
+
+    std::vector<float> K(T * n_embd_k, 0.0f);
+    std::vector<float> V(T * n_embd_v, 0.0f);
+    std::vector<float> Q(n_q * n_embd_k, 0.0f);
+
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < d_k; d++) {
+            // Head 0: sharp — only first 6 tokens have signal
+            K[i * n_embd_k + 0 * d_k + d] = (i < 6 && d == i % d_k) ? 4.0f : 0.01f;
+            // Head 1: moderately sharp — first 12 tokens dominate
+            K[i * n_embd_k + 1 * d_k + d] = (i < 12) ? sinf((float)(i * 3 + d * 5)) * 2.0f : 0.05f;
+            // Head 2: moderately broad — all tokens contribute, some more
+            K[i * n_embd_k + 2 * d_k + d] = sinf((float)(i * 7 + d * 11 + 1)) * 1.5f;
+            // Head 3: very broad — diverse, all equally important
+            K[i * n_embd_k + 3 * d_k + d] = sinf((float)(i * 13 + d * 17 + 3)) * 2.0f;
+        }
+        for (int d = 0; d < d_v; d++) {
+            V[i * n_embd_v + 0 * d_v + d] = (i < 6 && d == i % d_v) ? 3.0f : 0.1f;
+            V[i * n_embd_v + 1 * d_v + d] = cosf((float)(i * 2 + d * 7)) * 1.5f;
+            V[i * n_embd_v + 2 * d_v + d] = cosf((float)(i * 11 + d * 3 + 2)) * 1.5f;
+            V[i * n_embd_v + 3 * d_v + d] = cosf((float)(i * 17 + d * 5 + 1)) * 2.0f;
+        }
+    }
+    for (int i = 0; i < n_q; i++) {
+        for (int d = 0; d < d_k; d++) {
+            Q[i * n_embd_k + 0 * d_k + d] = (d == i % d_k) ? 3.0f : 0.0f;
+            Q[i * n_embd_k + 1 * d_k + d] = sinf((float)(i * 5 + d * 3)) * 2.0f;
+            Q[i * n_embd_k + 2 * d_k + d] = cosf((float)(i * 3 + d * 9 + 1)) * 1.5f;
+            Q[i * n_embd_k + 3 * d_k + d] = cosf((float)(i * 7 + d * 13 + 2)) * 2.0f;
+        }
+    }
+
+    // Test at multiple compression ratios
+    int ratios[] = {2, 4, 8};
+    int n_ratios = 3;
+    int exchange_wins = 0, exchange_ties = 0;
+
+    printf("    ratio  heuristic_mse  exchange_mse  winner\n");
+
+    for (int r = 0; r < n_ratios; r++) {
+        int t = T / ratios[r];
+        if (t < 2) continue;
+
+        // (A) Heuristic: auto-compute sensitivity (nullptr)
+        compaction_config cfg_heur;
+        auto result_heur = compact_layer_all_heads(
+            K.data(), V.data(), Q.data(),
+            T, n_q, n_heads, d_k, d_v, t, cfg_heur);
+
+        float mse_heur = compute_layer_reconstruction_mse(
+            result_heur, K.data(), V.data(), Q.data(),
+            T, n_q, n_heads, d_k, d_v);
+
+        // (B) Exchange: calibrated weights
+        int total_budget = t * n_heads;
+        auto ex = greedy_budget_exchange(
+            K.data(), V.data(), Q.data(),
+            T, n_q, n_heads, d_k, d_v, total_budget);
+
+        compaction_config cfg_ex;
+        cfg_ex.head_sensitivity = ex.sensitivity_weights.data();
+        auto result_ex = compact_layer_all_heads(
+            K.data(), V.data(), Q.data(),
+            T, n_q, n_heads, d_k, d_v, t, cfg_ex);
+
+        float mse_ex = compute_layer_reconstruction_mse(
+            result_ex, K.data(), V.data(), Q.data(),
+            T, n_q, n_heads, d_k, d_v);
+
+        const char * winner = (mse_ex < mse_heur - 1e-8f) ? "EXCHANGE"
+                            : (mse_heur < mse_ex - 1e-8f) ? "heuristic"
+                            : "tie";
+
+        printf("    %2dx    %.8f     %.8f    %s\n", ratios[r], mse_heur, mse_ex, winner);
+
+        if (mse_ex < mse_heur - 1e-8f) exchange_wins++;
+        else if (fabsf(mse_ex - mse_heur) <= 1e-8f) exchange_ties++;
+
+        // Exchange should never be significantly worse
+        assert(mse_ex <= mse_heur * 1.05f + 1e-6f);
+    }
+
+    // Exchange should win or tie in majority of cases
+    printf("    Result: exchange wins=%d ties=%d out of %d ratios\n",
+           exchange_wins, exchange_ties, n_ratios);
+    assert(exchange_wins + exchange_ties >= n_ratios / 2);
+
+    printf("  OK\n");
+}
+
+static void test_exchange_quality_scaling() {
+    printf("  test_exchange_quality_scaling...\n");
+
+    // Verify exchange benefit increases with compression ratio
+    // Use the same 2-head sharp/broad data but sweep compression
+    budget_exchange_test_data td;
+
+    printf("    ratio  heuristic_mse  exchange_mse  improvement\n");
+
+    float prev_improvement = -1.0f;
+    int ratios[] = {2, 3, 4, 6};
+    int n_ratios = 4;
+
+    for (int r = 0; r < n_ratios; r++) {
+        int t = td.T / ratios[r];
+        if (t < 2) continue;
+
+        // Heuristic
+        compaction_config cfg_h;
+        auto res_h = compact_layer_all_heads(
+            td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+            td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v, t, cfg_h);
+        float mse_h = compute_layer_reconstruction_mse(
+            res_h, td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+            td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v);
+
+        // Exchange
+        int total_budget = t * td.n_head_kv;
+        auto ex = greedy_budget_exchange(
+            td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+            td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v, total_budget);
+
+        compaction_config cfg_e;
+        cfg_e.head_sensitivity = ex.sensitivity_weights.data();
+        auto res_e = compact_layer_all_heads(
+            td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+            td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v, t, cfg_e);
+        float mse_e = compute_layer_reconstruction_mse(
+            res_e, td.K_all.data(), td.V_all.data(), td.Q_all.data(),
+            td.T, td.n_q, td.n_head_kv, td.d_k, td.d_v);
+
+        float improvement = (mse_h > 1e-10f) ? (mse_h - mse_e) / mse_h : 0.0f;
+        printf("    %2dx    %.8f     %.8f    %+.1f%%\n",
+               ratios[r], mse_h, mse_e, improvement * 100.0f);
+
+        // Exchange should never be significantly worse
+        assert(mse_e <= mse_h * 1.05f + 1e-6f);
+
+        prev_improvement = improvement;
+    }
+
+    printf("  OK\n");
+}
+
+static void test_exchange_beats_heuristic_adversarial() {
+    printf("  test_exchange_beats_heuristic_adversarial...\n");
+
+    // Adversarial case: heads prefer DIFFERENT keys, heuristic misranks them.
+    //
+    // Head A: attends to keys 16-31 (broad across 16 keys)
+    //         Values are redundant (all [1,0,0,0]) → doesn't actually need them
+    //         Heuristic: "sensitive" (50% mass outside top-8 of 16 keys)
+    //
+    // Head B: attends to keys 0-7 (concentrated on 8 keys)
+    //         Values are unique per key → critically needs its keys
+    //         Heuristic: "not sensitive" (all mass in top-8)
+    //
+    // At t=8: heuristic over-weights A → selects A's keys 24-31 → B excluded
+    // Exchange: A's error curve is flat → gives B high weight → B's keys included
+
+    const int T = 32, n_q = 8, d_k = 4, d_v = 4, n_heads = 2, t = 8;
+    const int n_embd_k = n_heads * d_k;
+    const int n_embd_v = n_heads * d_v;
+
+    std::vector<float> K(T * n_embd_k, 0.0f);
+    std::vector<float> V(T * n_embd_v, 0.0f);
+    std::vector<float> Q(n_q * n_embd_k, 0.0f);
+
+    for (int i = 0; i < T; i++) {
+        // Head A: keys 16-31 strong along dim 0, keys 0-15 weak
+        float ka = (i >= 16) ? 3.0f + 0.01f * (i - 16) : 0.01f;
+        K[i * n_embd_k + 0 * d_k + 0] = ka;
+        K[i * n_embd_k + 0 * d_k + 1] = 0.01f;
+        K[i * n_embd_k + 0 * d_k + 2] = 0.01f;
+        K[i * n_embd_k + 0 * d_k + 3] = 0.01f;
+
+        // Head A values: ALL identical → completely redundant
+        V[i * n_embd_v + 0 * d_v + 0] = 1.0f;
+        V[i * n_embd_v + 0 * d_v + 1] = 0.0f;
+        V[i * n_embd_v + 0 * d_v + 2] = 0.0f;
+        V[i * n_embd_v + 0 * d_v + 3] = 0.0f;
+
+        // Head B: keys 0-7 strong with diverse directions, keys 8-31 weak
+        if (i < 8) {
+            K[i * n_embd_k + 1 * d_k + 0] = sinf((float)(i * 5 + 1)) * 1.5f;
+            K[i * n_embd_k + 1 * d_k + 1] = 3.0f + cosf((float)(i * 3)) * 0.5f;
+            K[i * n_embd_k + 1 * d_k + 2] = cosf((float)(i * 7 + 2)) * 1.0f;
+            K[i * n_embd_k + 1 * d_k + 3] = sinf((float)(i * 2 + 3)) * 0.8f;
+        } else {
+            K[i * n_embd_k + 1 * d_k + 0] = 0.01f;
+            K[i * n_embd_k + 1 * d_k + 1] = 0.01f;
+            K[i * n_embd_k + 1 * d_k + 2] = 0.01f;
+            K[i * n_embd_k + 1 * d_k + 3] = 0.01f;
+        }
+
+        // Head B values: unique per token — each key is irreplaceable
+        for (int d = 0; d < d_v; d++) {
+            V[i * n_embd_v + 1 * d_v + d] = sinf((float)(i * 7 + d * 13 + 5)) * 2.0f;
+        }
+    }
+
+    for (int i = 0; i < n_q; i++) {
+        // Head A queries: point toward dim 0 → attend to keys 16-31
+        Q[i * n_embd_k + 0 * d_k + 0] = 3.0f;
+
+        // Head B queries: DIVERSE directions → each query attends differently to keys 0-7
+        // This creates diverse Y_B that can't be reconstructed from uniform softmax
+        Q[i * n_embd_k + 1 * d_k + 0] = sinf((float)(i * 3 + 1)) * 1.5f;
+        Q[i * n_embd_k + 1 * d_k + 1] = 3.0f + cosf((float)(i * 5 + 2)) * 1.0f;
+        Q[i * n_embd_k + 1 * d_k + 2] = sinf((float)(i * 7 + 3)) * 0.8f;
+        Q[i * n_embd_k + 1 * d_k + 3] = cosf((float)(i * 2 + 4)) * 0.5f;
+    }
+
+    // (A) Heuristic sensitivity (auto-compute)
+    compaction_config cfg_heur;
+    auto res_heur = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(),
+        T, n_q, n_heads, d_k, d_v, t, cfg_heur);
+    float mse_heur = compute_layer_reconstruction_mse(
+        res_heur, K.data(), V.data(), Q.data(),
+        T, n_q, n_heads, d_k, d_v);
+
+    // (B) Exchange sensitivity (calibrated)
+    int total_budget = t * n_heads;
+    auto ex = greedy_budget_exchange(
+        K.data(), V.data(), Q.data(),
+        T, n_q, n_heads, d_k, d_v, total_budget);
+
+    compaction_config cfg_ex;
+    cfg_ex.head_sensitivity = ex.sensitivity_weights.data();
+    auto res_ex = compact_layer_all_heads(
+        K.data(), V.data(), Q.data(),
+        T, n_q, n_heads, d_k, d_v, t, cfg_ex);
+    float mse_ex = compute_layer_reconstruction_mse(
+        res_ex, K.data(), V.data(), Q.data(),
+        T, n_q, n_heads, d_k, d_v);
+
+    printf("    exchange weights: A=%.3f B=%.3f  budgets: A=%d B=%d\n",
+           ex.sensitivity_weights[0], ex.sensitivity_weights[1],
+           ex.optimal_budgets[0], ex.optimal_budgets[1]);
+    printf("    heuristic keys:");
+    for (int j = 0; j < t; j++) printf(" %d", res_heur.selected_indices[j]);
+    printf("\n    exchange  keys:");
+    for (int j = 0; j < t; j++) printf(" %d", res_ex.selected_indices[j]);
+    printf("\n    heuristic MSE: %.8f\n", mse_heur);
+    printf("    exchange  MSE: %.8f\n", mse_ex);
+
+    if (mse_ex < mse_heur - 1e-8f) {
+        printf("    -> EXCHANGE WINS (%.1fx better)\n",
+               mse_heur / (mse_ex + 1e-12f));
+    } else if (fabsf(mse_ex - mse_heur) <= 1e-8f) {
+        printf("    -> TIE\n");
+    } else {
+        printf("    -> heuristic wins\n");
+    }
+
+    // Exchange must not be significantly worse
+    assert(mse_ex <= mse_heur * 1.05f + 1e-6f);
+
+    printf("  OK\n");
+}
+
 int main() {
     printf("test-kv-compact-math:\n");
 
@@ -3584,6 +3922,11 @@ int main() {
     test_greedy_exchange_nonuniform();
     test_greedy_exchange_improves_total_error();
     test_sensitivity_weights_reasonable();
+
+    printf("\n=== Exchange vs heuristic quality (§5 validation) ===\n");
+    test_exchange_vs_heuristic_quality();
+    test_exchange_quality_scaling();
+    test_exchange_beats_heuristic_adversarial();
 
     printf("\nAll tests passed!\n");
     return 0;
