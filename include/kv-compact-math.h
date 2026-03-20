@@ -445,7 +445,7 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
         }
 
         // Early stop: check gradient norm periodically
-        if (tol > 0.0f && (iter % 10 == 9)) {
+        if (tol > 0.0f && (outer % 10 == 9)) {
             float grad_norm = 0.0f;
             for (int i = 0; i < n; i++) grad_norm += grad[i] * grad[i];
             if (grad_norm < tol * tol * n) break;

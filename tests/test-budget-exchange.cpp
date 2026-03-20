@@ -217,6 +217,11 @@ static void test_greedy_exchange_proportional() {
     printf(" PASS\n");
 }
 
+// Tests 8-9 require compaction_config and head_sensitivity (available on the
+// pure-attention branch). Guard with HAS_COMPACTION_CONFIG to keep standalone
+// budget exchange tests building on the MoE branch.
+#ifdef HAS_COMPACTION_CONFIG
+
 // ---------------------------------------------------------------------------
 // Test 8: Nonuniform compaction quality -- per-head budgets via full pipeline
 // ---------------------------------------------------------------------------
@@ -462,6 +467,8 @@ static void test_nonuniform_backward_compatible() {
     printf(" PASS\n");
 }
 
+#endif // HAS_COMPACTION_CONFIG
+
 // ===========================================================================
 int main() {
     printf("test-budget-exchange:\n");
@@ -475,9 +482,13 @@ int main() {
     test_greedy_exchange_single_head();
     test_greedy_exchange_proportional();
 
+#ifdef HAS_COMPACTION_CONFIG
     printf("\n=== Nonuniform Compaction Integration ===\n");
     test_nonuniform_compaction_quality();
     test_nonuniform_backward_compatible();
+#else
+    printf("\n=== Nonuniform Compaction Integration (skipped — no compaction_config) ===\n");
+#endif
 
     printf("\nAll budget exchange tests passed!\n");
     return 0;
