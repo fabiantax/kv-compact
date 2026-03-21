@@ -40,11 +40,11 @@ Patched llama.cpp source at `build-native/_deps/llama_cpp-src/`:
 - Added `build_inp_moe_bias()` — creates per-layer bias tensors
 - Wired into `qwen35moe.cpp` — passes `res->t_moe_bias[il]` to `build_moe_ffn`
 - Built llama-server with Vulkan at `build-vk/bin/Release/llama-server.exe`
-- **STATUS: CRASHES** during first inference (segfault). Without `LLAMA_MOE_CACHE_AWARE`, the patched build works fine (36 tok/s single-slot).
+- **STATUS: WORKING** — 45.2 tok/s generation, 134.2 tok/s prefill on Qwen3.5-35B-A3B
 
-**Likely cause:** The `ggml_add(selection_probs, moe_cache_bias)` where `selection_probs` is [n_expert, n_tokens] (2D) and bias is [n_expert] (1D). Either broadcasting isn't supported on the Vulkan backend for this op, or the graph scheduler assigns the bias tensor to the wrong backend, causing a split.
+**Root cause of earlier crash:** `ggml_graph_get_tensor()` segfaulted when the graph had extra input tensors from the MoE bias. Fixed by replacing with safe manual node iteration over `gf->nodes[]`. The `ggml_add` broadcasting ([n_expert] + [n_expert, n_tokens]) works fine on Vulkan — was never the issue.
 
-**Next debug step:** Check if `ggml_add` broadcasting works for [n_expert, n_tokens] + [n_expert] on Vulkan. Try `ggml_repeat(bias, selection_probs)` before the add to explicitly match shapes. Or check graph splits — the extra split (3 vs 2) suggests a backend assignment issue.
+**Additional fix:** Input tensors must be connected to the graph via `ggml_build_forward_expand()` to avoid the `set_inputs` crash (documented FIXME in process_ubatch).
 
 ---
 
@@ -52,7 +52,7 @@ Patched llama.cpp source at `build-native/_deps/llama_cpp-src/`:
 
 | # | Task | Status | Effort |
 |---|------|--------|--------|
-| 1 | **P3: Fix MoE cache bias crash** | Segfault in ggml_add broadcasting or graph scheduling | 2-4h debug |
+| 1 | **P3: Multi-slot A/B benchmark** | Compare tok/s with vs without LLAMA_MOE_CACHE_AWARE at 2/5/10 slots | Ready |
 | 2 | **P1: SSM F16 source patch** | Confirmed needs `llama_memory_recurrent` F16 support | 6h |
 | 3 | **Investigate real scheduling overhead** | 8-15ms gap between kernel time and wall time at 2 slots | 2h |
 
@@ -82,9 +82,9 @@ cmake -B build -DKV_COMPACT_BUILD_TOOL=OFF && cmake --build build --config Relea
 cd build-native/_deps/llama_cpp-src
 cmake --build build-vk --config Release --target llama-server
 
-# Test without MoE cache (works)
+# Test without MoE cache (baseline)
 ./build-vk/bin/Release/llama-server.exe -m model.gguf -ngl 99
 
-# Test with MoE cache (CRASHES)
+# Test with MoE cache (cache-aware routing)
 LLAMA_MOE_CACHE_AWARE=1 ./build-vk/bin/Release/llama-server.exe -m model.gguf -ngl 99
 ```
