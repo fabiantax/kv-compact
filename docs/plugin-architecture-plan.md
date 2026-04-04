@@ -5,93 +5,142 @@ kv-compact features, with minimal maintenance burden.
 
 ---
 
-## Current State: What Works Today
+## Current State: Already a Plugin
 
-The current architecture is already **zero-touch** on llama.cpp:
+The `optimize-moe-rocm` branch has proven that a **fully external library**
+architecture works. The codebase is structured as three independent layers:
 
 ```
-kv-compact (external tool)
-    ├── kv-compact-math.h    (standalone, no deps)
-    ├── kv-compact-state.h   (standalone, parses binary format)
-    └── kv-compact.cpp       (links against llama.cpp as library)
-         uses: llama_state_seq_get_data() → compact → llama_state_seq_set_data()
+┌─ kv-compact library (fully standalone, no llama.cpp dependency) ─┐
+│                                                                   │
+│  kv-compact-math.h      Header-only math (NNLS, LS, scoring)    │
+│  kv-compact-api.h/cpp   C API: kv_compact(), quantized, R-KV    │
+│  kv-compact-accel.h     GPU interface (conditional HIP/CPU)      │
+│  kv-compact-hip.hip     ROCm kernels + rocBLAS (optional)        │
+│  kv-compact-state.h     Parses llama.cpp KV state binary format  │
+│                                                                   │
+│  Input:  float arrays (K, V, Q_ref)                              │
+│  Output: selected_indices[], beta[], C_v[]                       │
+│  Tests:  test-kv-compact-math, test-kv-compact-api (standalone)  │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ state serialization APIs only
+┌───────────────────────────┴───────────────────────────────────────┐
+│  llama.cpp (STOCK, unmodified)                                    │
+│                                                                   │
+│  llama_state_seq_get_data()    read KV cache to binary buffer    │
+│  llama_state_seq_set_data()    write KV cache from binary buffer │
+│  llama_memory_seq_rm()         clear cache positions             │
+│  llama_decode()                standard inference                 │
+│  llama_model_n_layer/head/embd model metadata queries            │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-This works for: key selection, NNLS beta computation, C_v value refitting,
-and writing compacted state back.
+### What's Already Working (optimize-moe-rocm branch)
 
-**What breaks this clean boundary:** Beta injection during `llama_decode()`.
-The attention computation needs `score_ij = q @ k / sqrt(d) + beta_j` but
-llama.cpp has no hook for per-position attention biases in its KV cache.
+| Feature | Status | llama.cpp changes? |
+|---------|--------|-------------------|
+| Full C library API (`kv_compact()`) | Done | No |
+| Quantized KV round-trip (Q4_0, Q8_0) | Done | No |
+| ROCm GPU scoring (gfx1151 / Strix Halo) | Done | No |
+| rocBLAS strided-batched GEMM | Done | No |
+| Chunked compaction for 1M+ contexts | Done | No |
+| OpenMP parallel per-layer | Done | No |
+| Reasoning-aware compression (R-KV) | Done | No |
+| Hybrid model layer filters (Qwen 3.5) | Done | No |
+| Skip-NNLS mode (6.75x faster) | Done | No |
+| Diversity-aware key selection | Done | No |
+| Iterative key refinement | Done | No |
+| Quality benchmarks (PPL, KL, needle) | Done | No |
+| Throughput benchmarks | Done | No |
+| Per-head sensitivity budgets | Done | No |
+| Multi-round progressive compaction | Done | No |
+
+**Every feature above runs against stock llama.cpp with zero patches.**
 
 ---
 
-## The Problem: Where We Must Touch llama.cpp
+## The One Remaining Question: Is Beta Injection Worth Patching?
 
-| Feature | Requires llama.cpp change? | Why |
-|---------|---------------------------|-----|
-| Key selection | No | External math on serialized state |
-| Beta computation | No | External NNLS solver |
-| C_v refitting | No | External least squares |
-| C_v write-back | **Borderline** | `llama_state_seq_set_data` works but is coarse |
-| **Beta injection** | **Yes** | Must modify attention score computation |
-| **Incremental compaction** | **Maybe** | Need hook after each decode step |
-| **Spec decode integration** | **Maybe** | Need to intercept verify step |
+### Evidence That Skipping Beta Works
 
-Only **beta injection** is a hard requirement for touching llama.cpp internals.
-Everything else can be done externally or through existing APIs.
+The `optimize-moe-rocm` branch discovered an empirical result:
+
+> "Skip NNLS beta by default: better quality AND 3-7x faster"
+
+This means the C_v least-squares refit alone (without beta bias injection)
+produces quality equal to or better than beta + C_v in many cases. The
+explanation: when the LS solver has enough reference queries, it compensates
+for missing beta by adjusting C_v values to absorb the mass distribution
+error.
+
+### When Beta Injection Still Matters
+
+Beta becomes important at **extreme compression** (>20x) where:
+- Very few keys remain (t < 50 for a 60k context)
+- The LS solver is underdetermined (fewer keys than query dimensions)
+- Mass mismatch causes systematic over/under-attention to cached context
+
+### Decision Framework
+
+```
+Compression ≤ 10x  →  Skip beta. LS-only is sufficient. No patch needed.
+Compression 10-50x →  Beta helps marginally. Test case-by-case.
+Compression > 50x  →  Beta is critical. Patch needed for best quality.
+```
+
+For practical home use (Strix Halo, M5 Max, 128GB):
+- 60k context at 10x = 6k tokens retained → 12GB → 240MB. Easy.
+- 60k context at 50x = 1.2k tokens retained → 12GB → 24MB. Aggressive.
+
+**Most home workloads won't need >10x compression**, making beta injection
+a nice-to-have rather than a must-have.
 
 ---
 
 ## Strategy: Three Layers of Integration
 
-### Layer 1: External Tool (current — no llama.cpp changes)
+### Layer 1: External Library (current — no llama.cpp changes)
 
 ```
 User workflow:
-  1. llama-server runs stock llama.cpp
-  2. kv-compact runs as sidecar, periodically:
-     - saves KV state via API
-     - compacts externally
-     - writes compacted state back
-  3. No beta injection (accept quality loss)
+  1. llama-server or llama-cli runs stock llama.cpp
+  2. kv-compact library compacts via state serialization:
+     - llama_state_seq_get_data() → parse → compact → write → llama_state_seq_set_data()
+  3. C_v values written back via state serialization
+  4. No beta injection (skip-beta mode, which benchmarks show is fine)
 ```
 
-**When to use:** Quick experiments, proving the concept, benchmarking
-compression ratios vs. quality without beta.
+**When to use:** All normal workloads. 10x compression with excellent quality.
 
-**Maintenance cost:** Zero. Track upstream by bumping FetchContent tag.
+**Maintenance cost:** Zero. Track upstream by bumping FetchContent tag or
+submodule pointer.
+
+**Already proven:** The optimize-moe-rocm branch has ~12,800 lines of code
+running this way with quality benchmarks, GPU acceleration, quantized KV
+support, and 1M+ context handling — all against stock llama.cpp.
 
 ---
 
-### Layer 2: GGML Custom Op / Attention Mask Injection (minimal patch)
+### Layer 2: Minimal Patch for Beta Injection (if needed)
+
+Only pursue this if benchmarks show beta injection provides meaningful quality
+gains at compression ratios you actually use.
 
 llama.cpp's `ggml_flash_attn_ext` already supports an **attention mask**
-parameter. The idea:
-
-```
-Instead of modifying attention computation code, inject beta as a
-KV-cache-aligned bias tensor that gets added to attention scores
-via the existing mask pathway.
-```
-
-**How it works:**
+parameter. The approach:
 
 1. **Store beta as a GGML tensor** alongside K/V in the KV cache.
-   This requires adding one tensor per layer to `llama_kv_cache`:
+   Add one tensor per layer to `llama_kv_cache`:
    ```c
-   // In llama_kv_cache (llama.cpp)
    struct ggml_tensor * beta[n_layer];  // [n_kv_max] float32
    ```
 
-2. **Inject beta into the attention mask.** `ggml_flash_attn_ext` takes a
-   mask tensor. Modify the graph builder to add beta to the mask:
+2. **Inject beta into the attention mask** (one line in graph builder):
    ```c
-   // In llama_build_graph (one line change)
    attn_mask = ggml_add(ctx, attn_mask, kv_cache.beta[il]);
    ```
 
-3. **Expose beta via API.** Add one new function:
+3. **Expose beta via API** (one new function):
    ```c
    void llama_kv_cache_set_bias(llama_context * ctx, int layer,
                                  const float * beta, int n_tokens);
@@ -99,182 +148,162 @@ via the existing mask pathway.
 
 **Total llama.cpp diff: ~30-50 lines across 2-3 files.**
 
-**Maintenance strategy:**
-- Keep the patch as a `.patch` file in this repo
-- On upstream update: `git fetch upstream && git rebase` or re-apply patch
-- The patch touches a narrow, stable surface (KV cache struct + graph build)
-- If it conflicts, the fix is mechanical (same 3 lines in new locations)
+**Maintenance:**
+- Keep as a `.patch` file in `patches/` directory
+- Touches narrow, stable surface (KV cache struct + attention graph build)
+- Conflicts are rare and mechanical to fix (~5 minutes)
 
 ---
 
 ### Layer 3: Upstream PR (zero maintenance, best case)
 
-Push beta injection as a **general-purpose feature** to upstream llama.cpp:
-"per-position attention biases in KV cache." This is useful beyond kv-compact:
+Push beta injection as a **general-purpose feature** to ggml-org/llama.cpp:
+"per-position attention biases in KV cache."
+
+Useful beyond kv-compact:
 - ALiBi-style positional encoding
 - Attention sink weighting
 - Any system that needs per-key score adjustments
 
-**If accepted:** kv-compact becomes fully external again. Zero patches.
+**If accepted:** kv-compact is fully external forever. Zero patches.
 **If rejected:** Fall back to Layer 2 (maintained patch).
 
 ---
 
-## Recommended Implementation Plan
+## Build System: How It Works Today
 
-### Phase 1: Prove Value Without Patching (now)
+The CMakeLists.txt already cleanly separates library from tools:
 
-Use Layer 1. Demonstrate compaction quality and tg/s improvements using
-only existing APIs. Build the full external pipeline:
+```cmake
+# ---- Standalone library (no llama.cpp) ----
+add_library(kv-compact-math INTERFACE)           # header-only math
+add_library(kv-compact-api STATIC ...)           # C API library
 
-```
-cmake .. -DLLAMA_CPP_DIR=/path/to/stock/llama.cpp
-```
+# ---- Optional GPU acceleration ----
+if(KV_COMPACT_HIP)
+    add_library(kv-compact-hip STATIC ...)       # ROCm kernels
+endif()
 
-Deliverables:
-- [ ] Full all-layer/all-head compaction via state serialization
-- [ ] Quality benchmarks (perplexity, KL, needle-in-haystack)
-- [ ] tg/s benchmarks at various compression ratios
-- [ ] Comparison: with vs. without C_v write-back (both work today)
+# ---- Standalone tests (no llama.cpp) ----
+add_executable(test-kv-compact-math ...)
+add_executable(test-kv-compact-api ...)
+add_executable(bench-kv-compact-quality ...)
 
-### Phase 2: Minimal Patch for Beta Injection
-
-Create a small, rebasing-friendly patch:
-
-```
-patches/
-  llama-kv-beta.patch       # The actual diff (~40 lines)
-  apply-patches.sh           # git apply + verify script
-  README-patches.md          # What each patch does, how to resolve conflicts
-```
-
-Build script becomes:
-```bash
-#!/bin/bash
-# build-with-patches.sh
-git clone https://github.com/ggml-org/llama.cpp.git --depth 1
-cd llama.cpp
-git apply ../patches/llama-kv-beta.patch
-cd ..
-cmake .. -DLLAMA_CPP_DIR=./llama.cpp
-cmake --build .
+# ---- Tools requiring llama.cpp (optional) ----
+if(KV_COMPACT_BUILD_TOOL)
+    # FetchContent or -DLLAMA_CPP_DIR=...
+    add_executable(llama-kv-compact ...)          # CLI tool
+    add_executable(bench-kv-compact-model ...)    # model benchmarks
+    add_executable(test-kv-compact-e2e ...)       # E2E tests
+endif()
 ```
 
-**Conflict resolution playbook:**
-- llama.cpp releases roughly weekly
-- Test patch application in CI against `master` nightly
-- When patch fails: fix takes 5-10 minutes (it's ~40 lines in stable code)
-- Track the specific functions/structs we touch in `README-patches.md`
+**Three build modes:**
 
-### Phase 3: Upstream Contribution
-
-Once beta injection is proven valuable with benchmarks:
-- Open PR to ggml-org/llama.cpp proposing per-position KV attention biases
-- Include benchmark data from Phase 1+2 showing quality + speed gains
-- Frame as general infrastructure, not kv-compact-specific
-
----
-
-## Architecture Diagram
-
-```
-┌─────────────────────────────────────────────────┐
-│                  kv-compact                      │
-│                                                  │
-│  ┌──────────────┐  ┌──────────────────────────┐ │
-│  │ kv-compact-  │  │ kv-compact-state.h       │ │
-│  │ math.h       │  │ (parse/write KV binary)  │ │
-│  │ (standalone) │  │ (standalone)             │ │
-│  └──────┬───────┘  └──────────┬───────────────┘ │
-│         │                     │                  │
-│  ┌──────┴─────────────────────┴───────────────┐ │
-│  │ kv-compact.cpp (or libkv-compact.so)       │ │
-│  │                                            │ │
-│  │  compact() → selection + NNLS + LS         │ │
-│  │  inject()  → llama_kv_cache_set_bias()  ←──┼─┼── only API needing patch
-│  └────────────────────┬───────────────────────┘ │
-│                       │                          │
-└───────────────────────┼──────────────────────────┘
-                        │ links against
-┌───────────────────────┼──────────────────────────┐
-│  llama.cpp (stock + optional ~40-line patch)     │
-│                       │                          │
-│  llama_state_seq_get_data()    (existing API)    │
-│  llama_state_seq_set_data()    (existing API)    │
-│  llama_memory_seq_rm()         (existing API)    │
-│  llama_kv_cache_set_bias()     (NEW, from patch) │
-│  ggml_flash_attn_ext(mask+β)   (patched, 1 line) │
-└──────────────────────────────────────────────────┘
-```
+| Mode | Command | Needs llama.cpp? | Use case |
+|------|---------|-------------------|----------|
+| **Library only** | `cmake .. -DKV_COMPACT_BUILD_TOOL=OFF` | No | Embed in other apps |
+| **With local llama.cpp** | `cmake .. -DLLAMA_CPP_DIR=/path` | Yes (your copy) | Development |
+| **Auto-fetch** | `cmake ..` | Fetched automatically | Quick start |
 
 ---
 
 ## Tracking Upstream: Practical Workflow
 
-### Option A: Git Submodule + Patch (recommended)
+### Recommended: Git Submodule + Optional Patch
 
 ```
 kv-compact/
-  ├── llama.cpp/              # git submodule pointing to upstream
+  ├── deps/
+  │   └── llama.cpp/          # git submodule → upstream
   ├── patches/
-  │   └── llama-kv-beta.patch
+  │   └── llama-kv-beta.patch # only if Layer 2 is needed (~40 lines)
   ├── scripts/
-  │   ├── update-llama.sh     # fetch upstream + re-apply patches
-  │   └── check-patch.sh      # CI: verify patch still applies
-  └── CMakeLists.txt          # -DLLAMA_CPP_DIR=./llama.cpp
+  │   ├── update-deps.sh      # fetch upstream + re-apply patches
+  │   └── check-patches.sh    # CI: verify patches still apply cleanly
+  ├── include/                # standalone headers
+  ├── src/                    # standalone library + tools
+  └── CMakeLists.txt
 ```
 
-Update workflow:
+**Update workflow:**
 ```bash
-cd llama.cpp
+#!/bin/bash
+# scripts/update-deps.sh
+cd deps/llama.cpp
 git fetch origin
-git checkout <new-tag>
-git apply ../patches/llama-kv-beta.patch
-# If conflict: manually fix ~40 lines, regenerate patch
-cd .. && cmake --build build
+git checkout <new-tag-or-master>
+
+# Apply patches if any exist
+if [ -d ../../patches ]; then
+    for p in ../../patches/*.patch; do
+        echo "Applying $p..."
+        git apply "$p" || {
+            echo "CONFLICT in $p — manual fix needed"
+            exit 1
+        }
+    done
+fi
+
+cd ../..
+cmake --build build
+echo "Updated to $(cd deps/llama.cpp && git describe --tags)"
 ```
 
-### Option B: Fork with Rebase Branch
+**Frequency:** Update when llama.cpp adds features you want (new model
+support, performance improvements, quantization formats). No urgency —
+the state serialization API is stable.
 
-Maintain a fork with a single `kv-compact-patches` branch:
-```bash
-git remote add upstream https://github.com/ggml-org/llama.cpp.git
-git fetch upstream
-git rebase upstream/master   # rebase our 1-2 commits on top
-```
+---
 
-**Downside:** fork divergence is harder to reason about than a .patch file.
+## Integration Points: Full Inventory
 
-### Option C: Runtime Injection (LD_PRELOAD / dylib)
+### APIs Used from llama.cpp (all stable, public)
 
-Override the attention function at runtime without modifying source:
-```bash
-LD_PRELOAD=libkv-compact-attn.so llama-server ...
-```
+| API | Category | Stability |
+|-----|----------|-----------|
+| `llama_state_seq_get_data()` | State serialization | High — used by llama-server |
+| `llama_state_seq_set_data()` | State serialization | High — used by llama-server |
+| `llama_state_seq_get_size()` | State serialization | High |
+| `llama_memory_seq_rm()` | Memory management | High |
+| `llama_memory_seq_pos_max()` | Memory management | High |
+| `llama_get_memory()` | Memory management | High |
+| `llama_decode()` | Inference | Very high |
+| `llama_batch_init/free()` | Batch management | Very high |
+| `llama_model_n_layer/head/embd()` | Model queries | Very high |
+| `llama_model_rope_type()` | Model queries | High |
+| `common_tokenize()` | Tokenization | High |
+| `common_sampler_*()` | Sampling | Medium (API evolving) |
+| `common_params_parse()` | CLI parsing | Medium (API evolving) |
 
-**Downside:** Fragile, ABI-dependent, breaks on any internal refactor.
-Not recommended for ongoing use.
+**High-risk surface:** Only `common_*` utilities, which are llama.cpp's own
+internal helpers. These change more often than the core `llama_*` APIs.
 
-**Recommendation: Option A** (submodule + patch). It's explicit, debuggable,
-and the patch is small enough to maintain manually.
+**Mitigation:** The `common_*` functions are only used in the CLI tool
+(`kv-compact.cpp`), not in the library. If they break, only the CLI tool
+needs updating — the library and all standalone tests remain unaffected.
 
 ---
 
 ## What Stays External Forever
 
-These components will **never** need to touch llama.cpp:
+| Component | Lines | Dependencies | Touches llama.cpp? |
+|-----------|-------|--------------|-------------------|
+| kv-compact-math.h | ~960 | None | Never |
+| kv-compact-api.h/cpp | ~1,870 | None | Never |
+| kv-compact-accel.h | ~120 | HIP (optional) | Never |
+| kv-compact-hip.hip | ~700 | ROCm + rocBLAS | Never |
+| kv-compact-state.h | ~500 | None | Never (parses binary format) |
+| Unit tests | ~3,200 | None | Never |
+| Quality benchmarks | ~2,600 | None | Never |
+| **Total standalone** | **~9,950** | | **Never** |
+| | | | |
+| kv-compact.cpp (CLI) | ~850 | llama.cpp | Uses stable public APIs |
+| Model benchmarks | ~750 | llama.cpp | Uses stable public APIs |
+| E2E tests | ~300 | llama.cpp | Uses stable public APIs |
+| **Total llama.cpp-dependent** | **~1,900** | | **Public APIs only** |
 
-| Component | Why it's safe |
-|-----------|--------------|
-| Math library | Pure CPU float32, zero dependencies |
-| State parser | Parses documented binary format |
-| Key selection | External algorithm on parsed data |
-| NNLS solver | External optimization |
-| LS value fitting | External optimization |
-| Quality benchmarks | Uses standard llama.cpp decode API |
-| Compaction scheduling | External orchestration |
-
-**>90% of kv-compact code is and will remain fully external.**
+**~84% of code has zero llama.cpp dependency. 100% runs without patches.**
 
 ---
 
@@ -282,20 +311,64 @@ These components will **never** need to touch llama.cpp:
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| llama.cpp changes KV state binary format | Low (stable API) | High | Pin to known-good tags, test in CI |
-| Flash attention API changes mask format | Medium | Medium | Patch is 1 line, easy to update |
-| KV cache struct changes | Medium | Low | Patch touches 1 field addition |
-| Beta injection PR accepted upstream | Hopeful | Eliminates all patches | Best case scenario |
-| llama.cpp drops state serialization API | Very low | Very high | This API is used by llama-server; won't be dropped |
+| KV state binary format changes | Low | High | Pin to tags, test in CI, format is stable (used by server) |
+| `common_*` API changes | Medium | Low | Only affects CLI tool (~850 lines), not library |
+| Core `llama_*` API changes | Low | Medium | These APIs are public contracts, rarely break |
+| Flash attention mask format changes | Medium | Low | Only matters if using Layer 2 patch |
+| New quantization formats added | Medium | None | Add dequant/requant support in kv-compact-api |
+| llama.cpp adds native KV compaction | Low | Positive | Can deprecate our tool or contribute upstream |
+| llama.cpp drops state serialization | Very low | Very high | Won't happen — llama-server depends on it |
+| ROCm/HIP API changes | Low | Medium | Isolated in kv-compact-hip.hip, easy to update |
+
+---
+
+## Speculative Decoding Integration (Future)
+
+The spec-decode-synergy analysis identified three paths. All remain compatible
+with the plugin architecture:
+
+| Path | Requires llama.cpp patch? | Why |
+|------|--------------------------|-----|
+| **A: Compaction-aware verification** | No (Layer 1) | Compact before decode, use state APIs |
+| **B: Hierarchical speculation cache** | Maybe | Depends on SSD implementation details |
+| **C: Aggressive draft compaction** | No (Layer 1) | Just run kv_compact() on draft model cache |
+
+Path A and C work today with the existing external library approach. Path B
+would require understanding how SSD manages its speculation cache, but the
+compaction itself remains external.
 
 ---
 
 ## Summary
 
-1. **Today:** Fully external, zero patches. Good enough for compaction without
-   beta injection.
-2. **Soon:** ~40-line patch for beta injection. Maintain as `.patch` file in
-   a `patches/` directory. Rebase-friendly, narrow surface.
-3. **Goal:** Upstream PR to make beta injection a first-class llama.cpp
-   feature. Then kv-compact goes back to fully external.
-4. **>90% of code never touches llama.cpp** regardless of strategy.
+```
+                      What we have today
+                      ──────────────────
+                      ┌──────────────────────┐
+                      │  kv-compact library   │  9,950 lines
+                      │  (standalone)         │  Zero llama.cpp deps
+                      │                       │  C API, GPU optional
+                      │  ✓ Key selection      │  ✓ Quantized KV
+                      │  ✓ NNLS beta          │  ✓ ROCm GPU accel
+                      │  ✓ LS value refit     │  ✓ 1M+ contexts
+                      │  ✓ Skip-beta mode     │  ✓ R-KV reasoning
+                      │  ✓ Multi-round        │  ✓ Hybrid layers
+                      └──────────┬───────────┘
+                                 │ state serialization (stable API)
+                      ┌──────────┴───────────┐
+                      │  llama.cpp (stock)    │  Unmodified
+                      │  FetchContent or      │  Submodule
+                      │  local checkout       │  Pin to tags
+                      └──────────────────────┘
+
+                      What we might add later
+                      ──────────────────────
+                      patches/llama-kv-beta.patch  (~40 lines)
+                      Only if >20x compression needs beta injection.
+                      Evidence so far: skip-beta works well enough.
+```
+
+**Bottom line:** kv-compact is already a plugin. The `optimize-moe-rocm`
+branch proved this with 12,800 lines of working code against stock llama.cpp.
+Keep it this way. Only patch llama.cpp if extreme compression benchmarks
+prove beta injection is essential — and even then, it's ~40 lines.
