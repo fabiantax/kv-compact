@@ -1,0 +1,144 @@
+bench-kv-compact: Automated quality benchmarks
+================================================
+
+--- Config: small-1L (T=64, n_q=32, heads=4, d_k=64, layers=1) ---
+  Retention 20% (t=12/64):
+    Avg cosine sim:    0.997621
+    Avg MSE:           0.00204163
+    Avg agreement:     67.2%
+    Worst cosine sim:  0.997577
+    Worst MSE:         0.00207816
+    Compaction time:   3.26 ms (1 layers)
+    PASS
+
+  Retention 50% (t=32/64):
+    Avg cosine sim:    0.999985
+    Avg MSE:           0.00001579
+    Avg agreement:     96.9%
+    Worst cosine sim:  0.999982
+    Worst MSE:         0.00001846
+    Compaction time:   4.85 ms (1 layers)
+    PASS
+
+  Retention 80% (t=51/64):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000000
+    Avg agreement:     100.0%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000000
+    Compaction time:   7.35 ms (1 layers)
+    PASS
+
+--- Config: medium-2L (T=128, n_q=64, heads=8, d_k=64, layers=2) ---
+  Retention 20% (t=25/128):
+    Avg cosine sim:    0.999686
+    Avg MSE:           0.00030959
+    Avg agreement:     89.0%
+    Worst cosine sim:  0.999470
+    Worst MSE:         0.00048877
+    Compaction time:   51.23 ms (2 layers)
+    PASS
+
+  Retention 50% (t=64/128):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000013
+    Avg agreement:     99.9%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000019
+    Compaction time:   81.60 ms (2 layers)
+    PASS
+
+  Retention 80% (t=102/128):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000001
+    Avg agreement:     100.0%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000001
+    Compaction time:   137.53 ms (2 layers)
+    PASS
+
+--- Config: large-4L (T=256, n_q=64, heads=8, d_k=128, layers=4) ---
+  Retention 20% (t=51/256):
+    Avg cosine sim:    0.999925
+    Avg MSE:           0.00006906
+    Avg agreement:     92.5%
+    Worst cosine sim:  0.999858
+    Worst MSE:         0.00013445
+    Compaction time:   427.25 ms (4 layers)
+    PASS
+
+  Retention 50% (t=128/256):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000000
+    Avg agreement:     100.0%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000000
+    Compaction time:   783.12 ms (4 layers)
+    PASS
+
+  Retention 80% (t=204/256):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000001
+    Avg agreement:     99.8%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000001
+    Compaction time:   1483.26 ms (4 layers)
+    PASS
+
+--- Config: wide-heads (T=128, n_q=32, heads=32, d_k=64, layers=1) ---
+  Retention 20% (t=25/128):
+    Avg cosine sim:    0.999958
+    Avg MSE:           0.00004456
+    Avg agreement:     94.4%
+    Worst cosine sim:  0.999957
+    Worst MSE:         0.00004622
+    Compaction time:   53.93 ms (1 layers)
+    PASS
+
+  Retention 50% (t=64/128):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000000
+    Avg agreement:     99.9%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000000
+    Compaction time:   101.03 ms (1 layers)
+    PASS
+
+  Retention 80% (t=102/128):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000000
+    Avg agreement:     99.9%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000000
+    Compaction time:   191.71 ms (1 layers)
+    PASS
+
+--- Config: 1k-8h (T=1024, n_q=64, heads=8, d_k=128, layers=1) ---
+  Retention 20% (t=204/1024):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000001
+    Avg agreement:     99.8%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000001
+    Compaction time:   629.37 ms (1 layers)
+    PASS
+
+  Retention 50% (t=512/1024):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000001
+    Avg agreement:     99.6%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000001
+    Compaction time:   2727.40 ms (1 layers)
+    PASS
+
+  Retention 80% (t=819/1024):
+    Avg cosine sim:    1.000000
+    Avg MSE:           0.00000001
+    Avg agreement:     99.8%
+    Worst cosine sim:  1.000000
+    Worst MSE:         0.00000001
+    Compaction time:   8205.35 ms (1 layers)
+    PASS
+
+--- Con

@@ -1,0 +1,1608 @@
+// Quality benchmarks for KV cache compaction
+//
+// Measures preservation quality across compression ratios using metrics
+// that go beyond basic cosine similarity:
+//
+//   1. Perplexity preservation  — simulated next-token log-prob shift
+//   2. KL divergence            — output distribution divergence
+//   3. Attention mass error     — partition function preservation (paper §3.2)
+//   4. Throughput scaling       — tokens/sec vs T and compression ratio
+//
+// These are best-practice benchmarks for evaluating KV cache compression
+// methods. No model weights required — uses synthetic data that exercises
+// the same code paths as real inference.
+
+#undef NDEBUG
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <numeric>
+#include <vector>
+
+#include "kv-compact-api.h"
+#include "kv-compact-math.h"
+#include "kv-compact-state.h"
+
+#include <climits>
+
+using clock_type = std::chrono::high_resolution_clock;
+
+// ============================================================================
+// Data generation
+// ============================================================================
+
+static void gen_data(float * out, int n, int seed) {
+    for (int i = 0; i < n; i++) {
+        out[i] = sinf((float)(i * 7 + seed) * 0.31f)
+               + 0.3f * cosf((float)(i * 3 + seed + 17) * 0.53f);
+    }
+}
+
+// Generate keys/queries that create spiky LLM-like attention patterns:
+// - Attention sink tokens (BOS, delimiters) with unique key directions
+// - Recent tokens with locality bias
+// - Clustered middle tokens that are hard to distinguish
+static void gen_spiky_data(float * K, float * V, float * Q,
+                           int T, int n_q, int n_head_kv, int d_k, int d_v,
+                           int seed) {
+    gen_data(V, T * n_head_kv * d_v, seed + 500);
+
+    int n_embd_k = n_head_kv * d_k;
+    std::vector<float> base_dir(d_k);
+    for (int d = 0; d < d_k; d++) {
+        base_dir[d] = sinf((float)(d * 7 + seed) * 0.31f);
+    }
+
+    for (int t = 0; t < T; t++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * row = K + t * n_embd_k + h * d_k;
+            if (t == 0) {
+                // BOS-like attention sink
+                for (int d = 0; d < d_k; d++)
+                    row[d] = 3.0f * cosf((float)(d * 13 + seed) * 0.17f);
+            } else if (t == 1 || t == T/4 || t == T/2) {
+                // Delimiter/punctuation sinks
+                for (int d = 0; d < d_k; d++)
+                    row[d] = 2.5f * sinf((float)(d * 11 + t * 37 + seed) * 0.23f);
+            } else if (t > T - T/10) {
+                // Recent tokens: locality bias
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.1f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = 1.5f * (base_dir[d] + noise);
+                }
+            } else {
+                // Middle tokens: clustered, hard to distinguish
+                for (int d = 0; d < d_k; d++) {
+                    float noise = 0.05f * sinf((float)(t * 31 + d * 7 + h * 53 + seed) * 0.41f);
+                    row[d] = base_dir[d] + noise;
+                }
+            }
+        }
+    }
+
+    // Queries that attend sharply to sinks
+    for (int q = 0; q < n_q; q++) {
+        for (int h = 0; h < n_head_kv; h++) {
+            float * qrow = Q + q * n_embd_k + h * d_k;
+            float sink_w = 0.7f + 0.3f * sinf((float)(q * 13 + h * 7 + seed) * 0.29f);
+            for (int d = 0; d < d_k; d++) {
+                float sink_dir = cosf((float)(d * 13 + seed) * 0.17f);
+                qrow[d] = sink_w * sink_dir + (1.0f - sink_w) * base_dir[d];
+                qrow[d] += 0.2f * sinf((float)(q * 41 + d * 3 + h * 19 + seed) * 0.37f);
+            }
+        }
+    }
+}
+
+// Generate a random "vocabulary projection" matrix W_vocab [d_v × vocab_size]
+// Used to simulate logit computation: logits = attn_output @ W_vocab
+static void gen_vocab_proj(float * out, int d_v, int vocab_size, int seed) {
+    for (int i = 0; i < d_v * vocab_size; i++) {
+        out[i] = 0.1f * sinf((float)(i * 13 + seed) * 0.17f)
+               + 0.05f * cosf((float)(i * 11 + seed + 31) * 0.41f);
+    }
+}
+
+// ============================================================================
+// Helper: compute attention output for a single query
+// ============================================================================
+
+// Original attention output: softmax(q·K^T/√d) · V
+static void compute_original_output(
+        const float * q, const float * K, const float * V,
+        int T, int d_k, int d_v, float * out) {
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    // Compute scores
+    std::vector<float> scores(T);
+    for (int j = 0; j < T; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < d_k; d++) dot += q[d] * K[j * d_k + d];
+        scores[j] = dot * inv_sqrt_dk;
+    }
+
+    // Softmax
+    softmax_rows(scores.data(), 1, T);
+
+    // Weighted sum of V
+    memset(out, 0, d_v * sizeof(float));
+    for (int j = 0; j < T; j++) {
+        for (int d = 0; d < d_v; d++) {
+            out[d] += scores[j] * V[j * d_v + d];
+        }
+    }
+}
+
+// Compacted attention output: softmax(q·C_k^T/√d + β) · C_v
+static void compute_compacted_output(
+        const float * q, const float * K, const float * beta,
+        const float * C_v, const int * selected, int t,
+        int d_k, int d_v, float * out) {
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    std::vector<float> scores(t);
+    for (int j = 0; j < t; j++) {
+        float dot = 0.0f;
+        const float * k = K + selected[j] * d_k;
+        for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+        scores[j] = dot * inv_sqrt_dk + beta[j];
+    }
+
+    softmax_rows(scores.data(), 1, t);
+
+    memset(out, 0, d_v * sizeof(float));
+    for (int j = 0; j < t; j++) {
+        for (int d = 0; d < d_v; d++) {
+            out[d] += scores[j] * C_v[j * d_v + d];
+        }
+    }
+}
+
+// ============================================================================
+// Benchmark 1: Perplexity Preservation
+// ============================================================================
+// Simulates next-token prediction by projecting attention output through
+// a vocabulary matrix, computing log-probabilities, then comparing
+// perplexity between original and compacted caches.
+//
+// Lower perplexity ratio (compacted/original) = better preservation.
+// A ratio of 1.0 means perfect preservation.
+
+static void bench_perplexity_preservation() {
+    printf("=== Perplexity Preservation ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int vocab_size = 256;  // small simulated vocab
+    const int n_eval_queries = 64;
+
+    // Vocabulary projection: maps d_v → vocab_size per head
+    std::vector<float> W_vocab(d_v * vocab_size);
+    gen_vocab_proj(W_vocab.data(), d_v, vocab_size, 42);
+
+    int T_sizes[] = {128, 256, 512, 1024, 2048, 4096, 10240};
+    float ratios[] = {0.5f, 0.2f, 0.1f};
+
+    printf("  %-6s  %-8s  %12s  %12s  %12s\n",
+           "T", "ratio", "ppl_orig", "ppl_compact", "ppl_ratio");
+    printf("  %-6s  %-8s  %12s  %12s  %12s\n",
+           "------", "--------", "------------", "------------", "------------");
+
+    for (int T : T_sizes) {
+        std::vector<float> K(T * n_embd_k), V(T * n_embd_v);
+        std::vector<float> Q_ref(n_eval_queries * n_embd_k);
+        std::vector<float> Q_eval(n_eval_queries * n_embd_k);
+
+        gen_data(K.data(), T * n_embd_k, 100 + T);
+        gen_data(V.data(), T * n_embd_v, 200 + T);
+        gen_data(Q_ref.data(), n_eval_queries * n_embd_k, 300 + T);
+        gen_data(Q_eval.data(), n_eval_queries * n_embd_k, 400 + T);
+
+        for (float ratio : ratios) {
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+
+            kv_compact_result result = {};
+            int rc = kv_compact(K.data(), V.data(), Q_ref.data(),
+                                T, n_eval_queries, n_head_kv, d_k, d_v,
+                                &p, &result);
+            assert(rc == 0);
+
+            // Compute perplexity for head 0 (representative)
+            double log_prob_orig = 0.0, log_prob_comp = 0.0;
+            int h = 0;
+
+            for (int qi = 0; qi < n_eval_queries; qi++) {
+                const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+                // Extract per-head K, V for original
+                std::vector<float> K_h(T * d_k), V_h(T * d_v);
+                for (int j = 0; j < T; j++) {
+                    memcpy(K_h.data() + j * d_k, K.data() + j * n_embd_k + h * d_k, d_k * sizeof(float));
+                    memcpy(V_h.data() + j * d_v, V.data() + j * n_embd_v + h * d_v, d_v * sizeof(float));
+                }
+
+                // Original output
+                std::vector<float> orig_out(d_v);
+                compute_original_output(q, K_h.data(), V_h.data(), T, d_k, d_v, orig_out.data());
+
+                // Compacted output
+                std::vector<float> comp_out(d_v);
+                compute_compacted_output(q, K_h.data(), result.beta[h],
+                                         result.C_v[h], result.selected_indices,
+                                         result.t, d_k, d_v, comp_out.data());
+
+                // Project to vocab logits: logits = out @ W_vocab^T  [vocab_size]
+                std::vector<float> logits_orig(vocab_size), logits_comp(vocab_size);
+                for (int v = 0; v < vocab_size; v++) {
+                    float dot_o = 0.0f, dot_c = 0.0f;
+                    for (int d = 0; d < d_v; d++) {
+                        dot_o += orig_out[d] * W_vocab[d * vocab_size + v];
+                        dot_c += comp_out[d] * W_vocab[d * vocab_size + v];
+                    }
+                    logits_orig[v] = dot_o;
+                    logits_comp[v] = dot_c;
+                }
+
+                // Softmax to get probabilities
+                softmax_rows(logits_orig.data(), 1, vocab_size);
+                softmax_rows(logits_comp.data(), 1, vocab_size);
+
+                // Use the original's argmax as the "correct" token
+                int target = 0;
+                for (int v = 1; v < vocab_size; v++) {
+                    if (logits_orig[v] > logits_orig[target]) target = v;
+                }
+
+                // Log probability of the target token under each distribution
+                log_prob_orig += log(logits_orig[target] + 1e-12);
+                log_prob_comp += log(logits_comp[target] + 1e-12);
+            }
+
+            double ppl_orig = exp(-log_prob_orig / n_eval_queries);
+            double ppl_comp = exp(-log_prob_comp / n_eval_queries);
+            double ppl_ratio = ppl_comp / ppl_orig;
+
+            printf("  %-6d  %-8.0f%%  %12.4f  %12.4f  %12.4f\n",
+                   T, ratio * 100, ppl_orig, ppl_comp, ppl_ratio);
+
+            // Sanity: perplexity should be finite and ratio shouldn't explode
+            assert(std::isfinite(ppl_orig));
+            assert(std::isfinite(ppl_comp));
+            assert(ppl_ratio < 100.0);  // very loose bound
+
+            kv_compact_result_free(&result);
+        }
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 2: KL Divergence
+// ============================================================================
+// Measures the KL divergence D_KL(P_orig || P_compact) of the output
+// distribution after projecting through a vocabulary matrix.
+//
+// KL divergence quantifies information lost when approximating the original
+// distribution with the compacted one. Lower = better. Zero = identical.
+
+static void bench_kl_divergence() {
+    printf("=== KL Divergence ===\n\n");
+
+    const int T = 256, n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int vocab_size = 256;
+    const int n_eval = 64;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v);
+    std::vector<float> Q_ref(n_eval * n_embd_k), Q_eval(n_eval * n_embd_k);
+    std::vector<float> W_vocab(d_v * vocab_size);
+
+    gen_data(K.data(), T * n_embd_k, 500);
+    gen_data(V.data(), T * n_embd_v, 600);
+    gen_data(Q_ref.data(), n_eval * n_embd_k, 700);
+    gen_data(Q_eval.data(), n_eval * n_embd_k, 800);
+    gen_vocab_proj(W_vocab.data(), d_v, vocab_size, 900);
+
+    float ratios[] = {0.8f, 0.5f, 0.2f, 0.1f, 0.05f};
+
+    printf("  %-8s  %12s  %12s  %12s\n",
+           "ratio", "avg_KL", "max_KL", "KL<0.01");
+    printf("  %-8s  %12s  %12s  %12s\n",
+           "--------", "------------", "------------", "--------");
+
+    for (float ratio : ratios) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = ratio;
+
+        kv_compact_result result = {};
+        int rc = kv_compact(K.data(), V.data(), Q_ref.data(),
+                            T, n_eval, n_head_kv, d_k, d_v, &p, &result);
+        assert(rc == 0);
+
+        double sum_kl = 0.0, max_kl = 0.0;
+        int low_kl_count = 0;
+
+        // Evaluate across heads 0-1 and all queries
+        for (int h = 0; h < 2; h++) {
+            std::vector<float> K_h(T * d_k), V_h(T * d_v);
+            for (int j = 0; j < T; j++) {
+                memcpy(K_h.data() + j * d_k, K.data() + j * n_embd_k + h * d_k, d_k * sizeof(float));
+                memcpy(V_h.data() + j * d_v, V.data() + j * n_embd_v + h * d_v, d_v * sizeof(float));
+            }
+
+            for (int qi = 0; qi < n_eval; qi++) {
+                const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+                std::vector<float> orig_out(d_v), comp_out(d_v);
+                compute_original_output(q, K_h.data(), V_h.data(), T, d_k, d_v, orig_out.data());
+                compute_compacted_output(q, K_h.data(), result.beta[h],
+                                         result.C_v[h], result.selected_indices,
+                                         result.t, d_k, d_v, comp_out.data());
+
+                // Project to logits
+                std::vector<float> logits_o(vocab_size), logits_c(vocab_size);
+                for (int v = 0; v < vocab_size; v++) {
+                    float dot_o = 0.0f, dot_c = 0.0f;
+                    for (int d = 0; d < d_v; d++) {
+                        dot_o += orig_out[d] * W_vocab[d * vocab_size + v];
+                        dot_c += comp_out[d] * W_vocab[d * vocab_size + v];
+                    }
+                    logits_o[v] = dot_o;
+                    logits_c[v] = dot_c;
+                }
+
+                softmax_rows(logits_o.data(), 1, vocab_size);
+                softmax_rows(logits_c.data(), 1, vocab_size);
+
+                // KL(P || Q) = sum_i P(i) * log(P(i) / Q(i))
+                double kl = 0.0;
+                for (int v = 0; v < vocab_size; v++) {
+                    double p_v = logits_o[v] + 1e-12;
+                    double q_v = logits_c[v] + 1e-12;
+                    kl += p_v * log(p_v / q_v);
+                }
+                if (kl < 0.0) kl = 0.0;  // numerical floor
+
+                sum_kl += kl;
+                if (kl > max_kl) max_kl = kl;
+                if (kl < 0.01) low_kl_count++;
+            }
+        }
+
+        int total = 2 * n_eval;
+        double avg_kl = sum_kl / total;
+
+        printf("  %-8.0f%%  %12.6f  %12.6f  %8d/%d\n",
+               ratio * 100, avg_kl, max_kl, low_kl_count, total);
+
+        assert(std::isfinite(avg_kl));
+
+        kv_compact_result_free(&result);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 3: Attention Mass Preservation
+// ============================================================================
+// Directly measures how well the partition function (total attention mass)
+// is preserved after compaction. This is the core invariant from Section 3.2
+// of the paper — if mass is wrong, the model over/under-attends to cached
+// context vs. new tokens during generation.
+//
+// Reports relative mass error: |mass_compact - mass_orig| / mass_orig
+
+static void bench_mass_preservation() {
+    printf("=== Attention Mass Preservation (Section 3.2) ===\n\n");
+
+    const int T = 256, n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_eval = 64;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v);
+    std::vector<float> Q_ref(n_eval * n_embd_k), Q_eval(n_eval * n_embd_k);
+
+    gen_data(K.data(), T * n_embd_k, 1000);
+    gen_data(V.data(), T * n_embd_v, 1100);
+    gen_data(Q_ref.data(), n_eval * n_embd_k, 1200);
+    gen_data(Q_eval.data(), n_eval * n_embd_k, 1300);
+
+    float ratios[] = {0.8f, 0.5f, 0.2f, 0.1f, 0.05f};
+
+    printf("  %-8s  %14s  %14s  %14s\n",
+           "ratio", "avg_rel_error", "max_rel_error", "< 1%% error");
+    printf("  %-8s  %14s  %14s  %14s\n",
+           "--------", "--------------", "--------------", "-----------");
+
+    for (float ratio : ratios) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = ratio;
+
+        kv_compact_result result = {};
+        int rc = kv_compact(K.data(), V.data(), Q_ref.data(),
+                            T, n_eval, n_head_kv, d_k, d_v, &p, &result);
+        assert(rc == 0);
+
+        double sum_rel_err = 0.0, max_rel_err = 0.0;
+        int low_err_count = 0;
+        int total = 0;
+
+        float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+        for (int h = 0; h < n_head_kv; h++) {
+            for (int qi = 0; qi < n_eval; qi++) {
+                const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+                // Original mass: sum_j exp(q·k_j / √d)
+                // Use max-shift for stability
+                float max_score = -1e30f;
+                std::vector<float> scores(T);
+                for (int j = 0; j < T; j++) {
+                    float dot = 0.0f;
+                    const float * k = K.data() + j * n_embd_k + h * d_k;
+                    for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                    scores[j] = dot * inv_sqrt_dk;
+                    if (scores[j] > max_score) max_score = scores[j];
+                }
+                double mass_orig = 0.0;
+                for (int j = 0; j < T; j++) {
+                    mass_orig += exp(scores[j] - max_score);
+                }
+
+                // Compacted mass: sum_j exp(q·k_sel[j] / √d + beta_j)
+                double mass_comp = 0.0;
+                for (int j = 0; j < result.t; j++) {
+                    float dot = 0.0f;
+                    const float * k = K.data() + result.selected_indices[j] * n_embd_k + h * d_k;
+                    for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                    float score = dot * inv_sqrt_dk + result.beta[h][j];
+                    mass_comp += exp(score - max_score);
+                }
+
+                double rel_err = fabs(mass_comp - mass_orig) / (mass_orig + 1e-12);
+                sum_rel_err += rel_err;
+                if (rel_err > max_rel_err) max_rel_err = rel_err;
+                if (rel_err < 0.01) low_err_count++;
+                total++;
+            }
+        }
+
+        double avg_rel_err = sum_rel_err / total;
+
+        printf("  %-8.0f%%  %14.6f  %14.6f  %10d/%d\n",
+               ratio * 100, avg_rel_err, max_rel_err, low_err_count, total);
+
+        assert(std::isfinite(avg_rel_err));
+
+        kv_compact_result_free(&result);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 4: Throughput Scaling
+// ============================================================================
+// Measures compaction throughput (tokens processed per second) across
+// different context lengths and compression ratios. Helps identify
+// computational bottlenecks and verify O(n_q·T·d_k) scaling.
+
+static void bench_throughput_scaling() {
+    printf("=== Throughput Scaling ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_q = 64;
+
+    // NOTE: T>10k at 50% retention causes OOM in LS normal equations
+    // (t^2 matrix = 10GB+ at t=51200). Needs iterative solver or GPU for 100k.
+    int T_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096, 10240};
+    float ratios[] = {0.5f, 0.2f};
+
+    printf("  %-6s  %-8s  %8s  %12s  %14s\n",
+           "T", "ratio", "t", "time_ms", "tokens/sec");
+    printf("  %-6s  %-8s  %8s  %12s  %14s\n",
+           "------", "--------", "--------", "------------", "--------------");
+
+    for (int T : T_sizes) {
+        std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+        gen_data(K.data(), T * n_embd_k, 2000 + T);
+        gen_data(V.data(), T * n_embd_v, 3000 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 4000 + T);
+
+        for (float ratio : ratios) {
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+
+            // Warmup (skip for large T to save time)
+            if (T <= 2048) {
+                kv_compact_result warmup = {};
+                kv_compact(K.data(), V.data(), Q.data(),
+                           T, n_q, n_head_kv, d_k, d_v, &p, &warmup);
+                kv_compact_result_free(&warmup);
+            }
+
+            // Timed run (fewer runs for large T)
+            const int n_runs = (T <= 2048) ? 3 : 1;
+            double total_ms = 0.0;
+            int final_t = 0;
+
+            for (int run = 0; run < n_runs; run++) {
+                kv_compact_result result = {};
+                auto t0 = clock_type::now();
+                kv_compact(K.data(), V.data(), Q.data(),
+                           T, n_q, n_head_kv, d_k, d_v, &p, &result);
+                double ms = std::chrono::duration<double, std::milli>(
+                    clock_type::now() - t0).count();
+                total_ms += ms;
+                final_t = result.t;
+                kv_compact_result_free(&result);
+            }
+
+            double avg_ms = total_ms / n_runs;
+            double tokens_per_sec = T / (avg_ms / 1000.0);
+
+            printf("  %-6d  %-8.0f%%  %8d  %12.2f  %14.0f\n",
+                   T, ratio * 100, final_t, avg_ms, tokens_per_sec);
+
+            assert(avg_ms > 0.0);
+        }
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 5: Eviction vs Compaction Comparison
+// ============================================================================
+// Directly compares naive token eviction (drop lowest-attention tokens,
+// keep original V) against full compaction (NNLS beta + LS value refit).
+// This demonstrates the MSE improvement factor reported in the paper.
+
+static void bench_eviction_vs_compaction() {
+    printf("=== Eviction vs Compaction (quality comparison) ===\n\n");
+
+    const int T = 256, n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_q = 64;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    std::vector<float> Q_eval(n_q * n_embd_k);
+
+    gen_data(K.data(), T * n_embd_k, 5000);
+    gen_data(V.data(), T * n_embd_v, 5100);
+    gen_data(Q.data(), n_q * n_embd_k, 5200);
+    gen_data(Q_eval.data(), n_q * n_embd_k, 5300);
+
+    float ratios[] = {0.5f, 0.2f, 0.1f};
+
+    printf("  %-8s  %12s  %12s  %12s  %12s  %12s\n",
+           "ratio", "evict_cos", "compact_cos", "evict_mse", "compact_mse", "MSE_ratio");
+    printf("  %-8s  %12s  %12s  %12s  %12s  %12s\n",
+           "--------", "------------", "------------", "------------", "------------", "------------");
+
+    for (float ratio : ratios) {
+        // Full compaction
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = ratio;
+
+        kv_compact_result result = {};
+        int rc = kv_compact(K.data(), V.data(), Q.data(),
+                            T, n_q, n_head_kv, d_k, d_v, &p, &result);
+        assert(rc == 0);
+
+        // Evaluate both eviction and compaction on head 0
+        int h = 0;
+        float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+        double evict_cos_sum = 0.0, evict_mse_sum = 0.0;
+        double comp_cos_sum = 0.0, comp_mse_sum = 0.0;
+
+        for (int qi = 0; qi < n_q; qi++) {
+            const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+            // Original output
+            std::vector<float> orig_scores(T);
+            for (int j = 0; j < T; j++) {
+                float dot = 0.0f;
+                const float * k = K.data() + j * n_embd_k + h * d_k;
+                for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                orig_scores[j] = dot * inv_sqrt_dk;
+            }
+            softmax_rows(orig_scores.data(), 1, T);
+            std::vector<float> orig_out(d_v, 0.0f);
+            for (int j = 0; j < T; j++) {
+                const float * v = V.data() + j * n_embd_v + h * d_v;
+                for (int d = 0; d < d_v; d++) orig_out[d] += orig_scores[j] * v[d];
+            }
+
+            // Eviction output: same selected keys, no beta, original V
+            std::vector<float> evict_scores(result.t);
+            for (int j = 0; j < result.t; j++) {
+                float dot = 0.0f;
+                const float * k = K.data() + result.selected_indices[j] * n_embd_k + h * d_k;
+                for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                evict_scores[j] = dot * inv_sqrt_dk;  // no beta
+            }
+            softmax_rows(evict_scores.data(), 1, result.t);
+            std::vector<float> evict_out(d_v, 0.0f);
+            for (int j = 0; j < result.t; j++) {
+                const float * v = V.data() + result.selected_indices[j] * n_embd_v + h * d_v;
+                for (int d = 0; d < d_v; d++) evict_out[d] += evict_scores[j] * v[d];
+            }
+
+            // Compaction output
+            std::vector<float> comp_scores(result.t);
+            for (int j = 0; j < result.t; j++) {
+                float dot = 0.0f;
+                const float * k = K.data() + result.selected_indices[j] * n_embd_k + h * d_k;
+                for (int d = 0; d < d_k; d++) dot += q[d] * k[d];
+                comp_scores[j] = dot * inv_sqrt_dk + result.beta[h][j];
+            }
+            softmax_rows(comp_scores.data(), 1, result.t);
+            std::vector<float> comp_out(d_v, 0.0f);
+            for (int j = 0; j < result.t; j++) {
+                for (int d = 0; d < d_v; d++)
+                    comp_out[d] += comp_scores[j] * result.C_v[h][j * d_v + d];
+            }
+
+            // Cosine similarity
+            auto cosine_sim = [&](const float * a, const float * b, int n) {
+                float dot = 0, na = 0, nb = 0;
+                for (int d = 0; d < n; d++) {
+                    dot += a[d] * b[d]; na += a[d] * a[d]; nb += b[d] * b[d];
+                }
+                return dot / (sqrtf(na * nb) + 1e-8f);
+            };
+
+            evict_cos_sum += cosine_sim(orig_out.data(), evict_out.data(), d_v);
+            comp_cos_sum += cosine_sim(orig_out.data(), comp_out.data(), d_v);
+
+            // MSE
+            double e_mse = 0, c_mse = 0;
+            for (int d = 0; d < d_v; d++) {
+                double de = orig_out[d] - evict_out[d];
+                double dc = orig_out[d] - comp_out[d];
+                e_mse += de * de;
+                c_mse += dc * dc;
+            }
+            evict_mse_sum += e_mse / d_v;
+            comp_mse_sum += c_mse / d_v;
+        }
+
+        double evict_cos = evict_cos_sum / n_q;
+        double comp_cos = comp_cos_sum / n_q;
+        double evict_mse = evict_mse_sum / n_q;
+        double comp_mse = comp_mse_sum / n_q;
+        double mse_ratio = (comp_mse > 1e-20) ? evict_mse / comp_mse : INFINITY;
+
+        printf("  %-8.0f%%  %12.6f  %12.6f  %12.2e  %12.2e  %12.0fx\n",
+               ratio * 100, evict_cos, comp_cos, evict_mse, comp_mse, mse_ratio);
+
+        // Compaction should always beat eviction
+        assert(comp_mse <= evict_mse * 1.1);  // allow small numerical margin
+
+        kv_compact_result_free(&result);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 6: Chunked Compaction — Quality vs Chunk Size
+// ============================================================================
+// Measures the quality impact of chunking at various chunk sizes. Smaller
+// chunks use less memory but lose cross-chunk attention patterns.
+
+static void bench_chunked_quality() {
+    printf("=== Chunked Compaction — Quality vs Chunk Size ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int n_q = 64;
+
+    int T_sizes[] = {256, 512, 1024, 2048};
+    int chunk_sizes[] = {-1, 64, 128, 256, 512, 1024};
+
+    printf("  %-6s  %-8s  %-8s  %12s  %12s  %12s  %14s\n",
+           "T", "ratio", "chunk", "cos_sim", "mse", "time_ms", "LS_peak_MB");
+    printf("  %-6s  %-8s  %-8s  %12s  %12s  %12s  %14s\n",
+           "------", "--------", "--------", "------------", "------------",
+           "------------", "--------------");
+
+    for (int T : T_sizes) {
+        std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+        std::vector<float> Q(n_q * n_embd_k);
+        gen_data(K.data(), T * n_embd_k, 8000 + T);
+        gen_data(V.data(), T * n_embd_v, 8500 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 9000 + T);
+
+        float ratio = 0.5f;
+
+        for (int cs : chunk_sizes) {
+            // Skip chunk sizes larger than T (same as unchunked)
+            if (cs > 0 && cs >= T) continue;
+
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            p.chunk_size = cs;
+
+            kv_compact_result result = {};
+            auto t0 = clock_type::now();
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            double ms = std::chrono::duration<double, std::milli>(
+                clock_type::now() - t0).count();
+
+            assert(rc == 0);
+
+            // Estimate peak LS memory: t_chunk^2 * 4 bytes
+            int effective_cs = (cs < 0) ? T : cs;
+            int t_chunk = (int)(effective_cs * ratio);
+            double ls_peak_mb = (double)t_chunk * t_chunk * 4.0 / (1024.0 * 1024.0);
+
+            const char * cs_str = (cs < 0) ? "none" : "";
+            if (cs < 0) {
+                printf("  %-6d  %-8.0f%%  %-8s  %12.6f  %12.2e  %12.1f  %14.1f\n",
+                       T, ratio * 100, "none",
+                       result.stats.avg_cosine_sim, result.stats.avg_mse,
+                       ms, ls_peak_mb);
+            } else {
+                printf("  %-6d  %-8.0f%%  %-8d  %12.6f  %12.2e  %12.1f  %14.1f\n",
+                       T, ratio * 100, cs,
+                       result.stats.avg_cosine_sim, result.stats.avg_mse,
+                       ms, ls_peak_mb);
+            }
+            (void)cs_str;
+
+            assert(std::isfinite(result.stats.avg_cosine_sim));
+            kv_compact_result_free(&result);
+        }
+        printf("\n");
+    }
+}
+
+// ============================================================================
+// Benchmark 7: Chunked Compaction — Throughput at Large T
+// ============================================================================
+// Tests chunked compaction at context lengths that would OOM without chunking.
+// Measures throughput (tokens/sec) and verifies quality.
+
+static void bench_chunked_throughput_scaling() {
+    printf("=== Chunked Throughput Scaling (up to 1M) ===\n\n");
+
+    // Use smaller dims for large T to fit in memory:
+    //   T ≤ 30k: n_head=4, d=64 (256-dim embeddings)
+    //   T > 30k: n_head=2, d=32 (64-dim embeddings, ~256MB for 1M tokens)
+    struct test_config {
+        int T;
+        int n_head_kv, d_k, d_v;
+    };
+    test_config configs[] = {
+        {    1024, 4, 64, 64},
+        {    4096, 4, 64, 64},
+        {   16384, 4, 64, 64},
+        {   30000, 4, 64, 64},
+        {  100000, 2, 32, 32},
+        {  500000, 2, 32, 32},
+        { 1000000, 1, 16, 16},
+    };
+    int n_q = 64;
+    float ratios[] = {0.5f, 0.2f};
+
+    printf("  %-8s  %-5s  %-4s  %-6s  %-8s  %10s  %12s  %10s\n",
+           "T", "heads", "d_k", "ratio", "t", "time_s", "tokens/sec", "cos_sim");
+    printf("  %-8s  %-5s  %-4s  %-6s  %-8s  %10s  %12s  %10s\n",
+           "--------", "-----", "----", "------", "--------",
+           "----------", "------------", "----------");
+
+    for (auto & cfg : configs) {
+        int T = cfg.T;
+        int n_head_kv = cfg.n_head_kv, d_k = cfg.d_k, d_v = cfg.d_v;
+        int n_embd_k = n_head_kv * d_k;
+        int n_embd_v = n_head_kv * d_v;
+
+        std::vector<float> K((size_t)T * n_embd_k), V((size_t)T * n_embd_v);
+        std::vector<float> Q((size_t)n_q * n_embd_k);
+        // Use modular gen_data to avoid int overflow for large T*n_embd
+        int gen_size_k = (int)std::min((size_t)T * n_embd_k, (size_t)INT_MAX);
+        int gen_size_v = (int)std::min((size_t)T * n_embd_v, (size_t)INT_MAX);
+        gen_data(K.data(), gen_size_k, 10000 + T);
+        gen_data(V.data(), gen_size_v, 11000 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 12000 + T);
+
+        for (float ratio : ratios) {
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            // Use auto chunk_size (0) — let the smart auto logic pick it
+
+            kv_compact_result result = {};
+            auto t0 = clock_type::now();
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            double ms = std::chrono::duration<double, std::milli>(
+                clock_type::now() - t0).count();
+
+            assert(rc == 0);
+            double tokens_per_sec = T / (ms / 1000.0);
+
+            printf("  %-8d  %-5d  %-4d  %-6.0f%%  %-8d  %10.2f  %12.0f  %10.6f\n",
+                   T, n_head_kv, d_k, ratio * 100, result.t,
+                   ms / 1000.0, tokens_per_sec, result.stats.avg_cosine_sim);
+
+            assert(std::isfinite(result.stats.avg_cosine_sim));
+            assert(result.stats.avg_cosine_sim > 0.9f);
+
+            kv_compact_result_free(&result);
+        }
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Benchmark 8: Method Comparison at Extreme Ratios (Spiky Attention)
+// ============================================================================
+// Compares all 4 paper methods on PPL, KL divergence, and mass preservation
+// using realistic spiky attention data at extreme compression (2%-50%).
+//
+// Methods:
+//   HighestAttn-fast  — top-k by score, skip beta, LS value refit only
+//   HighestAttn       — top-k by score + NNLS beta + LS value refit
+//   AM-OMP-fast       — OMP selection (k=4, int=2), skip beta
+//   AM-OMP            — OMP selection + NNLS beta + LS value refit
+
+struct method_config {
+    const char * name;
+    int use_omp;
+    int skip_beta;
+    int omp_k_choice;
+    int omp_refit_interval;
+};
+
+static void bench_method_comparison_extreme() {
+    printf("=== Method Comparison — Spiky Attention at Extreme Ratios ===\n\n");
+
+    const int T = 512, n_head_kv = 4, d_k = 64, d_v = 64;
+    const int n_embd_k = n_head_kv * d_k;
+    const int n_embd_v = n_head_kv * d_v;
+    const int vocab_size = 256;
+    const int n_q = 64;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    std::vector<float> Q_eval(n_q * n_embd_k);
+    gen_spiky_data(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, 7777);
+
+    // Separate eval queries — same spiky style but different seed
+    // (queries attend sharply to sinks, like real LLM queries)
+    {
+        std::vector<float> base_dir(d_k);
+        for (int d = 0; d < d_k; d++)
+            base_dir[d] = sinf((float)(d * 7 + 7777) * 0.31f);
+        for (int q = 0; q < n_q; q++) {
+            for (int h = 0; h < n_head_kv; h++) {
+                float * qrow = Q_eval.data() + q * n_embd_k + h * d_k;
+                float sink_w = 0.7f + 0.3f * sinf((float)(q * 17 + h * 11 + 8888) * 0.29f);
+                for (int d = 0; d < d_k; d++) {
+                    float sink_dir = cosf((float)(d * 13 + 7777) * 0.17f);
+                    qrow[d] = sink_w * sink_dir + (1.0f - sink_w) * base_dir[d];
+                    qrow[d] += 0.2f * sinf((float)(q * 43 + d * 5 + h * 23 + 8888) * 0.37f);
+                }
+            }
+        }
+    }
+
+    std::vector<float> W_vocab(d_v * vocab_size);
+    gen_vocab_proj(W_vocab.data(), d_v, vocab_size, 42);
+
+    method_config methods[] = {
+        {"HighestAttn-fast", 0, 1, 0, 0},
+        {"HighestAttn     ", 0, 0, 0, 0},
+        {"AM-OMP-fast     ", 1, 1, 4, 2},
+        {"AM-OMP          ", 1, 0, 4, 2},
+    };
+
+    float ratios[] = {0.50f, 0.20f, 0.10f, 0.05f, 0.02f};
+
+    // --- Perplexity ---
+    printf("  Perplexity ratio (compacted / original, closer to 1.0 = better):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+
+    // Store results for all methods/ratios
+    struct bench_result {
+        double ppl_ratio;
+        double avg_kl;
+        double max_kl;
+        double avg_mass_err;
+        double max_mass_err;
+    };
+    bench_result results[4][5] = {};
+
+    for (int mi = 0; mi < 4; mi++) {
+        auto & m = methods[mi];
+        printf("  %-18s", m.name);
+
+        for (int ri = 0; ri < 5; ri++) {
+            float ratio = ratios[ri];
+
+            kv_compact_params p = kv_compact_params_default();
+            p.target_ratio = ratio;
+            p.chunk_size = -1;
+            p.use_omp = m.use_omp;
+            p.skip_beta = m.skip_beta;
+            if (m.use_omp) {
+                p.omp_k_choice = m.omp_k_choice;
+                p.omp_refit_interval = m.omp_refit_interval;
+            }
+
+            kv_compact_result result = {};
+            int rc = kv_compact(K.data(), V.data(), Q.data(),
+                                T, n_q, n_head_kv, d_k, d_v, &p, &result);
+            assert(rc == 0);
+
+            // --- Perplexity on head 0 ---
+            double log_prob_orig = 0.0, log_prob_comp = 0.0;
+            double sum_kl = 0.0, max_kl = 0.0;
+            double sum_mass_err = 0.0, max_mass_err = 0.0;
+            int h = 0;
+            float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+            // Extract per-head K, V
+            std::vector<float> K_h(T * d_k), V_h(T * d_v);
+            for (int j = 0; j < T; j++) {
+                memcpy(K_h.data() + j * d_k, K.data() + j * n_embd_k + h * d_k, d_k * sizeof(float));
+                memcpy(V_h.data() + j * d_v, V.data() + j * n_embd_v + h * d_v, d_v * sizeof(float));
+            }
+
+            for (int qi = 0; qi < n_q; qi++) {
+                const float * q = Q_eval.data() + qi * n_embd_k + h * d_k;
+
+                // Original output
+                std::vector<float> orig_out(d_v), comp_out(d_v);
+                compute_original_output(q, K_h.data(), V_h.data(), T, d_k, d_v, orig_out.data());
+                compute_compacted_output(q, K_h.data(), result.beta[h],
+                                         result.C_v[h], result.selected_indices,
+                                         result.t, d_k, d_v, comp_out.data());
+
+                // Perplexity: project to vocab logits
+                std::vector<float> logits_o(vocab_size), logits_c(vocab_size);
+                for (int v = 0; v < vocab_size; v++) {
+                    float dot_o = 0.0f, dot_c = 0.0f;
+                    for (int d = 0; d < d_v; d++) {
+                        dot_o += orig_out[d] * W_vocab[d * vocab_size + v];
+                        dot_c += comp_out[d] * W_vocab[d * vocab_size + v];
+                    }
+                    logits_o[v] = dot_o;
+                    logits_c[v] = dot_c;
+                }
+                softmax_rows(logits_o.data(), 1, vocab_size);
+                softmax_rows(logits_c.data(), 1, vocab_size);
+
+                // PPL target = original's argmax
+                int target = 0;
+                for (int v = 1; v < vocab_size; v++)
+                    if (logits_o[v] > logits_o[target]) target = v;
+                log_prob_orig += log(logits_o[target] + 1e-12);
+                log_prob_comp += log(logits_c[target] + 1e-12);
+
+                // KL divergence
+                double kl = 0.0;
+                for (int v = 0; v < vocab_size; v++) {
+                    double pv = logits_o[v] + 1e-12;
+                    double qv = logits_c[v] + 1e-12;
+                    kl += pv * log(pv / qv);
+                }
+                if (kl < 0.0) kl = 0.0;
+                sum_kl += kl;
+                if (kl > max_kl) max_kl = kl;
+
+                // Attention mass preservation
+                std::vector<float> scores_orig(T);
+                float max_score = -1e30f;
+                for (int j = 0; j < T; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++) dot += q[d] * K_h[j * d_k + d];
+                    scores_orig[j] = dot * inv_sqrt_dk;
+                    if (scores_orig[j] > max_score) max_score = scores_orig[j];
+                }
+                double mass_orig = 0.0;
+                for (int j = 0; j < T; j++) mass_orig += exp(scores_orig[j] - max_score);
+
+                double mass_comp = 0.0;
+                for (int j = 0; j < result.t; j++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_k; d++)
+                        dot += q[d] * K_h[result.selected_indices[j] * d_k + d];
+                    float score = dot * inv_sqrt_dk + result.beta[h][j];
+                    mass_comp += exp(score - max_score);
+                }
+
+                double rel_err = fabs(mass_comp - mass_orig) / (mass_orig + 1e-12);
+                sum_mass_err += rel_err;
+                if (rel_err > max_mass_err) max_mass_err = rel_err;
+            }
+
+            double ppl_orig = exp(-log_prob_orig / n_q);
+            double ppl_comp = exp(-log_prob_comp / n_q);
+
+            results[mi][ri].ppl_ratio     = ppl_comp / ppl_orig;
+            results[mi][ri].avg_kl        = sum_kl / n_q;
+            results[mi][ri].max_kl        = max_kl;
+            results[mi][ri].avg_mass_err  = sum_mass_err / n_q;
+            results[mi][ri].max_mass_err  = max_mass_err;
+
+            printf("  %8.4f", ppl_comp / ppl_orig);
+
+            kv_compact_result_free(&result);
+        }
+        printf("\n");
+    }
+
+    // --- KL Divergence ---
+    printf("\n  Avg KL divergence (lower = better, 0 = identical):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].avg_kl);
+        printf("\n");
+    }
+
+    // --- Max KL ---
+    printf("\n  Max KL divergence (worst-case query):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].max_kl);
+        printf("\n");
+    }
+
+    // --- Mass Preservation ---
+    printf("\n  Avg attention mass relative error (lower = better):\n\n");
+    printf("  %-18s", "Method");
+    for (float r : ratios) printf("  %8.0f%%", r * 100);
+    printf("\n  %-18s", "------------------");
+    for (int i = 0; i < 5; i++) printf("  %8s", "--------");
+    printf("\n");
+    for (int mi = 0; mi < 4; mi++) {
+        printf("  %-18s", methods[mi].name);
+        for (int ri = 0; ri < 5; ri++)
+            printf("  %8.5f", results[mi][ri].avg_mass_err);
+        printf("\n");
+    }
+
+    printf("\n");
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+// R-KV Reasoning compression benchmark (A4)
+// ============================================================================
+
+// Classifier: first think_pct% thinking, 5% transition, rest answer.
+struct rkv_bench_ctx { int T; int think_pct; };
+static int rkv_bench_classifier(int pos, void * data) {
+    const rkv_bench_ctx * ctx = (const rkv_bench_ctx *)data;
+    int think_end = (ctx->T * ctx->think_pct) / 100;
+    int trans_end = think_end + (ctx->T * 5) / 100;
+    if (pos < think_end) return KV_TOKEN_THINKING;
+    if (pos < trans_end) return KV_TOKEN_TRANSITION;
+    return KV_TOKEN_ANSWER;
+}
+
+static void bench_reasoning_compression() {
+    printf("=== R-KV Reasoning Compression (A4) ===\n\n");
+
+    // Test: how much thinking is suppressed at various weights/ratios
+    printf("  Thinking weight sweep (T=512, 70%% thinking, ratio=50%%):\n\n");
+    printf("  weight    think_sel%%   answer_sel%%    cos_sim       mse         time_ms\n");
+    printf("  ------    ----------   -----------    --------    --------      --------\n");
+
+    const int T = 512, n_q = 32, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K.data(), T * n_embd_k, 2026);
+    gen_data(V.data(), T * n_embd_v, 2027);
+    gen_data(Q.data(), n_q * n_embd_k, 2028);
+
+    rkv_bench_ctx ctx = { T, 70 };
+    int think_end = (T * 70) / 100;
+    int trans_end = think_end + (T * 5) / 100;
+
+    float weights[] = { 1.0f, 0.7f, 0.5f, 0.3f, 0.1f, 0.0f };
+    for (float w : weights) {
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx;
+        reasoning.thinking_weight = w;
+        reasoning.transition_weight = (w + 1.0f) / 2.0f;
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.reasoning = (w < 1.0f) ? &reasoning : NULL;  // 1.0 = baseline
+        p.chunk_size = -1;
+
+        kv_compact_result result = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        int think_sel = 0, answer_sel = 0;
+        for (int j = 0; j < result.t; j++) {
+            if (result.selected_indices[j] < think_end) think_sel++;
+            if (result.selected_indices[j] >= trans_end) answer_sel++;
+        }
+
+        printf("  %.1f       %5.1f%%       %5.1f%%       %.6f    %.6f    %7.1f\n",
+               w,
+               100.0f * think_sel / result.t,
+               100.0f * answer_sel / result.t,
+               result.stats.avg_cosine_sim,
+               result.stats.avg_mse,
+               result.stats.elapsed_ms);
+
+        kv_compact_result_free(&result);
+    }
+
+    // Test: varying thinking proportion
+    printf("\n  Thinking proportion sweep (T=512, weight=0.3, ratio=50%%):\n\n");
+    printf("  think%%    think_sel%%   answer_sel%%    cos_sim       mse\n");
+    printf("  ------    ----------   -----------    --------    --------\n");
+
+    int think_pcts[] = { 90, 80, 70, 50, 30 };
+    for (int tp : think_pcts) {
+        rkv_bench_ctx ctx2 = { T, tp };
+        int te = (T * tp) / 100;
+        int tre = te + (T * 5) / 100;
+
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx2;
+        reasoning.thinking_weight = 0.3f;
+        reasoning.transition_weight = 0.7f;
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.reasoning = &reasoning;
+        p.chunk_size = -1;
+
+        kv_compact_result result = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        int think_sel = 0, answer_sel = 0;
+        for (int j = 0; j < result.t; j++) {
+            if (result.selected_indices[j] < te) think_sel++;
+            if (result.selected_indices[j] >= tre) answer_sel++;
+        }
+
+        printf("  %3d%%      %5.1f%%       %5.1f%%       %.6f    %.6f\n",
+               tp,
+               100.0f * think_sel / result.t,
+               100.0f * answer_sel / result.t,
+               result.stats.avg_cosine_sim,
+               result.stats.avg_mse);
+
+        kv_compact_result_free(&result);
+    }
+
+    // Compression ratio sweep with R-KV
+    printf("\n  Compression ratio sweep (T=512, 70%% thinking, weight=0.3):\n\n");
+    printf("  ratio     std_cos     rkv_cos     std_think%%  rkv_think%%  think_reduction\n");
+    printf("  ------    --------    --------    ----------  ----------  ---------------\n");
+
+    float ratios[] = { 0.5f, 0.3f, 0.2f, 0.1f };
+    for (float ratio : ratios) {
+        rkv_bench_ctx ctx3 = { T, 70 };
+
+        kv_compact_reasoning reasoning = {};
+        reasoning.classifier = rkv_bench_classifier;
+        reasoning.classifier_data = &ctx3;
+        reasoning.thinking_weight = 0.3f;
+        reasoning.transition_weight = 0.7f;
+
+        // Standard
+        kv_compact_params p_std = kv_compact_params_default();
+        p_std.target_ratio = ratio;
+        p_std.chunk_size = -1;
+        kv_compact_result r_std = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_std, &r_std);
+
+        // R-KV
+        kv_compact_params p_rkv = p_std;
+        p_rkv.reasoning = &reasoning;
+        kv_compact_result r_rkv = {};
+        kv_compact(K.data(), V.data(), Q.data(), T, n_q, n_head_kv, d_k, d_v, &p_rkv, &r_rkv);
+
+        int std_think = 0, rkv_think = 0;
+        for (int j = 0; j < r_std.t; j++)
+            if (r_std.selected_indices[j] < think_end) std_think++;
+        for (int j = 0; j < r_rkv.t; j++)
+            if (r_rkv.selected_indices[j] < think_end) rkv_think++;
+
+        float reduction = (std_think > 0)
+            ? 100.0f * (1.0f - (float)rkv_think / std_think) : 0.0f;
+
+        printf("  %3.0f%%      %.6f    %.6f    %5.1f%%       %5.1f%%       %5.1f%%\n",
+               ratio * 100.0f,
+               r_std.stats.avg_cosine_sim,
+               r_rkv.stats.avg_cosine_sim,
+               100.0f * std_think / r_std.t,
+               100.0f * rkv_think / r_rkv.t,
+               reduction);
+
+        kv_compact_result_free(&r_std);
+        kv_compact_result_free(&r_rkv);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+
+// ============================================================================
+// Quantized KV compaction benchmark (B4)
+// ============================================================================
+
+static void bench_quantized_compaction() {
+    printf("=== Quantized KV Compaction (B4) ===\n\n");
+
+    const int T = 512, n_q = 32, n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+
+    // Generate reference float data
+    std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+    gen_data(K_f32.data(), T * n_embd_k, 3000);
+    gen_data(V_f32.data(), T * n_embd_v, 3001);
+    gen_data(Q.data(), n_q * n_embd_k, 3002);
+
+    // ---- Quality comparison: F32 vs Q8_0 vs Q4_0 vs Q4_1 ----
+    printf("  Quality comparison (T=%d, ratio=50%%):\n\n", T);
+    printf("  type      cos_sim       mse           time_ms    K_bytes    V_bytes\n");
+    printf("  ------    --------    ----------      --------   --------   --------\n");
+
+    // F32 baseline
+    {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+        kv_compact_result result = {};
+        kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        size_t k_bytes = (size_t)T * n_embd_k * 4;
+        size_t v_bytes = (size_t)T * n_embd_v * 4;
+        printf("  F32       %.6f    %.8f    %7.1f    %6zu    %6zu\n",
+               result.stats.avg_cosine_sim, result.stats.avg_mse,
+               result.stats.elapsed_ms, k_bytes, v_bytes);
+        kv_compact_result_free(&result);
+    }
+
+    // Quantized types
+    int types[] = { KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * names[] = { "Q8_0", "Q4_0", "Q4_1" };
+
+    for (int ti = 0; ti < 3; ti++) {
+        int type = types[ti];
+        size_t k_row_bytes = kv_quant_row_bytes(type, n_embd_k);
+        size_t v_row_bytes = kv_quant_row_bytes(type, n_embd_v);
+
+        std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+        for (int i = 0; i < T; i++) {
+            kv_quantize_row(K_f32.data() + i * n_embd_k, type, n_embd_k,
+                            K_q.data() + i * k_row_bytes);
+            kv_quantize_row(V_f32.data() + i * n_embd_v, type, n_embd_v,
+                            V_q.data() + i * v_row_bytes);
+        }
+
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+
+        kv_compact_quant_result result = {};
+        kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                              type, type, k_row_bytes, v_row_bytes,
+                              T, n_q, n_head_kv, d_k, d_v, &p, &result);
+
+        size_t k_bytes = T * k_row_bytes;
+        size_t v_bytes = T * v_row_bytes;
+        printf("  %s      %.6f    %.8f    %7.1f    %6zu    %6zu\n",
+               names[ti],
+               result.base.stats.avg_cosine_sim, result.base.stats.avg_mse,
+               result.base.stats.elapsed_ms, k_bytes, v_bytes);
+
+        kv_compact_quant_result_free(&result);
+    }
+
+    // ---- Compression ratio sweep: Q8_0 vs F32 ----
+    printf("\n  Compression ratio sweep (T=%d, Q8_0 vs F32):\n\n", T);
+    printf("  ratio     f32_cos       q8_cos        f32_mse       q8_mse\n");
+    printf("  ------    --------      --------      ----------    ----------\n");
+
+    float ratios[] = { 0.5f, 0.3f, 0.2f, 0.1f, 0.05f };
+    size_t k_row_bytes_q8 = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+    size_t v_row_bytes_q8 = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+    std::vector<uint8_t> K_q8(T * k_row_bytes_q8), V_q8(T * v_row_bytes_q8);
+    for (int i = 0; i < T; i++) {
+        kv_quantize_row(K_f32.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                        K_q8.data() + i * k_row_bytes_q8);
+        kv_quantize_row(V_f32.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                        V_q8.data() + i * v_row_bytes_q8);
+    }
+
+    for (float ratio : ratios) {
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = ratio;
+        p.chunk_size = -1;
+
+        kv_compact_result r_f32 = {};
+        kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &r_f32);
+
+        kv_compact_quant_result r_q8 = {};
+        kv_compact_quantized(K_q8.data(), V_q8.data(), Q.data(),
+                              KV_TYPE_Q8_0, KV_TYPE_Q8_0,
+                              k_row_bytes_q8, v_row_bytes_q8,
+                              T, n_q, n_head_kv, d_k, d_v, &p, &r_q8);
+
+        printf("  %3.0f%%      %.6f      %.6f      %.8f    %.8f\n",
+               ratio * 100.0f,
+               r_f32.stats.avg_cosine_sim,
+               r_q8.base.stats.avg_cosine_sim,
+               r_f32.stats.avg_mse,
+               r_q8.base.stats.avg_mse);
+
+        kv_compact_result_free(&r_f32);
+        kv_compact_quant_result_free(&r_q8);
+    }
+
+    // ---- Memory savings table ----
+    printf("\n  Memory savings (T=%d, ratio=50%%):\n\n", T);
+    printf("  type      original_KB   compacted_KB   savings%%   effective_compression\n");
+    printf("  ------    -----------   ------------   --------   ---------------------\n");
+
+    int all_types[] = { KV_TYPE_F32, KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * all_names[] = { "F32", "Q8_0", "Q4_0", "Q4_1" };
+    for (int ti = 0; ti < 4; ti++) {
+        int type = all_types[ti];
+        size_t k_rb = kv_quant_row_bytes(type, n_embd_k);
+        size_t v_rb = kv_quant_row_bytes(type, n_embd_v);
+        size_t orig = T * (k_rb + v_rb);
+        int t_kept = T / 2;  // 50% ratio
+        size_t comp = (size_t)t_kept * (k_rb + v_rb);
+        float savings = 100.0f * (1.0f - (float)comp / (float)orig);
+        float f32_orig = (float)T * (n_embd_k + n_embd_v) * 4;
+        float effective = f32_orig / (float)comp;
+        printf("  %s       %7.1f       %7.1f       %5.1f%%       %.1fx\n",
+               all_names[ti],
+               (float)orig / 1024.0f,
+               (float)comp / 1024.0f,
+               savings,
+               effective);
+    }
+    printf("\n");
+}
+
+// ============================================================================
+// Quantized throughput benchmark — tokens/second at various scales
+// ============================================================================
+
+static void bench_quantized_throughput() {
+    printf("=== Quantized KV Throughput (B4) ===\n\n");
+
+    const int n_head_kv = 4, d_k = 64, d_v = 64;
+    int n_embd_k = n_head_kv * d_k;
+    int n_embd_v = n_head_kv * d_v;
+    const int n_warmup = 1;
+    const int n_runs = 3;
+
+    int sizes[] = { 256, 512, 1024, 2048, 4096 };
+    int all_types[] = { KV_TYPE_F32, KV_TYPE_Q8_0, KV_TYPE_Q4_0, KV_TYPE_Q4_1 };
+    const char * all_names[] = { "F32 ", "Q8_0", "Q4_0", "Q4_1" };
+
+    printf("  Throughput (tokens/sec) at 50%% compression, %d heads, d=%d:\n\n", n_head_kv, d_k);
+    printf("  T       ");
+    for (int ti = 0; ti < 4; ti++) printf("%-12s", all_names[ti]);
+    printf("\n  ------  ");
+    for (int ti = 0; ti < 4; ti++) printf("----------  ");
+    printf("\n");
+
+    for (int T : sizes) {
+        int n_q = std::min(T / 4, 64);
+
+        // Generate float data once
+        std::vector<float> K_f32(T * n_embd_k), V_f32(T * n_embd_v), Q(n_q * n_embd_k);
+        gen_data(K_f32.data(), T * n_embd_k, 5000 + T);
+        gen_data(V_f32.data(), T * n_embd_v, 5001 + T);
+        gen_data(Q.data(), n_q * n_embd_k, 5002 + T);
+
+        printf("  %-6d  ", T);
+
+        for (int ti = 0; ti < 4; ti++) {
+            int type = all_types[ti];
+
+            if (type == KV_TYPE_F32) {
+                // F32 baseline
+                kv_compact_params p = kv_compact_params_default();
+                p.target_ratio = 0.5f;
+                p.chunk_size = -1;
+
+                // Warmup
+                for (int w = 0; w < n_warmup; w++) {
+                    kv_compact_result r = {};
+                    kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                               T, n_q, n_head_kv, d_k, d_v, &p, &r);
+                    kv_compact_result_free(&r);
+                }
+
+                double total_ms = 0;
+                for (int r = 0; r < n_runs; r++) {
+                    kv_compact_result res = {};
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    kv_compact(K_f32.data(), V_f32.data(), Q.data(),
+                               T, n_q, n_head_kv, d_k, d_v, &p, &res);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    kv_compact_result_free(&res);
+                }
+                double avg_ms = total_ms / n_runs;
+                double toks_per_sec = T / (avg_ms / 1000.0);
+                printf("%-12.0f", toks_per_sec);
+            } else {
+                // Quantized
+                size_t k_row_bytes = kv_quant_row_bytes(type, n_embd_k);
+                size_t v_row_bytes = kv_quant_row_bytes(type, n_embd_v);
+                std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+
+                for (int i = 0; i < T; i++) {
+                    kv_quantize_row(K_f32.data() + i * n_embd_k, type, n_embd_k,
+                                    K_q.data() + i * k_row_bytes);
+                    kv_quantize_row(V_f32.data() + i * n_embd_v, type, n_embd_v,
+                                    V_q.data() + i * v_row_bytes);
+                }
+
+                kv_compact_params p = kv_compact_params_default();
+                p.target_ratio = 0.5f;
+                p.chunk_size = -1;
+
+                // Warmup
+                for (int w = 0; w < n_warmup; w++) {
+                    kv_compact_quant_result r = {};
+                    kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                          type, type, k_row_bytes, v_row_bytes,
+                                          T, n_q, n_head_kv, d_k, d_v, &p, &r);
+                    kv_compact_quant_result_free(&r);
+                }
+
+                double total_ms = 0;
+                for (int r = 0; r < n_runs; r++) {
+                    kv_compact_quant_result res = {};
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    kv_compact_quantized(K_q.data(), V_q.data(), Q.data(),
+                                          type, type, k_row_bytes, v_row_bytes,
+                                          T, n_q, n_head_kv, d_k, d_v, &p, &res);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    kv_compact_quant_result_free(&res);
+                }
+                double avg_ms = total_ms / n_runs;
+                double toks_per_sec = T / (avg_ms / 1000.0);
+                printf("%-12.0f", toks_per_sec);
+            }
+        }
+        printf("\n");
+    }
+
+    // ---- Phase breakdown: dequant vs compact vs requant ----
+    printf("\n  Phase breakdown (T=2048, Q8_0, 50%% ratio):\n\n");
+    {
+        int T = 2048, n_q = 64;
+        size_t k_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_k);
+        size_t v_row_bytes = kv_quant_row_bytes(KV_TYPE_Q8_0, n_embd_v);
+
+        std::vector<float> K_f32_l(T * n_embd_k), V_f32_l(T * n_embd_v), Q_l(n_q * n_embd_k);
+        gen_data(K_f32_l.data(), T * n_embd_k, 6000);
+        gen_data(V_f32_l.data(), T * n_embd_v, 6001);
+        gen_data(Q_l.data(), n_q * n_embd_k, 6002);
+
+        std::vector<uint8_t> K_q(T * k_row_bytes), V_q(T * v_row_bytes);
+        for (int i = 0; i < T; i++) {
+            kv_quantize_row(K_f32_l.data() + i * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                            K_q.data() + i * k_row_bytes);
+            kv_quantize_row(V_f32_l.data() + i * n_embd_v, KV_TYPE_Q8_0, n_embd_v,
+                            V_q.data() + i * v_row_bytes);
+        }
+
+        // Phase 1: Dequant
+        std::vector<float> K_deq(T * n_embd_k), V_deq(T * n_embd_v);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < T; i++) {
+            kv_dequantize_row(K_q.data() + i * k_row_bytes, KV_TYPE_Q8_0, k_row_bytes,
+                              K_deq.data() + i * n_embd_k, n_embd_k);
+            kv_dequantize_row(V_q.data() + i * v_row_bytes, KV_TYPE_Q8_0, v_row_bytes,
+                              V_deq.data() + i * n_embd_v, n_embd_v);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double dequant_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Phase 2: Compact
+        kv_compact_params p = kv_compact_params_default();
+        p.target_ratio = 0.5f;
+        p.chunk_size = -1;
+        kv_compact_result result = {};
+        t0 = std::chrono::high_resolution_clock::now();
+        kv_compact(K_deq.data(), V_deq.data(), Q_l.data(),
+                   T, n_q, n_head_kv, d_k, d_v, &p, &result);
+        t1 = std::chrono::high_resolution_clock::now();
+        double compact_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Phase 3: Requant
+        int t_kept = result.t;
+        std::vector<uint8_t> K_out(t_kept * k_row_bytes), V_out(t_kept * v_row_bytes);
+        std::vector<float> v_row(n_embd_v);
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int j = 0; j < t_kept; j++) {
+            int orig = result.selected_indices[j];
+            kv_quantize_row(K_deq.data() + orig * n_embd_k, KV_TYPE_Q8_0, n_embd_k,
+                            K_out.data() + j * k_row_bytes);
+            for (int h = 0; h < n_head_kv; h++) {
+                memcpy(v_row.data() + h * d_v, result.C_v[h] + j * d_v, d_v * sizeof(float));
+            }
+            kv_quantize_row(v_row.data(), KV_TYPE_Q8_0, n_embd_v,
+                            V_out.data() + j * v_row_bytes);
+        }
+        t1 = std::chrono::high_resolution_clock::now();
+        double requant_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double total = dequant_ms + compact_ms + requant_ms;
+
+        printf("  phase       time_ms    %%_total\n");
+        printf("  ---------   --------   --------\n");
+        printf("  dequant     %7.2f    %5.1f%%\n", dequant_ms, 100.0 * dequant_ms / total);
+        printf("  compact     %7.2f    %5.1f%%\n", compact_ms, 100.0 * compact_ms / total);
+        printf("  requant     %7.2f    %5.1f%%\n", requant_ms, 100.0 * requant_ms / total);
+        printf("  TOTAL       %7.2f    100.0%%\n", total);
+        printf("  throughput: %.0f tok/s (end-to-end)\n", T / (total / 1000.0));
+
+        kv_compact_result_free(&result);
+    }
+
+    printf("\n");
+}
+
+int main() {
+    printf("bench-kv-compact-quality\n");
+    printf("========================\n\n");
+
+    bench_perplexity_preservation();
+    bench_kl_divergence();
+    bench_mass_preservation();
+    bench_throughput_scaling();
+    bench_eviction_vs_compaction();
+    bench_method_comparison_extreme();
+    bench_chunked_quality();
+    bench_chunked_throughput_scaling();
+    bench_reasoning_compression();
+    bench_quantized_compaction();
+    bench_quantized_throughput();
+
+    printf("All quality benchmarks completed.\n");
+    return 0;
+}

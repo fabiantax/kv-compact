@@ -1,0 +1,40 @@
+Quantized KV Throughput Benchmark (B4)
+======================================
+
+  Throughput (tokens/sec) at 50% compression, 4 heads, d=64:
+
+  T       F32          Q8_0         Q4_0         Q4_1
+  ------  ----------   ----------   ----------   ----------
+  256     18575        17786        17749        17808        
+  512     12358        12100        12238        12163        
+  1024    5531         5414         5411         5381         
+  2048    2278         2158         2142         2133         
+  4096    800          798          778          782          
+
+  Per-stage breakdown (Q8_0, 50% ratio):
+
+  T       dequant_ms   scoring_ms   nnls+ls_ms   requant_ms   total_ms    tok/s
+  ------  ----------   ----------   ----------   ----------   --------    ------
+  256         0.03         1.76        10.28         0.37        14.23     17990
+  512         0.05         3.57        33.89         0.75        42.15     12146
+  1024        0.11         7.39       164.96         1.51       184.76      5542
+  2048        0.40        14.71       867.99         3.05       919.02      2228
+  4096        0.78        28.82      4944.50         6.13      5061.79       809
+
+  Stage percentage breakdown (T=2048, Q8_0):
+
+  stage             time_ms    %_total    analogy
+  ----------------  --------   --------   --------------------------
+  dequant (load)       0.37      0.0%     ~ batch loading KV from VRAM
+  scoring             14.11      1.5%     ~ prompt processing (Q@K^T)
+  NNLS + LS solve    884.22     94.5%     ~ weight optimization
+  requant (store)      3.11      0.3%     ~ token generation writeback
+  TOTAL              935.86    100.0%
+  throughput:       2188 tok/s (end-to-end)
+
+  Quantization overhead (Q8_0 vs F32):
+    F32 compact only:  936.11 ms (2188 tok/s)
+    Q8_0 end-to-end:   935.86 ms (2188 tok/s)
+    overhead:          +3.48 ms (+0.4% from dequant+requant)
+
+Done.

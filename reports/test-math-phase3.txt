@@ -1,0 +1,108 @@
+ softmax(200x100,p=32): |sum_x|=1614.5 max_err=0.0003
+    peaky(376x375,p=4): |sum_x|=23886.9 max_err=0.2481 OK
+ uniform: |sum_x|=29750.1 max_err=0.3107 OK
+
+    NNLS: 212/375 dead weights, beta range [-27.6, 3.6]
+    X: max=0.113185 sum=376.0 nonzero=61288/141000
+    Y: |sum|=921.6
+    C_v: |sum|=8612.9 max=9.926171 OK
+test-kv-compact-math:
+
+=== Matrix multiplication ===
+  test_mat_mul_ABt_identity... OK
+  test_mat_mul_ABt_rectangular... OK
+  test_mat_mul_AtB_basic... OK
+  test_mat_mul_AtB_rectangular... OK
+
+=== Softmax ===
+  test_softmax_rows_sums_to_one... OK
+  test_softmax_rows_ordering... OK
+  test_softmax_rows_uniform... OK
+  test_softmax_rows_numerical_stability... OK
+
+=== Stable exp ===
+  test_exp_rows_stable_basic... OK
+  test_exp_rows_stable_large_values... OK
+
+=== NNLS solver (Lawson-Hanson) ===
+  test_nnls_identity... OK
+  test_nnls_non_negative_constraint... OK
+  test_nnls_overdetermined... OK
+
+=== NNLS solver (PGD — paper's Algorithm 3) ===
+  test_nnls_pgd_basic... OK
+  test_nnls_pgd_clamping... OK
+  test_nnls_pgd_with_iters... OK
+
+=== OMP key selection ===
+  test_omp_select_basic... OK
+  test_omp_select_with_kchoice... OK
+
+=== Score aggregation methods ===
+  test_score_agg_rms... OK
+
+=== Least squares solver ===
+  test_least_squares_identity... OK
+  test_least_squares_overdetermined... OK
+  test_least_squares_multi_rhs... OK
+  test_least_squares_with_ridge... OK
+  test_least_squares_small_known... max_err=0.000016 OK
+  test_least_squares_softmax_structure... OK
+  test_least_squares_large_overdetermined... OK
+
+=== Per-head sensitivity ===
+  test_sensitivity_uniform_attention... OK
+  test_sensitivity_concentrated_attention... OK
+  test_sensitivity_ordering...
+    Concentrated sensitivity: 11.20, Uniform sensitivity: 1.00
+  OK
+  test_weighted_importance_basic... OK
+
+=== Beta injection via K-modification ===
+  test_compute_beta_direction_identity_queries... OK
+  test_compute_beta_direction_produces_unit_dot...
+    Max |Q@v - 1| = 1.016586, Mean = 0.999762
+  OK
+  test_apply_beta_to_keys_basic... OK
+  test_beta_injection_quality...
+    Avg |score_mod - (score_orig + beta)| = 0.000000
+    Avg |beta| = 0.000000
+    Relative error = 0.000000
+  OK
+
+=== Full compaction pipeline ===
+  test_compact_no_compression_needed... OK
+  test_compact_selects_correct_count... OK
+  test_compact_quality_improves_with_refitting...
+    MSE with refitting: 0.00000005
+    MSE without refit:  0.12400100
+    Improvement:        2619560.50x
+  OK
+  test_compact_beta_values_are_finite... OK
+  test_compact_cosine_similarity...
+    Cosine similarity (50% compression): 0.999999
+  OK
+
+=== Layer-level compaction ===
+  test_compact_layer_shared_selection... OK
+  test_compact_layer_no_compression... OK
+  test_compact_layer_quality_per_head...
+    Head 0: cos_sim=0.995504
+    Head 1: cos_sim=0.973748
+    Head 2: cos_sim=0.996611
+  OK
+  test_compact_layer_finite_values... OK
+
+=== Pipeline end-to-end ===
+  test_compact_pipeline_ls_produces_nonzero_cv... OK
+
+=== Quantized KV round-trip ===
+  test_q8_0_round_trip...
+    Q8_0 max round-trip error: 0.008192 (range: [-2, 2])
+  OK
+  test_q4_0_round_trip...
+    Q4_0 max round-trip error: 0.140873 (range: [-2, 2])
+  OK
+  test_n_elements_per_row... OK
+
+All tests passed!
