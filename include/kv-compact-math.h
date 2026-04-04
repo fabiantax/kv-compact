@@ -241,7 +241,7 @@ static void least_squares_solve(const float * A, const float * b, float * x,
 }
 
 // ============================================================================
-// Compaction algorithm types and implementation
+// Compaction result types (forward declarations for use by bridge detection)
 // ============================================================================
 
 struct compacted_head {
@@ -249,6 +249,332 @@ struct compacted_head {
     std::vector<float> beta;              // attention mass biases [t]
     std::vector<float> C_v;               // refit values [t * d_v]
 };
+
+// ============================================================================
+// Sparse matrix (CSR) and spectral bridge detection
+// ============================================================================
+
+// Compressed Sparse Row matrix
+struct csr_matrix {
+    int rows;
+    int cols;
+    std::vector<int>   row_ptr;   // [rows + 1] start of each row in col_idx/values
+    std::vector<int>   col_idx;   // [nnz] column indices
+    std::vector<float> values;    // [nnz] edge weights
+
+    int nnz() const { return (int) col_idx.size(); }
+};
+
+// Build CSR from dense attention matrix by keeping only edges above a percentile.
+// attn: [n_q x T] dense attention weights (softmax output)
+// percentile: fraction of edges to keep (e.g. 0.95 keeps top 5%)
+// Returns a bipartite graph: rows = queries [0, n_q), cols = keys [0, T)
+static csr_matrix csr_from_threshold(const float * attn, int n_q, int T, float percentile = 0.95f) {
+    // Find threshold value by sampling (avoid sorting all n_q*T values)
+    int total = n_q * T;
+    int sample_n = std::min(total, 10000);
+    std::vector<float> sample(sample_n);
+    int step = std::max(1, total / sample_n);
+    for (int i = 0; i < sample_n; i++) {
+        sample[i] = attn[i * step];
+    }
+    std::sort(sample.begin(), sample.end());
+    float thresh = sample[(int)(percentile * (sample_n - 1))];
+
+    // Build CSR in one pass
+    csr_matrix csr;
+    csr.rows = n_q;
+    csr.cols = T;
+    csr.row_ptr.resize(n_q + 1);
+    csr.row_ptr[0] = 0;
+
+    // First pass: count nnz per row
+    for (int i = 0; i < n_q; i++) {
+        int count = 0;
+        for (int j = 0; j < T; j++) {
+            if (attn[i * T + j] >= thresh) count++;
+        }
+        csr.row_ptr[i + 1] = csr.row_ptr[i] + count;
+    }
+
+    int nnz = csr.row_ptr[n_q];
+    csr.col_idx.resize(nnz);
+    csr.values.resize(nnz);
+
+    // Second pass: fill
+    for (int i = 0; i < n_q; i++) {
+        int pos = csr.row_ptr[i];
+        for (int j = 0; j < T; j++) {
+            if (attn[i * T + j] >= thresh) {
+                csr.col_idx[pos] = j;
+                csr.values[pos] = attn[i * T + j];
+                pos++;
+            }
+        }
+    }
+
+    return csr;
+}
+
+// Transpose CSR (query→key) to CSC (key→query), returned as CSR with swapped dims
+static csr_matrix csr_transpose(const csr_matrix & A) {
+    csr_matrix At;
+    At.rows = A.cols;
+    At.cols = A.rows;
+    At.row_ptr.assign(At.rows + 1, 0);
+    At.col_idx.resize(A.nnz());
+    At.values.resize(A.nnz());
+
+    // Count entries per column of A (= per row of A^T)
+    for (int i = 0; i < A.nnz(); i++) {
+        At.row_ptr[A.col_idx[i] + 1]++;
+    }
+    // Prefix sum
+    for (int i = 0; i < At.rows; i++) {
+        At.row_ptr[i + 1] += At.row_ptr[i];
+    }
+    // Fill using a copy of row_ptr as write cursors
+    std::vector<int> cursor(At.row_ptr.begin(), At.row_ptr.end());
+    for (int i = 0; i < A.rows; i++) {
+        for (int p = A.row_ptr[i]; p < A.row_ptr[i + 1]; p++) {
+            int col = A.col_idx[p];
+            int dest = cursor[col]++;
+            At.col_idx[dest] = i;
+            At.values[dest] = A.values[p];
+        }
+    }
+    return At;
+}
+
+// Sparse matrix-vector multiply: y = A * x  (CSR format)
+static void csr_spmv(const csr_matrix & A, const float * x, float * y) {
+    for (int i = 0; i < A.rows; i++) {
+        float sum = 0.0f;
+        for (int p = A.row_ptr[i]; p < A.row_ptr[i + 1]; p++) {
+            sum += A.values[p] * x[A.col_idx[p]];
+        }
+        y[i] = sum;
+    }
+}
+
+// Compute the Fiedler vector (2nd smallest eigenvector of the graph Laplacian)
+// of the key-key affinity graph derived from the bipartite attention graph.
+//
+// The key-key affinity is A^T * A (= CSC^T * CSC = how strongly two keys are
+// co-attended). The Laplacian is L = D - A^T*A. The Fiedler vector partitions
+// keys into high-connectivity vs low-connectivity groups.
+//
+// Uses inverse power iteration on L + sigma*I to find the smallest non-trivial
+// eigenvector. We actually find the 2nd largest eigenvector of A^T*A (equivalent
+// to 2nd smallest of L) via standard power iteration with deflation.
+//
+// csc: the transposed attention graph (key→query), i.e. csr_transpose() output
+// csr: the original attention graph (query→key)
+// fiedler: output [T] Fiedler vector
+// n_iter: power iteration steps
+static void fiedler_vector(const csr_matrix & csr, const csr_matrix & csc,
+                           float * fiedler, int T, int n_iter = 25) {
+    // We compute the top-2 eigenvectors of the affinity matrix B = A^T * A
+    // via power iteration, then return the 2nd one (Fiedler vector of L).
+    //
+    // B*x = A^T * (A * x): two SpMV calls per iteration.
+
+    std::vector<float> x(T), tmp_q(csr.rows), bx(T);
+
+    // Initialize with structured vector (not constant, to avoid converging to e1)
+    for (int i = 0; i < T; i++) {
+        x[i] = sinf(3.14159f * (float)i / (float)T) + 0.1f * ((float)(i % 7) - 3.0f);
+    }
+
+    for (int iter = 0; iter < n_iter; iter++) {
+        // bx = A^T * (A * x)
+        csr_spmv(csr, x.data(), tmp_q.data());     // tmp_q = A * x  [n_q]
+        csr_spmv(csc, tmp_q.data(), bx.data());     // bx = A^T * tmp_q [T]
+
+        // Deflate: remove component along the largest eigenvector (uniform/degree vector)
+        // The largest eigenvector of A^T*A is approximately proportional to the
+        // degree vector d_j = sum_i A_ij. Remove this component.
+        float dot_d = 0.0f, norm_d = 0.0f;
+        for (int i = 0; i < T; i++) {
+            // Degree of key i = number of queries attending to it (from CSC)
+            float di = (float)(csc.row_ptr[i + 1] - csc.row_ptr[i]);
+            dot_d += bx[i] * di;
+            norm_d += di * di;
+        }
+        if (norm_d > 1e-12f) {
+            float proj = dot_d / norm_d;
+            for (int i = 0; i < T; i++) {
+                float di = (float)(csc.row_ptr[i + 1] - csc.row_ptr[i]);
+                bx[i] -= proj * di;
+            }
+        }
+
+        // Normalize
+        float norm = 0.0f;
+        for (int i = 0; i < T; i++) norm += bx[i] * bx[i];
+        norm = sqrtf(norm + 1e-12f);
+        float inv_norm = 1.0f / norm;
+        for (int i = 0; i < T; i++) {
+            x[i] = bx[i] * inv_norm;
+        }
+    }
+
+    memcpy(fiedler, x.data(), T * sizeof(float));
+}
+
+// Detect bridge keys using the Fiedler vector.
+// Bridge keys are at the "boundary" of the spectral partition — they have
+// Fiedler values near the median, meaning they connect the two halves.
+// Keys with extreme Fiedler values (far from median) are deep inside one
+// partition and more safely removable.
+//
+// Returns a score [0,1] per key where higher = more "bridge-like" (must keep).
+static void bridge_scores_from_fiedler(const float * fiedler, int T,
+                                        float * bridge_scores) {
+    // Find median of Fiedler vector
+    std::vector<float> sorted_f(fiedler, fiedler + T);
+    std::sort(sorted_f.begin(), sorted_f.end());
+    float median = sorted_f[T / 2];
+
+    // Find max deviation from median for normalization
+    float max_dev = 0.0f;
+    for (int i = 0; i < T; i++) {
+        float dev = fabsf(fiedler[i] - median);
+        if (dev > max_dev) max_dev = dev;
+    }
+
+    if (max_dev < 1e-12f) {
+        // All keys have the same Fiedler value — no structural info
+        for (int i = 0; i < T; i++) bridge_scores[i] = 0.5f;
+        return;
+    }
+
+    // Bridge score = 1 - |deviation from median| / max_dev
+    // Keys near the median (partition boundary) get high scores.
+    float inv_max = 1.0f / max_dev;
+    for (int i = 0; i < T; i++) {
+        bridge_scores[i] = 1.0f - fabsf(fiedler[i] - median) * inv_max;
+    }
+}
+
+// Select top-t keys using a combined score: attention importance + bridge score.
+// bridge_weight controls the blend (0 = pure attention, 1 = pure bridge).
+// Returns selected indices sorted by position.
+static std::vector<int> select_keys_bridge_aware(
+        const float * key_scores,     // [T] max-attention importance per key
+        const float * bridge_scores,  // [T] structural bridge scores [0,1]
+        int T, int t,
+        float bridge_weight = 0.3f) {
+
+    // Normalize key_scores to [0,1]
+    float max_ks = 0.0f;
+    for (int i = 0; i < T; i++) {
+        if (key_scores[i] > max_ks) max_ks = key_scores[i];
+    }
+    float inv_max_ks = (max_ks > 1e-12f) ? 1.0f / max_ks : 1.0f;
+
+    // Combined score
+    std::vector<float> combined(T);
+    for (int i = 0; i < T; i++) {
+        float attn_norm = key_scores[i] * inv_max_ks;
+        combined[i] = (1.0f - bridge_weight) * attn_norm
+                    + bridge_weight * bridge_scores[i];
+    }
+
+    // Select top-t
+    std::vector<int> indices(T);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::partial_sort(indices.begin(), indices.begin() + t, indices.end(),
+                      [&](int a, int b) { return combined[a] > combined[b]; });
+
+    std::vector<int> selected(indices.begin(), indices.begin() + t);
+    std::sort(selected.begin(), selected.end());
+    return selected;
+}
+
+// Full bridge-aware compaction: CSR construction + Fiedler + selection + LS refit
+// This is the spectral-structural variant of compact_head_highest_attn.
+static compacted_head compact_head_bridge_aware(
+        const float * K, const float * V, const float * Q_ref,
+        int T, int n_q, int d_k, int d_v, int t,
+        float bridge_weight = 0.3f, float percentile = 0.95f) {
+
+    compacted_head result;
+    result.selected_indices.resize(t);
+    result.beta.resize(t);
+    result.C_v.resize(t * d_v);
+
+    if (t >= T) {
+        for (int i = 0; i < T; i++) result.selected_indices[i] = i;
+        std::fill(result.beta.begin(), result.beta.end(), 0.0f);
+        memcpy(result.C_v.data(), V, T * d_v * sizeof(float));
+        return result;
+    }
+
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+
+    // Compute attention scores and weights (same as standard pipeline)
+    std::vector<float> scores(n_q * T);
+    mat_mul_ABt(Q_ref, K, scores.data(), n_q, T, d_k);
+    for (int i = 0; i < n_q * T; i++) scores[i] *= inv_sqrt_dk;
+
+    std::vector<float> attn_weights(scores);
+    softmax_rows(attn_weights.data(), n_q, T);
+
+    // Standard max-attention key scores
+    std::vector<float> key_scores(T, 0.0f);
+    for (int j = 0; j < T; j++) {
+        for (int i = 0; i < n_q; i++) {
+            float w = attn_weights[i * T + j];
+            if (w > key_scores[j]) key_scores[j] = w;
+        }
+    }
+
+    // Build sparse graph and compute bridge scores
+    csr_matrix csr = csr_from_threshold(attn_weights.data(), n_q, T, percentile);
+    csr_matrix csc = csr_transpose(csr);
+
+    std::vector<float> fvec(T);
+    fiedler_vector(csr, csc, fvec.data(), T);
+
+    std::vector<float> bscores(T);
+    bridge_scores_from_fiedler(fvec.data(), T, bscores.data());
+
+    // Bridge-aware selection
+    std::vector<int> selected = select_keys_bridge_aware(
+        key_scores.data(), bscores.data(), T, t, bridge_weight);
+    result.selected_indices = selected;
+
+    // Skip beta (LS-only, as benchmarked to be better)
+    std::fill(result.beta.begin(), result.beta.end(), 0.0f);
+
+    // LS value refit (same as standard pipeline)
+    std::vector<float> X(n_q * t);
+    for (int i = 0; i < n_q; i++) {
+        for (int j = 0; j < t; j++) {
+            X[i * t + j] = scores[i * T + selected[j]];
+        }
+    }
+    softmax_rows(X.data(), n_q, t);
+
+    std::vector<float> Y(n_q * d_v, 0.0f);
+    for (int i = 0; i < n_q; i++) {
+        for (int j = 0; j < T; j++) {
+            float w_ij = attn_weights[i * T + j];
+            for (int d = 0; d < d_v; d++) {
+                Y[i * d_v + d] += w_ij * V[j * d_v + d];
+            }
+        }
+    }
+
+    least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
+
+    return result;
+}
+
+// ============================================================================
+// Compaction algorithm implementation
+// ============================================================================
 
 // Result of compacting all heads within a single layer
 struct compacted_layer {
