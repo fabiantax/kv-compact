@@ -706,6 +706,243 @@ static void test_compact_layer_finite_values() {
 }
 
 // ============================================================================
+// CSR sparse matrix tests
+// ============================================================================
+
+static void test_csr_from_threshold_basic() {
+    printf("  test_csr_from_threshold_basic...");
+    // 3x4 attention matrix, threshold should keep only high values
+    float attn[] = {
+        0.1f, 0.8f, 0.05f, 0.05f,   // query 0: mostly attends to key 1
+        0.05f, 0.05f, 0.1f, 0.8f,   // query 1: mostly attends to key 3
+        0.7f, 0.1f, 0.1f, 0.1f,     // query 2: mostly attends to key 0
+    };
+    // With percentile=0.5, threshold ~0.1, keeps above-average edges
+    csr_matrix csr = csr_from_threshold(attn, 3, 4, 0.5f);
+
+    assert(csr.rows == 3);
+    assert(csr.cols == 4);
+    assert(csr.nnz() > 0);
+    assert(csr.nnz() <= 12); // at most all edges
+    // The high-value edges (0.7, 0.8, 0.8) should definitely be included
+    bool found_high = false;
+    for (int i = 0; i < csr.nnz(); i++) {
+        if (csr.values[i] >= 0.7f) found_high = true;
+    }
+    assert(found_high);
+    printf(" OK\n");
+}
+
+static void test_csr_transpose_roundtrip() {
+    printf("  test_csr_transpose_roundtrip...");
+    float attn[] = {
+        0.5f, 0.3f, 0.1f, 0.1f,
+        0.1f, 0.1f, 0.3f, 0.5f,
+    };
+    csr_matrix csr = csr_from_threshold(attn, 2, 4, 0.0f); // keep all edges
+    csr_matrix csc = csr_transpose(csr);
+
+    // CSC should have 4 rows (keys) and 2 cols (queries)
+    assert(csc.rows == 4);
+    assert(csc.cols == 2);
+    assert(csc.nnz() == csr.nnz());
+
+    // Double transpose should give back original structure
+    csr_matrix csr2 = csr_transpose(csc);
+    assert(csr2.rows == csr.rows);
+    assert(csr2.cols == csr.cols);
+    assert(csr2.nnz() == csr.nnz());
+    printf(" OK\n");
+}
+
+static void test_csr_spmv_basic() {
+    printf("  test_csr_spmv_basic...");
+    // 2x3 matrix: [[1,0,2],[0,3,0]]
+    csr_matrix A;
+    A.rows = 2; A.cols = 3;
+    A.row_ptr = {0, 2, 3};
+    A.col_idx = {0, 2, 1};
+    A.values = {1.0f, 2.0f, 3.0f};
+
+    float x[] = {1.0f, 2.0f, 3.0f};
+    float y[2] = {};
+    csr_spmv(A, x, y);
+    // y[0] = 1*1 + 2*3 = 7,  y[1] = 3*2 = 6
+    assert(approx_eq(y[0], 7.0f));
+    assert(approx_eq(y[1], 6.0f));
+    printf(" OK\n");
+}
+
+// ============================================================================
+// Fiedler vector & bridge detection tests
+// ============================================================================
+
+static void test_fiedler_vector_structure() {
+    printf("  test_fiedler_vector_structure...");
+    // Create attention pattern with two clear clusters + one bridge key
+    // Keys 0-3: cluster A (queries 0-3 attend here)
+    // Keys 5-8: cluster B (queries 4-7 attend here)
+    // Key 4: bridge (both query groups attend to it)
+    const int n_q = 8, T = 9;
+    std::vector<float> attn(n_q * T, 0.01f); // small baseline
+
+    // Cluster A: queries 0-3 → keys 0-3
+    for (int q = 0; q < 4; q++)
+        for (int k = 0; k < 4; k++)
+            attn[q * T + k] = 0.2f;
+
+    // Cluster B: queries 4-7 → keys 5-8
+    for (int q = 4; q < 8; q++)
+        for (int k = 5; k < 9; k++)
+            attn[q * T + k] = 0.2f;
+
+    // Bridge: key 4 attended by ALL queries
+    for (int q = 0; q < 8; q++)
+        attn[q * T + 4] = 0.15f;
+
+    // Normalize rows to sum to ~1
+    softmax_rows(attn.data(), n_q, T);
+
+    csr_matrix csr = csr_from_threshold(attn.data(), n_q, T, 0.5f);
+    csr_matrix csc = csr_transpose(csr);
+
+    std::vector<float> fvec(T);
+    fiedler_vector(csr, csc, fvec.data(), T, 30);
+
+    // Fiedler vector should separate the two clusters:
+    // keys in cluster A should have similar values, cluster B should have
+    // different values. Key 4 (bridge) should be near the middle.
+    float mean_A = 0, mean_B = 0;
+    for (int i = 0; i < 4; i++) mean_A += fvec[i];
+    for (int i = 5; i < 9; i++) mean_B += fvec[i];
+    mean_A /= 4.0f;
+    mean_B /= 4.0f;
+
+    // The two clusters should be on opposite sides (or at least clearly separated)
+    // We check that |mean_A - mean_B| > some threshold
+    float separation = fabsf(mean_A - mean_B);
+    assert(separation > 0.01f); // clusters should be separated
+
+    printf(" OK (separation=%.4f)\n", separation);
+}
+
+static void test_bridge_scores_range() {
+    printf("  test_bridge_scores_range...");
+    float fiedler[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
+    float bscores[5];
+    bridge_scores_from_fiedler(fiedler, 5, bscores);
+
+    // All scores should be in [0, 1]
+    for (int i = 0; i < 5; i++) {
+        assert(bscores[i] >= 0.0f && bscores[i] <= 1.0f + 1e-6f);
+    }
+    // Middle value (0.0 = median) should have highest bridge score
+    assert(bscores[2] > bscores[0]);
+    assert(bscores[2] > bscores[4]);
+    // Extreme values should have lowest bridge scores
+    assert(bscores[0] < 0.15f);  // far from median
+    assert(bscores[4] < 0.15f);
+    printf(" OK\n");
+}
+
+static void test_bridge_aware_selection_keeps_bridges() {
+    printf("  test_bridge_aware_selection_keeps_bridges...");
+    // Scenario: key 4 has LOW attention but HIGH bridge score.
+    // Standard selection drops it. Bridge-aware should keep it.
+    const int T = 10, t = 3;
+    float key_scores[10] = {0.9f, 0.8f, 0.7f, 0.6f, 0.1f, 0.5f, 0.4f, 0.3f, 0.2f, 0.15f};
+    //                                                  ^ low attention but bridge!
+
+    // Bridge scores: key 4 is the bridge
+    float bridge_scores[10] = {0.1f, 0.1f, 0.1f, 0.1f, 1.0f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+
+    // Standard selection (bridge_weight=0): picks keys 0,1,2 (highest attention)
+    auto standard = select_keys_bridge_aware(key_scores, bridge_scores, T, t, 0.0f);
+    bool standard_has_4 = false;
+    for (int idx : standard) if (idx == 4) standard_has_4 = true;
+    assert(!standard_has_4); // standard should NOT pick key 4
+
+    // Bridge-aware selection (bridge_weight=0.5): should pick key 4
+    auto bridge = select_keys_bridge_aware(key_scores, bridge_scores, T, t, 0.5f);
+    bool bridge_has_4 = false;
+    for (int idx : bridge) if (idx == 4) bridge_has_4 = true;
+    assert(bridge_has_4); // bridge-aware SHOULD pick key 4
+
+    printf(" OK\n");
+}
+
+static void test_bridge_aware_compaction_quality() {
+    printf("  test_bridge_aware_compaction_quality...");
+    // Test that bridge-aware compaction produces finite, reasonable results
+    const int T = 32, n_q = 16, d_k = 8, d_v = 8, t = 8;
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)(i * 3 + 1) * 0.4f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)(i * 2 + 3) * 0.3f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)(i * 5 + 2) * 0.7f);
+
+    auto result = compact_head_bridge_aware(K.data(), V.data(), Q.data(),
+                                             T, n_q, d_k, d_v, t, 0.3f, 0.5f);
+
+    assert((int)result.selected_indices.size() == t);
+    assert((int)result.C_v.size() == t * d_v);
+
+    // All values should be finite
+    for (int i = 0; i < t; i++) {
+        assert(std::isfinite(result.beta[i]));
+        assert(result.selected_indices[i] >= 0 && result.selected_indices[i] < T);
+    }
+    for (int i = 0; i < t * d_v; i++) {
+        assert(std::isfinite(result.C_v[i]));
+    }
+
+    // Check quality: cosine similarity of attention output
+    float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+    double total_cos = 0;
+    int n_eval = std::min(8, n_q);
+    for (int qi = 0; qi < n_eval; qi++) {
+        const float * q = Q.data() + qi * d_k;
+
+        // Original output
+        std::vector<float> orig_scores(T);
+        for (int j = 0; j < T; j++) {
+            float dot = 0;
+            for (int d = 0; d < d_k; d++) dot += q[d] * K[j * d_k + d];
+            orig_scores[j] = dot * inv_sqrt_dk;
+        }
+        softmax_rows(orig_scores.data(), 1, T);
+        std::vector<float> orig_out(d_v, 0.0f);
+        for (int j = 0; j < T; j++)
+            for (int d = 0; d < d_v; d++)
+                orig_out[d] += orig_scores[j] * V[j * d_v + d];
+
+        // Compacted output
+        std::vector<float> comp_scores(t);
+        for (int j = 0; j < t; j++) {
+            float dot = 0;
+            int idx = result.selected_indices[j];
+            for (int d = 0; d < d_k; d++) dot += q[d] * K[idx * d_k + d];
+            comp_scores[j] = dot * inv_sqrt_dk;
+        }
+        softmax_rows(comp_scores.data(), 1, t);
+        std::vector<float> comp_out(d_v, 0.0f);
+        for (int j = 0; j < t; j++)
+            for (int d = 0; d < d_v; d++)
+                comp_out[d] += comp_scores[j] * result.C_v[j * d_v + d];
+
+        float dotp = 0, no = 0, nc = 0;
+        for (int d = 0; d < d_v; d++) {
+            dotp += orig_out[d] * comp_out[d];
+            no += orig_out[d] * orig_out[d];
+            nc += comp_out[d] * comp_out[d];
+        }
+        total_cos += dotp / (sqrtf(no * nc) + 1e-8f);
+    }
+    double avg_cos = total_cos / n_eval;
+    assert(avg_cos > 0.95); // should be decent quality
+    printf(" OK (avg cosine=%.6f)\n", avg_cos);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -745,6 +982,17 @@ int main() {
     test_compact_quality_improves_with_refitting();
     test_compact_beta_values_are_finite();
     test_compact_cosine_similarity();
+
+    printf("\n=== CSR sparse matrix ===\n");
+    test_csr_from_threshold_basic();
+    test_csr_transpose_roundtrip();
+    test_csr_spmv_basic();
+
+    printf("\n=== Fiedler vector & bridge detection ===\n");
+    test_fiedler_vector_structure();
+    test_bridge_scores_range();
+    test_bridge_aware_selection_keeps_bridges();
+    test_bridge_aware_compaction_quality();
 
     printf("\n=== Layer-level compaction ===\n");
     test_compact_layer_shared_selection();
