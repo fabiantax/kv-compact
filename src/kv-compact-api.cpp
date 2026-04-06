@@ -32,11 +32,89 @@
 #include <omp.h>
 #endif
 
+#if defined(KV_COMPACT_USE_BLAS) && KV_COMPACT_USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+#endif
+
 using clock_type = std::chrono::high_resolution_clock;
 
 static double elapsed_ms(clock_type::time_point t0) {
     return std::chrono::duration<double, std::milli>(clock_type::now() - t0).count();
 }
+
+// ============================================================================
+// BLAS-accelerated least-squares solve
+// ============================================================================
+
+// BLAS version: uses cblas_sgemm for AtA/Atb, Cholesky for the solve.
+// AtA is symmetric positive definite (with ridge), so Cholesky is 2x faster
+// than Gaussian elimination and more numerically stable.
+//
+// Solves: min ||A*x - b||^2  via normal equations (A^T A + ridge*I) x = A^T b
+// A is (m x n), b is (m x p), x is (n x p), all row-major.
+#if KV_COMPACT_USE_BLAS
+static void least_squares_solve_blas(const float * A, const float * b, float * x,
+                                      int m, int n, int p, float ridge = 1e-6f) {
+    // Phase 1: AtA = A^T * A  (n x n, row-major = column-major for symmetric)
+    // cblas_sgemm: C = alpha * A * B + beta * C
+    // A^T (n x m) * A (m x n) = AtA (n x n)
+    // In BLAS terms: CblasTrans * CblasNoTrans
+    std::vector<float> AtA(n * n, 0.0f);
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n, n, m,                     // rows_A, cols_B, inner_dim
+                1.0f,                         // alpha
+                A, n,                         // A (m x n), lda = n
+                A, n,                         // B (m x n), ldb = n
+                0.0f,                         // beta
+                AtA.data(), n);               // C (n x n), ldc = n
+
+    // Add ridge regularization to diagonal
+    for (int i = 0; i < n; i++) {
+        AtA[i * n + i] += ridge;
+    }
+
+    // Phase 2: Atb = A^T * b  (n x p)
+    // A^T (n x m) * b (m x p) = Atb (n x p)
+    std::vector<float> Atb(n * p, 0.0f);
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n, p, m,
+                1.0f,
+                A, n,
+                b, p,
+                0.0f,
+                Atb.data(), p);
+
+    // Phase 3: Cholesky factorization and solve
+    // AtA is SPD. Use LAPACK sposv: factor + solve in one call.
+    // sposv expects column-major. Since AtA is symmetric and we formed it
+    // row-major, it's the same in column-major for symmetric matrices.
+    // Atb needs to be column-major for sposv. For symmetric AtA + general Atb,
+    // we copy Atb into column-major layout.
+    std::vector<float> Atb_cm(n * p);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < p; j++)
+            Atb_cm[j * n + i] = Atb[i * p + j];  // row-major → col-major
+
+    // sposv: solves A * X = B where A is SPD
+    // A is overwritten with Cholesky factor L (lower triangle)
+    // B is overwritten with solution X
+    __LAPACK_int nn = n, nrhs = p, info;
+    __LAPACK_int lda_val = n, ldb_val = n;
+    sposv_("L", &nn, &nrhs, AtA.data(), &lda_val, Atb_cm.data(), &ldb_val, &info);
+
+    // Copy solution back to row-major output
+    if (info == 0) {
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < p; j++)
+                x[i * p + j] = Atb_cm[j * n + i];
+    } else {
+        // Cholesky failed (singular matrix) — fall back to zeros
+        memset(x, 0, (size_t)n * p * sizeof(float));
+    }
+}
+#endif
 
 // ============================================================================
 // Cheap Q_ref generation from K vectors
@@ -704,6 +782,7 @@ int kv_compact(
         }
     }
 
+    #pragma omp parallel for schedule(static) if(n_head_kv > 1)
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hc = hcache[0][h];
         beta_vecs[h].resize(t);
@@ -760,8 +839,13 @@ int kv_compact(
         }
         softmax_rows(X.data(), n_q_used, t);
 
+        #if KV_COMPACT_USE_BLAS
+        least_squares_solve_blas(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
+                                  n_q_used, t, d_v, p.ridge);
+        #else
         least_squares_solve(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
                            n_q_used, t, d_v, p.ridge);
+        #endif
     }
 
     // ---- Iterative refinement: swap worst selected keys with best unused ----
@@ -850,8 +934,13 @@ int kv_compact(
                 }
                 softmax_rows(X.data(), n_q_used, t);
 
+                #if KV_COMPACT_USE_BLAS
+                least_squares_solve_blas(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
+                                          n_q_used, t, d_v, p.ridge);
+                #else
                 least_squares_solve(X.data(), Y_vecs[h].data(), cv_vecs[h].data(),
                                    n_q_used, t, d_v, p.ridge);
+                #endif
             }
         }
     }

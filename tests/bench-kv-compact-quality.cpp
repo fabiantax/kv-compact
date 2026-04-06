@@ -505,10 +505,11 @@ static void bench_throughput_scaling() {
     int T_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096, 10240};
     float ratios[] = {0.5f, 0.2f};
 
-    printf("  %-6s  %-8s  %8s  %12s  %14s\n",
-           "T", "ratio", "t", "time_ms", "tokens/sec");
-    printf("  %-6s  %-8s  %8s  %12s  %14s\n",
-           "------", "--------", "--------", "------------", "--------------");
+    printf("  %-6s  %-8s  %8s  %12s  %14s  %10s  %10s  %10s\n",
+           "T", "ratio", "t", "time_ms", "tokens/sec", "scoring%", "nnls%", "other%");
+    printf("  %-6s  %-8s  %8s  %12s  %14s  %10s  %10s  %10s\n",
+           "------", "--------", "--------", "------------", "--------------",
+           "--------", "--------", "--------");
 
     for (int T : T_sizes) {
         std::vector<float> K(T * n_embd_k), V(T * n_embd_v), Q(n_q * n_embd_k);
@@ -530,7 +531,7 @@ static void bench_throughput_scaling() {
 
             // Timed run (fewer runs for large T)
             const int n_runs = (T <= 2048) ? 3 : 1;
-            double total_ms = 0.0;
+            double total_ms = 0.0, total_scoring_ms = 0.0, total_nnls_ms = 0.0;
             int final_t = 0;
 
             for (int run = 0; run < n_runs; run++) {
@@ -541,15 +542,23 @@ static void bench_throughput_scaling() {
                 double ms = std::chrono::duration<double, std::milli>(
                     clock_type::now() - t0).count();
                 total_ms += ms;
+                total_scoring_ms += result.stats.scoring_ms;
+                total_nnls_ms += result.stats.nnls_ms;
                 final_t = result.t;
                 kv_compact_result_free(&result);
             }
 
             double avg_ms = total_ms / n_runs;
             double tokens_per_sec = T / (avg_ms / 1000.0);
+            double avg_scoring = total_scoring_ms / n_runs;
+            double avg_nnls = total_nnls_ms / n_runs;
+            double scoring_pct = 100.0 * avg_scoring / avg_ms;
+            double nnls_pct = 100.0 * avg_nnls / avg_ms;
+            double other_pct = 100.0 - scoring_pct - nnls_pct;
 
-            printf("  %-6d  %-8.0f%%  %8d  %12.2f  %14.0f\n",
-                   T, ratio * 100, final_t, avg_ms, tokens_per_sec);
+            printf("  %-6d  %-8.0f%%  %8d  %12.2f  %14.0f  %9.1f%%  %9.1f%%  %9.1f%%\n",
+                   T, ratio * 100, final_t, avg_ms, tokens_per_sec,
+                   scoring_pct, nnls_pct, other_pct);
 
             assert(avg_ms > 0.0);
         }

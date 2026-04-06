@@ -295,15 +295,21 @@ static void bench_model_quality(model_info & mi, common_params & params) {
     int actual_d_v = sd.layers[0].n_embd_v_gqa_computed() / mi.n_head_kv;
 
     // ---- Step 3: Compact at multiple ratios and measure quality ----
-    printf("  [3/5] Compacting and evaluating...\n\n");
+    printf("  [3/6] Compacting and evaluating...\n\n");
 
-    float ratios[] = {0.8f, 0.5f, 0.3f, 0.2f};
+    // Per-token KV cost: attention layers only have KV; SSM layers have recurrent state.
+    // We calculate from the actual state size.
+    const double kv_bytes_per_token = (double)saved / n_prompt;
+    printf("  Full state: %.2f MB for %d tokens = %.1f bytes/tok\n\n",
+           saved / (1024.0 * 1024.0), n_prompt, kv_bytes_per_token);
 
-    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %7s  %7s  %10s\n",
-           "ratio", "t/T", "ppl", "ppl_ratio", "avg_KL", "max_KL", "top1%", "top5%", "time_ms");
-    printf("  %-8s  %8s  %12s  %12s  %12s  %12s  %7s  %7s  %10s\n",
-           "--------", "--------", "------------", "------------",
-           "------------", "------------", "-------", "-------", "----------");
+    float ratios[] = {0.8f, 0.5f, 0.3f, 0.2f, 0.1f, 0.05f, 0.033f, 0.025f, 0.02f};
+
+    printf("  %-8s  %8s  %9s  %9s  %7s  %12s  %12s  %12s  %12s  %7s  %7s  %7s  %10s\n",
+           "ratio", "t/T", "KV(MB)", "comp(MB)", "batch", "ppl", "ppl_ratio", "avg_KL", "max_KL", "top1%", "top5%", "dPPL%%", "time_ms");
+    printf("  %-8s  %8s  %9s  %9s  %7s  %12s  %12s  %12s  %12s  %7s  %7s  %7s  %10s\n",
+           "--------", "--------", "---------", "---------", "-------",
+           "------------", "------------", "------------", "------------", "-------", "-------", "-------", "----------");
 
     for (float ratio : ratios) {
         auto t_start = clock_type::now();
@@ -430,15 +436,22 @@ static void bench_model_quality(model_info & mi, common_params & params) {
         double top1_pct = 100.0 * top1_match / n_eval;
         double top5_pct = 100.0 * top5_match / n_eval;
 
-        printf("  %-8.0f%%  %4d/%-3d  %12.4f  %12.4f  %12.6f  %12.6f  %6.1f%%  %6.1f%%  %10.1f\n",
-               ratio * 100, t, T, comp_ppl, ppl_ratio, avg_kl, max_kl, top1_pct, top5_pct, compact_ms);
+        double comp_state_mb = compacted_buf.size() / (1024.0 * 1024.0);
+        double full_state_mb = saved / (1024.0 * 1024.0);
+        // Batch capacity: how many sequences fit in same memory as 1 full-cache seq
+        int batch_capacity = (int)(full_state_mb / comp_state_mb);
+        double d_ppl_pct = (ppl_ratio - 1.0) * 100.0;
+
+        printf("  %-8.0f%%  %4d/%-3d  %8.2f  %8.2f  %5d   %12.4f  %12.4f  %12.6f  %12.6f  %6.1f%%  %6.1f%%  %+5.1f%%  %10.1f\n",
+               ratio * 100, t, T, full_state_mb, comp_state_mb, batch_capacity,
+               comp_ppl, ppl_ratio, avg_kl, max_kl, top1_pct, top5_pct, d_ppl_pct, compact_ms);
 
         llama_batch_free(eval_batch);
         kv_compact_result_free(&compact_result);
     }
 
     // ---- Step 4: Needle-in-a-Haystack retrieval ----
-    printf("\n  [4/5] Needle-in-a-Haystack retrieval test...\n\n");
+    printf("\n  [4/6] Needle-in-a-Haystack retrieval test...\n\n");
     {
         // Insert a distinctive fact ("needle") in the middle of a padded prompt,
         // compact, then check if the model can retrieve it.
@@ -585,120 +598,137 @@ static void bench_model_quality(model_info & mi, common_params & params) {
         }
     }
 
-    // ---- Step 5: Generation comparison ----
-    printf("\n  [5/5] Generation comparison...\n\n");
+    // ---- Step 5: Generation throughput (tok/s) at various compression ratios ----
+    printf("\n  [5/6] Generation throughput (tok/s)...\n\n");
 
-    const int n_gen = 50;
+    const int n_gen = 100;
 
-    // Generate with full cache
-    llama_memory_seq_rm(mem, 0, -1, -1);
-    {
-        llama_batch pb = llama_batch_init(n_prompt, 0, 1);
-        for (int i = 0; i < n_prompt; i++)
-            common_batch_add(pb, prompt_tokens[i], i, {0}, (i == n_prompt - 1));
-        llama_decode(mi.ctx, pb);
-        llama_batch_free(pb);
-    }
-
-    std::string full_gen;
-    {
-        // Decode first continuation token as seed (same as compacted path)
-        llama_batch sb = llama_batch_init(1, 0, 1);
-        common_batch_add(sb, cont_tokens[0], n_prompt, {0}, true);
-        llama_decode(mi.ctx, sb);
-        llama_batch_free(sb);
-
-        full_gen += common_token_to_piece(mi.vocab, cont_tokens[0]);
-
-        common_sampler * smpl = common_sampler_init(mi.model, params.sampling);
-        llama_batch gb = llama_batch_init(1, 0, 1);
-        for (int i = 0; i < n_gen - 1; i++) {
-            llama_token id = common_sampler_sample(smpl, mi.ctx, -1);
-            if (llama_vocab_is_eog(mi.vocab, id)) break;
-            full_gen += common_token_to_piece(mi.vocab, id);
-            common_sampler_accept(smpl, id, true);
-            common_batch_clear(gb);
-            common_batch_add(gb, id, n_prompt + 1 + i, {0}, true);
-            if (llama_decode(mi.ctx, gb) != 0) break;
-        }
-        common_sampler_free(smpl);
-        llama_batch_free(gb);
-    }
-
-    // Generate with 50% compacted cache
-    {
+    // Helper lambda: prefill, compact at given ratio, generate, return tok/s and output
+    // Also returns compacted state size via reference
+    auto bench_gen = [&](float ratio, std::string & output, size_t & out_state_size) -> double {
+        // Prefill
         llama_memory_seq_rm(mem, 0, -1, -1);
         llama_batch pb = llama_batch_init(n_prompt, 0, 1);
         for (int i = 0; i < n_prompt; i++)
             common_batch_add(pb, prompt_tokens[i], i, {0}, (i == n_prompt - 1));
         llama_decode(mi.ctx, pb);
         llama_batch_free(pb);
-    }
 
-    // Save, compact at 50%, reload
-    {
-        size_t ss = llama_state_seq_get_size(mi.ctx, 0);
-        std::vector<uint8_t> sb(ss);
-        llama_state_seq_get_data(mi.ctx, sb.data(), sb.size(), 0);
+        if (ratio >= 1.0f) {
+            // Full cache — no compaction
+            out_state_size = saved;
+        } else {
+            // Save state
+            size_t ss = llama_state_seq_get_size(mi.ctx, 0);
+            std::vector<uint8_t> sb(ss);
+            llama_state_seq_get_data(mi.ctx, sb.data(), sb.size(), 0);
 
-        parsed_kv_state ks2;
-        ks2.parse(sb.data(), ss, mi.n_pos_per_embd);
+            parsed_kv_state ks;
+            ks.parse(sb.data(), ss, mi.n_pos_per_embd);
 
-        kv_compact_params p50 = kv_compact_params_default();
-        p50.target_ratio = 0.5f;
-        p50.use_cheap_qref = 1;
+            kv_compact_params pc = kv_compact_params_default();
+            pc.target_ratio = ratio;
+            pc.use_cheap_qref = 1;
 
-        kv_compact_result r50 = {};
-        kv_compact(ks2.streams[0].layers[0].K.data(),
-                   ks2.streams[0].layers[0].V.data(), NULL,
-                   n_prompt, 0, mi.n_head_kv, actual_d_k, actual_d_v,
-                   &p50, &r50);
+            kv_compact_result rc2 = {};
+            int rr = kv_compact(ks.streams[0].layers[0].K.data(),
+                                ks.streams[0].layers[0].V.data(), NULL,
+                                n_prompt, 0, mi.n_head_kv, actual_d_k, actual_d_v,
+                                &pc, &rc2);
+            if (rr != 0) { out_state_size = 0; return 0.0; }
 
-        std::vector<int> sel50(r50.selected_indices, r50.selected_indices + r50.t);
+            std::vector<int> sel(rc2.selected_indices, rc2.selected_indices + rc2.t);
 
-        std::vector<std::vector<std::vector<float>>> cv50, beta50, dirs50;
-        compact_all_layers(ks2.streams[0], sel50,
-                          mi.n_head_kv, actual_d_k, actual_d_v,
-                          cv50, beta50, dirs50);
+            std::vector<std::vector<std::vector<float>>> cv_r, beta_r, dirs_r;
+            compact_all_layers(ks.streams[0], sel,
+                              mi.n_head_kv, actual_d_k, actual_d_v,
+                              cv_r, beta_r, dirs_r);
 
-        auto cb = build_compacted_state(ks2, sel50, cv50, mi.n_head_kv, actual_d_k, actual_d_v,
-                                         mi.n_pos_per_embd);
+            auto cb = build_compacted_state(ks, sel, cv_r, mi.n_head_kv, actual_d_k, actual_d_v,
+                                             mi.n_pos_per_embd);
+            out_state_size = cb.size();
 
-        llama_memory_seq_rm(mem, 0, -1, -1);
-        llama_state_seq_set_data(mi.ctx, cb.data(), cb.size(), 0);
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_state_seq_set_data(mi.ctx, cb.data(), cb.size(), 0);
+            kv_compact_result_free(&rc2);
+        }
 
-        kv_compact_result_free(&r50);
-    }
+        llama_pos pm = llama_memory_seq_pos_max(mem, 0);
 
-    llama_pos pos_max2 = llama_memory_seq_pos_max(mem, 0);
-    std::string compact_gen;
-    {
-        // Decode a "seed" continuation token at pos_max+1 to prime logits
-        // (we can't re-decode pos_max since it's already in the cache)
-        llama_batch pb = llama_batch_init(1, 0, 1);
-        common_batch_add(pb, cont_tokens[0], pos_max2 + 1, {0}, true);
-        llama_decode(mi.ctx, pb);
-        llama_batch_free(pb);
+        // Seed with first continuation token
+        llama_batch seed_b = llama_batch_init(1, 0, 1);
+        common_batch_add(seed_b, cont_tokens[0], pm + 1, {0}, true);
+        llama_decode(mi.ctx, seed_b);
+        llama_batch_free(seed_b);
 
-        compact_gen += common_token_to_piece(mi.vocab, cont_tokens[0]);
+        output = common_token_to_piece(mi.vocab, cont_tokens[0]);
 
+        // Timed generation
+        auto gen_start = clock_type::now();
         common_sampler * smpl = common_sampler_init(mi.model, params.sampling);
         llama_batch gb = llama_batch_init(1, 0, 1);
+        int generated = 0;
         for (int i = 0; i < n_gen - 1; i++) {
             llama_token id = common_sampler_sample(smpl, mi.ctx, -1);
             if (llama_vocab_is_eog(mi.vocab, id)) break;
-            compact_gen += common_token_to_piece(mi.vocab, id);
+            output += common_token_to_piece(mi.vocab, id);
             common_sampler_accept(smpl, id, true);
             common_batch_clear(gb);
-            common_batch_add(gb, id, pos_max2 + 2 + i, {0}, true);
+            common_batch_add(gb, id, pm + 2 + i, {0}, true);
             if (llama_decode(mi.ctx, gb) != 0) break;
+            generated++;
         }
+        double gen_ms = std::chrono::duration<double, std::milli>(clock_type::now() - gen_start).count();
         common_sampler_free(smpl);
         llama_batch_free(gb);
+
+        // total tokens = 1 (seed) + generated
+        return (1 + generated) / (gen_ms / 1000.0);
+    };
+
+    printf("  %-12s  %8s  %9s  %9s  %7s  %10s  %s\n",
+           "compression", "kept", "full(MB)", "comp(MB)", "batch", "tok/s", "output");
+    printf("  %-12s  %8s  %9s  %9s  %7s  %10s  %s\n",
+           "------------", "--------", "---------", "---------", "-------", "----------",
+           std::string(60, '-').c_str());
+
+    float gen_ratios[] = {1.0f, 0.5f, 0.2f, 0.1f, 0.05f, 0.033f, 0.025f, 0.02f};
+    for (float r : gen_ratios) {
+        std::string out;
+        size_t comp_size = 0;
+        double tps = bench_gen(r, out, comp_size);
+        int kept = (r >= 1.0f) ? n_prompt : std::max(1, (int)(n_prompt * r));
+        double compression = (double)n_prompt / kept;
+        double full_mb = saved / (1024.0 * 1024.0);
+        double comp_mb = comp_size / (1024.0 * 1024.0);
+        int batch = (comp_size > 0) ? (int)(saved / comp_size) : 1;
+
+        char ratio_str[32];
+        if (r >= 1.0f) snprintf(ratio_str, sizeof(ratio_str), "full");
+        else snprintf(ratio_str, sizeof(ratio_str), "%.0fx (%.1f%%)", compression, r * 100);
+
+        printf("  %-12s  %4d/%-3d  %8.2f  %8.2f  %5d   %10.2f  \"%.55s\"\n",
+               ratio_str, kept, n_prompt, full_mb, comp_mb, batch, tps, out.c_str());
     }
 
-    printf("  Full cache:  \"%.100s...\"\n", full_gen.c_str());
-    printf("  50%% compact: \"%.100s...\"\n", compact_gen.c_str());
+    // ---- Step 6: Batching capacity summary ----
+    printf("\n  [6/6] Batching capacity (same %.0f MB budget):\n\n", saved / (1024.0 * 1024.0));
+    printf("  %-12s  %7s  %9s  %12s\n", "compression", "seqs", "tok/seq", "total_tok");
+    printf("  %-12s  %7s  %9s  %12s\n", "------------", "-------", "---------", "------------");
+    for (float r : gen_ratios) {
+        int kept = (r >= 1.0f) ? n_prompt : std::max(1, (int)(n_prompt * r));
+        double comp_state_bytes = saved * ((double)kept / n_prompt);
+        int seqs = (int)(saved / comp_state_bytes);
+        if (seqs < 1) seqs = 1;
+        long total_tok = (long)seqs * n_prompt;
+        double compression = (double)n_prompt / kept;
+
+        char ratio_str[32];
+        if (r >= 1.0f) snprintf(ratio_str, sizeof(ratio_str), "full");
+        else snprintf(ratio_str, sizeof(ratio_str), "%.0fx", compression);
+
+        printf("  %-12s  %5d   %7d   %10ld\n", ratio_str, seqs, n_prompt, total_tok);
+    }
 
     llama_batch_free(batch);
     printf("\n  Done.\n");
@@ -720,6 +750,11 @@ int main(int argc, char ** argv) {
     // Ensure enough context for our benchmark prompt
     if (params.n_ctx < 1024) {
         params.n_ctx = 1024;
+    }
+
+    // Ensure batch size is large enough for bulk prefills (5k–100k tokens)
+    if (params.n_batch < (int)params.n_ctx) {
+        params.n_batch = params.n_ctx;
     }
 
     common_init();
@@ -748,6 +783,191 @@ int main(int argc, char ** argv) {
                           rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
 
     bench_model_quality(mi, params);
+
+    // ---- Scaling benchmark: compaction at 5k, 10k, 20k, 50k, 75k, 100k ----
+    {
+        printf("\n\n=== Scaling Benchmark ===\n");
+        char desc_buf[256];
+        llama_model_desc(mi.model, desc_buf, sizeof(desc_buf));
+        printf("  Model: %s\n\n", desc_buf);
+
+        llama_memory_t mem = llama_get_memory(mi.ctx);
+        const int n_ctx = llama_n_ctx(mi.ctx);
+
+        // Generate a long base text by repeating BENCH_PROMPT
+        std::string base_text = BENCH_PROMPT;
+        std::string long_text;
+        while (long_text.size() < 500000) long_text += base_text;
+        std::vector<llama_token> all_tokens = common_tokenize(mi.vocab, long_text, true, false);
+
+        int ctx_sizes[] = {5000, 10000, 20000, 50000, 75000, 100000};
+        float comp_ratios[] = {0.5f, 0.2f, 0.1f, 0.05f, 0.02f};
+
+        printf("  %-8s  %8s  %9s", "ctx", "ratio", "kept");
+        for (float cr : comp_ratios) {
+            printf("  %10s", cr >= 1.0f ? "full(MB)" :
+                   cr == 0.5f ? "2x(MB)" :
+                   cr == 0.2f ? "5x(MB)" :
+                   cr == 0.1f ? "10x(MB)" :
+                   cr == 0.05f ? "20x(MB)" : "50x(MB)");
+        }
+        printf("  %10s  %10s\n", "compact(ms)", "tok/s");
+        printf("  %-8s  %8s  %9s", "--------", "--------", "--------");
+        for (int i = 0; i < (int)(sizeof(comp_ratios)/sizeof(comp_ratios[0])); i++)
+            printf("  %10s", "----------");
+        printf("  %10s  %10s\n", "----------", "----------");
+
+        for (int target_ctx : ctx_sizes) {
+            if (target_ctx >= n_ctx) {
+                printf("  %-8d  (exceeds -c %d, skip)\n", target_ctx, n_ctx);
+                continue;
+            }
+
+            int n_tok = std::min(target_ctx - 64, (int)all_tokens.size());
+            if (n_tok <= 0) continue;
+
+            // Prefill
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_batch pb = llama_batch_init(n_tok, 0, 1);
+            for (int i = 0; i < n_tok; i++)
+                common_batch_add(pb, all_tokens[i], i, {0}, (i == n_tok - 1));
+            int rc = llama_decode(mi.ctx, pb);
+            llama_batch_free(pb);
+            if (rc != 0) {
+                printf("  %-8d  PREFILL FAILED (rc=%d)\n", n_tok, rc);
+                continue;
+            }
+
+            // Save state
+            size_t ss = llama_state_seq_get_size(mi.ctx, 0);
+            std::vector<uint8_t> sb(ss);
+            size_t saved_bytes = llama_state_seq_get_data(mi.ctx, sb.data(), sb.size(), 0);
+            double full_mb = saved_bytes / (1024.0 * 1024.0);
+
+            // Parse state
+            parsed_kv_state ks;
+            ks.parse(sb.data(), saved_bytes, mi.n_pos_per_embd);
+            const auto & sd = ks.streams[0];
+            int adk = sd.layers[0].n_embd_k_gqa() / mi.n_head_kv;
+            int adv = sd.layers[0].n_embd_v_gqa_computed() / mi.n_head_kv;
+
+            // Full state column
+            printf("  %-8d  %8s  %9d  %10.2f", n_tok, "full", n_tok, full_mb);
+
+            // Compact at each ratio
+            for (float cr : comp_ratios) {
+                auto t0 = clock_type::now();
+
+                kv_compact_params cp = kv_compact_params_default();
+                cp.target_ratio = cr;
+                cp.use_cheap_qref = 1;
+
+                kv_compact_result cr2 = {};
+                int rr = kv_compact(sd.layers[0].K.data(), sd.layers[0].V.data(), NULL,
+                                    n_tok, 0, mi.n_head_kv, adk, adv, &cp, &cr2);
+                if (rr != 0) {
+                    printf("  %10s", "FAIL");
+                    continue;
+                }
+
+                std::vector<int> sel(cr2.selected_indices, cr2.selected_indices + cr2.t);
+                std::vector<std::vector<std::vector<float>>> cv_r, beta_r, dirs_r;
+                compact_all_layers(sd, sel, mi.n_head_kv, adk, adv, cv_r, beta_r, dirs_r);
+
+                auto cb = build_compacted_state(ks, sel, cv_r, mi.n_head_kv, adk, adv,
+                                                 mi.n_pos_per_embd);
+
+                double ms = std::chrono::duration<double, std::milli>(clock_type::now() - t0).count();
+                double comp_mb = cb.size() / (1024.0 * 1024.0);
+                double saved_pct = (1.0 - (double)cb.size() / saved_bytes) * 100.0;
+
+                // Only print size for the first ratio, print time for all
+                printf("  %10.2f", comp_mb);
+
+                kv_compact_result_free(&cr2);
+            }
+
+            // Re-run just one ratio (20x) to get clean timing
+            {
+                kv_compact_params cp = kv_compact_params_default();
+                cp.target_ratio = 0.05f;
+                cp.use_cheap_qref = 1;
+                kv_compact_result cr2 = {};
+                auto t0 = clock_type::now();
+                int rr = kv_compact(sd.layers[0].K.data(), sd.layers[0].V.data(), NULL,
+                                    n_tok, 0, mi.n_head_kv, adk, adv, &cp, &cr2);
+                double ms = std::chrono::duration<double, std::milli>(clock_type::now() - t0).count();
+                if (rr == 0) {
+                    printf("  %10.1f  %10.1f", ms, n_tok / (ms / 1000.0));
+                    kv_compact_result_free(&cr2);
+                }
+            }
+
+            printf("\n");
+        }
+
+        // Batch capacity table
+        printf("\n  Batching capacity (sequences fitting in full-cache memory of one 50k context):\n\n");
+        {
+            // Estimate from 50k row if available
+            int ref_ctx = 50000;
+            if (ref_ctx >= n_ctx) ref_ctx = n_ctx - 64;
+            int n_tok = std::min(ref_ctx, (int)all_tokens.size());
+
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_batch pb = llama_batch_init(n_tok, 0, 1);
+            for (int i = 0; i < n_tok; i++)
+                common_batch_add(pb, all_tokens[i], i, {0}, (i == n_tok - 1));
+            llama_decode(mi.ctx, pb);
+            llama_batch_free(pb);
+
+            size_t ss = llama_state_seq_get_size(mi.ctx, 0);
+            std::vector<uint8_t> sb(ss);
+            size_t ref_bytes = llama_state_seq_get_data(mi.ctx, sb.data(), sb.size(), 0);
+            double ref_mb = ref_bytes / (1024.0 * 1024.0);
+
+            parsed_kv_state ks;
+            ks.parse(sb.data(), ref_bytes, mi.n_pos_per_embd);
+            const auto & sd = ks.streams[0];
+            int adk = sd.layers[0].n_embd_k_gqa() / mi.n_head_kv;
+            int adv = sd.layers[0].n_embd_v_gqa_computed() / mi.n_head_kv;
+
+            printf("  Reference: %d tokens, %.2f MB state\n\n", n_tok, ref_mb);
+            printf("  %-12s  %9s  %7s  %9s  %12s\n", "compression", "comp(MB)", "seqs", "tok/seq", "total_tok");
+            printf("  %-12s  %9s  %7s  %9s  %12s\n", "------------", "---------", "-------", "---------", "------------");
+
+            float bratios[] = {1.0f, 0.5f, 0.2f, 0.1f, 0.05f, 0.033f, 0.025f, 0.02f};
+            for (float r : bratios) {
+                kv_compact_params cp = kv_compact_params_default();
+                cp.target_ratio = r;
+                cp.use_cheap_qref = 1;
+
+                kv_compact_result cr2 = {};
+                int rr = kv_compact(sd.layers[0].K.data(), sd.layers[0].V.data(), NULL,
+                                    n_tok, 0, mi.n_head_kv, adk, adv, &cp, &cr2);
+                if (rr != 0) continue;
+
+                std::vector<int> sel(cr2.selected_indices, cr2.selected_indices + cr2.t);
+                std::vector<std::vector<std::vector<float>>> cv_r, beta_r, dirs_r;
+                compact_all_layers(sd, sel, mi.n_head_kv, adk, adv, cv_r, beta_r, dirs_r);
+                auto cb = build_compacted_state(ks, sel, cv_r, mi.n_head_kv, adk, adv,
+                                                 mi.n_pos_per_embd);
+
+                double comp_mb = cb.size() / (1024.0 * 1024.0);
+                int seqs = (int)(ref_bytes / cb.size());
+                if (seqs < 1) seqs = 1;
+                long total = (long)seqs * n_tok;
+                double compression = (double)n_tok / (int)(n_tok * r);
+
+                char label[32];
+                if (r >= 1.0f) snprintf(label, sizeof(label), "full");
+                else snprintf(label, sizeof(label), "%.0fx", compression);
+
+                printf("  %-12s  %9.2f  %5d   %7d   %10ld\n", label, comp_mb, seqs, n_tok, total);
+                kv_compact_result_free(&cr2);
+            }
+        }
+    }
 
     llama_backend_free();
     return 0;

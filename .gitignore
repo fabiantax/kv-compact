@@ -1,11 +1,45 @@
+# Build
 build*/
 .cache/
 .vs/
 CMakeUserPresets.json
+
+# Compiled objects
 *.exe
 *.obj
 *.o
 *.lib
 *.dll
 *.pdb
+
+# Dependencies
+_deps/
+
+# Models
 models/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Profiles / benchmark artifacts
+*.json.gz
+bench-results-*.md
+
+# Python
+__pycache__/
+*.pyc

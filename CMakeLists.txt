@@ -32,10 +32,44 @@ target_link_libraries(kv-compact-api PUBLIC kv-compact-math)
 target_include_directories(kv-compact-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # OpenMP for parallel chunk processing (optional, graceful fallback)
-find_package(OpenMP)
+if(APPLE)
+    set(OpenMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../_deps/omp")  # unused but silences warnings
+    # Homebrew libomp on Apple Silicon — find_package won't find it, set manually
+    find_path(OMP_INCLUDE_DIR NAMES omp.h PATHS /opt/homebrew/opt/libomp/include /usr/local/opt/libomp/include)
+    find_library(OMP_LIBRARY NAMES omp libomp PATHS /opt/homebrew/opt/libomp/lib /usr/local/opt/libomp/lib)
+    if(OMP_INCLUDE_DIR AND OMP_LIBRARY)
+        set(OpenMP_CXX_FOUND TRUE)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp")
+        set(OpenMP_CXX_LIB_NAMES "omp")
+        set(OpenMP_omp_LIBRARY "${OMP_LIBRARY}")
+        add_library(OpenMP::OpenMP_CXX SHARED IMPORTED)
+        set_target_properties(OpenMP::OpenMP_CXX PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${OMP_INCLUDE_DIR}"
+            INTERFACE_COMPILE_OPTIONS "-Xpreprocessor;-fopenmp"
+            IMPORTED_LOCATION "${OMP_LIBRARY}"
+        )
+        message(STATUS "OpenMP found (Homebrew libomp) — parallel chunk processing enabled")
+    else()
+        set(OpenMP_CXX_FOUND FALSE)
+        message(STATUS "OpenMP not found — install with: brew install libomp")
+    endif()
+else()
+    find_package(OpenMP)
+endif()
 if(OpenMP_CXX_FOUND)
     target_link_libraries(kv-compact-api PUBLIC OpenMP::OpenMP_CXX)
     message(STATUS "OpenMP found — parallel chunk processing enabled")
+endif()
+
+# BLAS/LAPACK via Apple Accelerate (macOS) — Cholesky LS solve
+if(APPLE)
+    target_link_libraries(kv-compact-api PUBLIC "-framework Accelerate")
+    target_compile_definitions(kv-compact-api PUBLIC
+        KV_COMPACT_USE_BLAS=1
+        ACCELERATE_NEW_LAPACK=1
+        ACCELERATE_LAPACK_ILP64=1
+    )
+    message(STATUS "Apple Accelerate BLAS enabled — Cholesky LS solve (ILP64)")
 endif()
 
 if(KV_COMPACT_HIP)
@@ -59,6 +93,16 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(bench-quant-throughput tests/bench-quant-throughput.cpp)
     target_link_libraries(bench-quant-throughput PRIVATE kv-compact-api)
+
+    # Optimization validation benchmarks (paper-backed)
+    add_executable(bench-opt-expected-attention tests/bench-opt-expected-attention.cpp)
+    target_link_libraries(bench-opt-expected-attention PRIVATE kv-compact-api)
+
+    add_executable(bench-opt-snapkv-window tests/bench-opt-snapkv-window.cpp)
+    target_link_libraries(bench-opt-snapkv-window PRIVATE kv-compact-api)
+
+    add_executable(bench-opt-value-norm-filter tests/bench-opt-value-norm-filter.cpp)
+    target_link_libraries(bench-opt-value-norm-filter PRIVATE kv-compact-api)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----
@@ -104,6 +148,26 @@ if(KV_COMPACT_BUILD_TOOL)
     find_package(Threads REQUIRED)
     add_executable(bench-kv-compact-model tests/bench-kv-compact-model.cpp)
     target_link_libraries(bench-kv-compact-model PRIVATE
+        kv-compact-api
+        llama
+        common
+        ggml
+        Threads::Threads
+    )
+
+    # Code generation quality benchmark at scale
+    add_executable(bench-kv-compact-codegen tests/bench-kv-compact-codegen.cpp)
+    target_link_libraries(bench-kv-compact-codegen PRIVATE
+        kv-compact-api
+        llama
+        common
+        ggml
+        Threads::Threads
+    )
+
+    # Real-model optimization validation gate
+    add_executable(bench-opt-real-model tests/bench-opt-real-model.cpp)
+    target_link_libraries(bench-opt-real-model PRIVATE
         kv-compact-api
         llama
         common

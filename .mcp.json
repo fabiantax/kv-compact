@@ -3,6 +3,14 @@
     "arxiv": {
       "command": "uvx",
       "args": ["arxiv-mcp-server"]
+    },
+    "kato": {
+      "command": "/Users/fabian/.cargo/target/release/kato-mcp",
+      "args": [],
+      "env": {
+        "OLLAMA_HOST": "http://127.0.0.1:11434",
+        "LLAMACPP_HOST": "http://127.0.0.1:8080"
+      }
     }
   }
 }
