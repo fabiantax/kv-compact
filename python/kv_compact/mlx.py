@@ -303,3 +303,101 @@ def compact_and_generate(
     )
 
     return result
+
+
+def compact_and_generate_speculative(
+    model,
+    draft_model,
+    tokenizer,
+    prompt: str,
+    *,
+    max_tokens: int = 256,
+    target_ratio: float = 0.5,
+    num_draft_tokens: int = 3,
+    verbose: bool = False,
+    **generate_kwargs,
+) -> str:
+    """Prefill, compact the target model's cache, then generate with speculative decoding.
+
+    Speculative decoding uses a small draft model to propose tokens, which the
+    large target model verifies in a single forward pass. Combined with cache
+    compaction, this gives both memory savings AND faster generation.
+
+    Pipeline:
+      1. Prefill target model cache with full context
+      2. Compact target cache (attention-based selection + LS value refit)
+      3. Prefill draft model cache with same context (NOT compacted — it's tiny)
+      4. Generate using speculative decoding with both caches
+
+    Args:
+        model: Target (large) mlx-lm model
+        draft_model: Draft (small) mlx-lm model for speculation
+        tokenizer: Shared tokenizer
+        prompt: Input text
+        max_tokens: Max tokens to generate
+        target_ratio: KV cache compression ratio for target model
+        num_draft_tokens: Tokens the draft model proposes per step (default 3)
+        verbose: Print compaction stats
+        **generate_kwargs: Passed to mlx_lm.generate()
+
+    Returns:
+        Generated text string
+    """
+    from mlx_lm import generate as mlx_generate
+    from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache
+
+    import mlx.core as mx
+
+    tokens = mx.array(tokenizer.encode(prompt))[None]
+
+    # 1. Prefill target model
+    target_cache = make_prompt_cache(model)
+    model(tokens, cache=target_cache)
+    mx.eval([c.state for c in target_cache if hasattr(c, "state")])
+
+    if verbose:
+        seq_len = target_cache[0].offset if hasattr(target_cache[0], "offset") else "?"
+        print(f"Target model prefilled: {seq_len} tokens")
+
+    # 2. Compact target cache (the big one — this is where memory savings matter)
+    stats = compact_cache(model, target_cache, target_ratio=target_ratio, verbose=verbose)
+
+    if verbose:
+        print(
+            f"Target cache compacted: {stats.original_len} -> {stats.compacted_len} tokens "
+            f"({stats.elapsed_ms:.0f}ms, cos_sim={stats.avg_cosine_sim:.4f})"
+        )
+
+    # Verify target cache is trimmable (required for speculative decoding)
+    if not can_trim_prompt_cache(target_cache):
+        raise ValueError(
+            "Compacted target cache is not trimmable. "
+            "Speculative decoding requires trimmable caches (KVCache or QuantizedKVCache)."
+        )
+
+    # 3. Prefill draft model (NOT compacted — draft model is small, cache is cheap)
+    draft_cache = make_prompt_cache(draft_model)
+    draft_model(tokens, cache=draft_cache)
+    mx.eval([c.state for c in draft_cache if hasattr(c, "state")])
+
+    if verbose:
+        draft_len = draft_cache[0].offset if hasattr(draft_cache[0], "offset") else "?"
+        print(f"Draft model prefilled: {draft_len} tokens (not compacted)")
+
+    # 4. Combine caches: [target_layers..., draft_layers...]
+    #    mlx-lm's speculative_generate_step expects this layout
+    combined_cache = list(target_cache) + list(draft_cache)
+
+    # 5. Generate with speculative decoding
+    result = mlx_generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        draft_model=draft_model,
+        prompt_cache=combined_cache,
+        num_draft_tokens=num_draft_tokens,
+        **generate_kwargs,
+    )
+
+    return result

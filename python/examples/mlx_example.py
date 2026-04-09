@@ -16,6 +16,10 @@ Requirements:
 Usage:
   python examples/mlx_example.py --model mlx-community/Qwen3-8B-4bit
   python examples/mlx_example.py --model mlx-community/Llama-3.2-3B-Instruct-4bit --ratio 0.3
+
+  # With speculative decoding (compact + fast generation):
+  python examples/mlx_example.py --model mlx-community/Qwen3-8B-4bit \
+    --draft mlx-community/Qwen3-0.6B-4bit --ratio 0.5
 """
 
 import argparse
@@ -35,6 +39,10 @@ def main():
                         help="Max tokens to generate")
     parser.add_argument("--prompt", "-p", default=None,
                         help="Custom prompt (default: built-in long context)")
+    parser.add_argument("--draft", "-d", default=None,
+                        help="Draft model for speculative decoding (e.g. mlx-community/Qwen3-0.6B-4bit)")
+    parser.add_argument("--num-draft", type=int, default=3,
+                        help="Draft tokens per speculative step (default: 3)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -147,6 +155,31 @@ def main():
     if min_len > 0:
         matches = sum(1 for a, b in zip(full_tokens[:min_len], compact_tokens[:min_len]) if a == b)
         print(f"Token agreement (first {min_len}): {matches}/{min_len} ({matches/min_len:.1%})")
+
+    # === Speculative decoding with compacted cache ===
+    if args.draft:
+        from kv_compact.mlx import compact_and_generate_speculative
+
+        print(f"\n--- Compacted + speculative decoding (draft: {args.draft}) ---")
+        print(f"Loading draft model {args.draft}...")
+        draft_model, _ = load(args.draft)
+
+        t0 = time.perf_counter()
+        spec_output = compact_and_generate_speculative(
+            model, draft_model, tokenizer, prompt,
+            max_tokens=args.max_tokens,
+            target_ratio=args.ratio,
+            num_draft_tokens=args.num_draft,
+            verbose=args.verbose,
+        )
+        spec_time = time.perf_counter() - t0
+        print(f"Time: {spec_time:.1f}s")
+        print(f"Output: {spec_output[:200]}...")
+
+        print(f"\n--- Timing comparison ---")
+        print(f"  Full cache:                  {full_time:.1f}s")
+        print(f"  Compacted:                   {compact_time:.1f}s")
+        print(f"  Compacted + speculative:     {spec_time:.1f}s")
 
 
 if __name__ == "__main__":
