@@ -77,6 +77,34 @@ if(KV_COMPACT_HIP)
     target_compile_definitions(kv-compact-api PUBLIC KV_COMPACT_HIP)
 endif()
 
+# ---- Shared library for Python/FFI bindings ----
+option(KV_COMPACT_BUILD_SHARED "Build shared library for Python bindings" OFF)
+if(KV_COMPACT_BUILD_SHARED)
+    add_library(kv-compact-shared SHARED src/kv-compact-api.cpp)
+    target_link_libraries(kv-compact-shared PUBLIC kv-compact-math)
+    target_include_directories(kv-compact-shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(kv-compact-shared PROPERTIES
+        OUTPUT_NAME "kv-compact"
+        POSITION_INDEPENDENT_CODE ON
+    )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(kv-compact-shared PUBLIC OpenMP::OpenMP_CXX)
+    endif()
+    if(APPLE)
+        target_link_libraries(kv-compact-shared PUBLIC "-framework Accelerate")
+        target_compile_definitions(kv-compact-shared PUBLIC
+            KV_COMPACT_USE_BLAS=1
+            ACCELERATE_NEW_LAPACK=1
+            ACCELERATE_LAPACK_ILP64=1
+        )
+    endif()
+    if(KV_COMPACT_HIP)
+        target_link_libraries(kv-compact-shared PUBLIC kv-compact-hip)
+        target_compile_definitions(kv-compact-shared PUBLIC KV_COMPACT_HIP)
+    endif()
+    message(STATUS "Shared library enabled — python/kv_compact can use libkv-compact.so/.dylib")
+endif()
+
 # ---- Unit tests (standalone, no llama.cpp needed) ----
 if(KV_COMPACT_BUILD_TESTS)
     add_executable(test-kv-compact-math tests/test-kv-compact-math.cpp)
