@@ -4,9 +4,44 @@ project(kv-compact LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(KV_COMPACT_BUILD_TESTS "Build unit tests" ON)
-option(KV_COMPACT_BUILD_TOOL  "Build CLI tool (requires llama.cpp)" ON)
-option(KV_COMPACT_HIP         "Enable ROCm/HIP GPU acceleration" OFF)
+option(KV_COMPACT_BUILD_TESTS  "Build unit tests" ON)
+option(KV_COMPACT_BUILD_TOOL   "Build CLI tool (requires llama.cpp)" ON)
+option(KV_COMPACT_BUILD_SHARED "Build shared library for Python bindings" ON)
+option(KV_COMPACT_HIP          "Enable ROCm/HIP GPU acceleration (auto-detected if not set)" OFF)
+
+# ============================================================================
+# Platform auto-detection
+# ============================================================================
+
+# Auto-detect ROCm/HIP on Linux when not explicitly disabled
+if(NOT KV_COMPACT_HIP AND NOT APPLE)
+    find_program(_HIPCC hipcc PATHS /opt/rocm/bin ENV HIP_PATH)
+    if(_HIPCC)
+        set(KV_COMPACT_HIP ON)
+        message(STATUS "Auto-detected ROCm/HIP (hipcc found at ${_HIPCC})")
+    endif()
+endif()
+
+# Auto-detect GPU architecture via rocminfo
+if(KV_COMPACT_HIP AND NOT DEFINED KV_COMPACT_HIP_ARCH)
+    find_program(_ROCMINFO rocminfo PATHS /opt/rocm/bin)
+    if(_ROCMINFO)
+        execute_process(
+            COMMAND ${_ROCMINFO}
+            OUTPUT_VARIABLE _ROCMINFO_OUT
+            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        # Extract gfx architecture (e.g., gfx1151, gfx1100, gfx942)
+        string(REGEX MATCH "gfx[0-9a-z]+" KV_COMPACT_HIP_ARCH "${_ROCMINFO_OUT}")
+        if(KV_COMPACT_HIP_ARCH)
+            message(STATUS "Auto-detected GPU architecture: ${KV_COMPACT_HIP_ARCH}")
+        endif()
+    endif()
+    if(NOT KV_COMPACT_HIP_ARCH)
+        set(KV_COMPACT_HIP_ARCH "gfx1151")
+        message(STATUS "GPU architecture not detected, defaulting to ${KV_COMPACT_HIP_ARCH}")
+    endif()
+endif()
 
 # ---- Header-only math library (no dependencies) ----
 add_library(kv-compact-math INTERFACE)
@@ -21,8 +56,8 @@ if(KV_COMPACT_HIP)
     target_include_directories(kv-compact-hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(kv-compact-hip PUBLIC KV_COMPACT_HIP)
     target_link_libraries(kv-compact-hip PUBLIC roc::rocblas)
-    set_target_properties(kv-compact-hip PROPERTIES HIP_ARCHITECTURES "gfx1151")
-    message(STATUS "ROCm/HIP acceleration enabled (target: gfx1151 / RDNA 3.5)")
+    set_target_properties(kv-compact-hip PROPERTIES HIP_ARCHITECTURES "${KV_COMPACT_HIP_ARCH}")
+    message(STATUS "ROCm/HIP acceleration enabled (target: ${KV_COMPACT_HIP_ARCH})")
     message(STATUS "  rocBLAS: strided-batched GEMM for multi-head scoring + value refit")
 endif()
 
@@ -31,7 +66,9 @@ add_library(kv-compact-api STATIC src/kv-compact-api.cpp)
 target_link_libraries(kv-compact-api PUBLIC kv-compact-math)
 target_include_directories(kv-compact-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# OpenMP for parallel chunk processing (optional, graceful fallback)
+# ============================================================================
+# OpenMP — parallel chunk processing (optional, graceful fallback)
+# ============================================================================
 if(APPLE)
     set(OpenMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../_deps/omp")  # unused but silences warnings
     # Homebrew libomp on Apple Silicon — find_package won't find it, set manually
@@ -61,8 +98,11 @@ if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP found — parallel chunk processing enabled")
 endif()
 
-# BLAS/LAPACK via Apple Accelerate (macOS) — Cholesky LS solve
+# ============================================================================
+# BLAS/LAPACK — Cholesky least-squares solve
+# ============================================================================
 if(APPLE)
+    # macOS: Apple Accelerate (always available)
     target_link_libraries(kv-compact-api PUBLIC "-framework Accelerate")
     target_compile_definitions(kv-compact-api PUBLIC
         KV_COMPACT_USE_BLAS=1
@@ -70,6 +110,18 @@ if(APPLE)
         ACCELERATE_LAPACK_ILP64=1
     )
     message(STATUS "Apple Accelerate BLAS enabled — Cholesky LS solve (ILP64)")
+else()
+    # Linux: auto-detect OpenBLAS or system BLAS
+    find_package(BLAS QUIET)
+    find_package(LAPACK QUIET)
+    if(BLAS_FOUND AND LAPACK_FOUND)
+        target_link_libraries(kv-compact-api PUBLIC ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES})
+        target_compile_definitions(kv-compact-api PUBLIC KV_COMPACT_USE_BLAS=1)
+        message(STATUS "BLAS/LAPACK found — Cholesky LS solve enabled")
+        message(STATUS "  BLAS: ${BLAS_LIBRARIES}")
+    else()
+        message(STATUS "BLAS/LAPACK not found — using fallback LS solver (install: apt install libopenblas-dev)")
+    endif()
 endif()
 
 if(KV_COMPACT_HIP)
@@ -77,8 +129,9 @@ if(KV_COMPACT_HIP)
     target_compile_definitions(kv-compact-api PUBLIC KV_COMPACT_HIP)
 endif()
 
-# ---- Shared library for Python/FFI bindings ----
-option(KV_COMPACT_BUILD_SHARED "Build shared library for Python bindings" OFF)
+# ============================================================================
+# Shared library for Python/FFI bindings (enabled by default)
+# ============================================================================
 if(KV_COMPACT_BUILD_SHARED)
     add_library(kv-compact-shared SHARED src/kv-compact-api.cpp)
     target_link_libraries(kv-compact-shared PUBLIC kv-compact-math)
@@ -97,6 +150,9 @@ if(KV_COMPACT_BUILD_SHARED)
             ACCELERATE_NEW_LAPACK=1
             ACCELERATE_LAPACK_ILP64=1
         )
+    elseif(BLAS_FOUND AND LAPACK_FOUND)
+        target_link_libraries(kv-compact-shared PUBLIC ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES})
+        target_compile_definitions(kv-compact-shared PUBLIC KV_COMPACT_USE_BLAS=1)
     endif()
     if(KV_COMPACT_HIP)
         target_link_libraries(kv-compact-shared PUBLIC kv-compact-hip)
@@ -203,3 +259,39 @@ if(KV_COMPACT_BUILD_TOOL)
         Threads::Threads
     )
 endif()
+
+# ============================================================================
+# Configuration summary
+# ============================================================================
+message(STATUS "")
+message(STATUS "=== kv-compact build configuration ===")
+message(STATUS "  Platform:       ${CMAKE_SYSTEM_NAME} (${CMAKE_SYSTEM_PROCESSOR})")
+if(APPLE)
+    message(STATUS "  Accelerator:    Apple Metal / Accelerate BLAS")
+    message(STATUS "  Python target:  MLX (python/kv_compact/mlx.py)")
+elseif(KV_COMPACT_HIP)
+    message(STATUS "  Accelerator:    ROCm/HIP (${KV_COMPACT_HIP_ARCH})")
+    message(STATUS "  Python target:  llama.cpp + HIP")
+else()
+    message(STATUS "  Accelerator:    CPU only")
+endif()
+message(STATUS "  OpenMP:         ${OpenMP_CXX_FOUND}")
+if(BLAS_FOUND OR APPLE)
+    message(STATUS "  BLAS:           YES")
+else()
+    message(STATUS "  BLAS:           NO (fallback solver)")
+endif()
+message(STATUS "  Shared library: ${KV_COMPACT_BUILD_SHARED}")
+message(STATUS "  Tests:          ${KV_COMPACT_BUILD_TESTS}")
+message(STATUS "  CLI tool:       ${KV_COMPACT_BUILD_TOOL}")
+message(STATUS "")
+if(APPLE)
+    message(STATUS "  Quick start (macOS):")
+    message(STATUS "    cd python && pip install -e '.[mlx]'")
+    message(STATUS "    python examples/mlx_example.py -m mlx-community/Qwen3-8B-4bit")
+elseif(KV_COMPACT_HIP)
+    message(STATUS "  Quick start (ROCm):")
+    message(STATUS "    cd python && pip install -e .")
+    message(STATUS "    # Use libkv-compact.so via ctypes or llama-kv-compact CLI")
+endif()
+message(STATUS "")
