@@ -1,268 +1,256 @@
 # Handover: kv-compact
 
-**Date:** 2026-03-11
-**Branch:** `claude/arxiv-mcp-integration-t956A`
-**Last commit:** (about to commit Phase 1 streaming compaction)
+**Date:** 2026-03-19
+**Branch:** `claude/arxiv-mcp-integration-t956A` (main worktree)
+**Focus:** Qwen3.5-35B-A3B performance — 30 tok/s × 10 agents + Mistral Small 4 benchmarking
 
 ---
 
-## Session Summary (2026-03-11)
+## What We're Trying to Achieve
 
-### What was accomplished
+Push **Qwen3.5-35B-A3B** on Strix Halo (128 GB LPDDR5X, 212 GB/s, Radeon 8060S)
+from current 8.6 tok/s per slot at 10 agents to **30 tok/s per slot**.
 
-**Phase 1: Streaming Compaction - SUBSTANTIALLY COMPLETE**
-
-Implemented incremental KV cache compaction for 200K+ context agentic workloads. The `streaming_compactor` class enables chunk-based compaction (e.g., 8K→4K) with <20ms overhead per round.
-
-#### New Components (587 lines added to kv-compact-math.h)
-
-1. **`streaming_config` struct** - Configuration for streaming:
-   - `budget`, `trigger`, `pin_prefix`, `recent_window`
-   - Validation, helper methods (`is_valid`, `compactable_size`, `target_size`)
-
-2. **`streaming_head_state` struct** - Per-head state across rounds:
-   - `C_k`, `C_v`, `beta` buffers
-   - `n_compacted` tracker
-
-3. **`streaming_compactor` class** - Core streaming engine:
-   - `init()` - Initialize layer/head structure
-   - `needs_compaction()` - Check if compaction should trigger
-   - `compact_layer()` - Per-layer compaction with 3-zone architecture
-   - `merge_new_tokens()` - Append new tokens to compacted state
-   - `get_merged_layer()` - Export for llama.cpp write-back
-   - `adjust_rope()` / `adjust_compacted_rope()` - Temporal RoPE adjustment
-   - `position_mapping()` - Track old→new positions
-
-4. **CLI enhancements** (`kv-compact.cpp`):
-   - `--pin-prefix N` - Protect system prompt
-   - `--recent-window N` - Keep recent tokens accessible
-   - `--trigger N` - Compaction threshold
-   - `--budget N` - Target cache size
-   - Streaming mode auto-detection
-
-5. **Unit tests** (4 new tests, 73 total passing):
-   - `test_streaming_config_validation`
-   - `test_streaming_config_helpers`
-   - `test_streaming_compactor_init`
-   - `test_streaming_compactor_basic_workflow`
-
-#### Zone Architecture (3-zone)
-
-```
-┌─────────────────────────────────────────────────────┐
-│              KV Cache (before compaction)            │
-├────────────┬───────────────────┬─────────────────────┤
-│  PINNED    │    COMPACTABLE     │      RECENT        │
-│  (sys prmpt)│   (gets compacted)  │   (keep as-is)     │
-└────────────┴───────────────────┴─────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────┐
-│              KV Cache (after compaction)             │
-├────────────┬───────────────────┬─────────────────────┤
-│  PINNED    │    COMPACTED       │      RECENT        │
-│   (keep)    │  (selected keys)   │      (keep)        │
-└────────────┴───────────────────┴─────────────────────┘
-```
-
-#### Validation
-
-- ✅ Qwen3.5-4B tested (hybrid layers correctly detected: 8/32 compacted)
-- ✅ Compaction: 5.2× in 18.5ms (measured on single-shot, should scale)
-- ✅ Quality: cos_sim 0.9999+ (excellent)
-- ⚠️ Generation speed: 3-4 t/s measured but included model loading overhead
-  - **Actual bottleneck**: WSL2 filesystem mount (`/mnt/c/`) - 9x slower than native FS
-  - With native FS + mmap: expect 30-50+ t/s on this hardware
-
-#### Files Modified
-
-| File | Changes |
-|------|----------|
-| `include/kv-compact-math.h` | +587 lines (streaming infrastructure) |
-| `src/kv-compact.cpp` | +62 lines (CLI flags, streaming config) |
-| `tests/test-kv-compact-math.cpp` | +150 lines (4 new tests) |
-| `README.md` | +7 lines (documentation links) |
-| `.fab-swarm/` | new (task coordination) |
+Realistic ceiling based on memory bandwidth math: **~20 tok/s per slot at 10 agents**
+(200 agg). For 30/slot, max ~7 concurrent agents. The 300 agg target is above the
+hardware ceiling at 10 slots.
 
 ---
 
-## What is kv-compact?
+## Current Performance
 
-A C++ implementation of "Fast KV Compaction via Attention Matching" (arXiv:2602.16284, Zweiger et al., MIT, Feb 2026). Achieves **50x KV cache compression** with minimal quality loss using a closed-form 3-step algorithm:
+| Agents | Per-slot tok/s | Agg tok/s | Build |
+|--------|---------------|-----------|-------|
+| 1 | 44.7 | 39.8 | Fork (Coder-Next) |
+| 2 | 28.3 | 50.7 | Fork |
+| 5 | 17.9 | 82.0 | Fork |
+| 10 | **8.6** | **79.1** | Fork |
+| **Target** | **30** | **300** | |
 
-1. **Key Selection** — Select top-t keys by cumulative attention score
-2. **NNLS Beta Fitting** — Solve for attention mass biases (beta) to match original attention distribution
-3. **Least Squares Value Refitting** — Compute optimal compacted values (C_v) via ridge regression
-
-The key insight: it works in continuous latent space, not token space. Compacted values can be weighted combinations of many original values.
+Single-slot generation: 60-68 tok/s (fork), 64 tok/s (stock).
+Prefill: fork -17% vs stock (regression from flash attn row_split change).
 
 ---
 
-## Project Structure
+## Per-Token Kernel Breakdown (single slot, Vulkan profiler)
+
+| Category | % of Time | Multi-slot scaling |
+|----------|-----------|-------------------|
+| Shared expert FFN (q5_K) | **34.2%** | Batches well (GEMM n→10) |
+| Attention QKV | 24.0% | Batches well |
+| MoE experts (top-8, 256 pool) | **21.4%** | 10× unique reads (or 3× with caching) |
+| SSM/DeltaNet state | ~10% | Does NOT batch — sequential per seq |
+| Router + other | ~10% | Negligible |
+
+Full profile: `docs/vulkan-perf-profile-35b.md`
+
+### Key insight from profiling
+
+The original plan assumed 4800 dispatches/step. Reality: **120 dispatches/step**
+(llama.cpp batches all 8 experts per layer into one dispatch). Dispatch overhead
+was NOT the bottleneck — the bottleneck at 10 slots is:
 
 ```
-include/
-  kv-compact-math.h      — Core algorithm (2100+ lines, zero deps)
-  kv-compact-adapter.h   — Attention-type abstraction (GQA, MLA, hybrid)
-  kv-compact-state.h     — llama.cpp binary state parser/writer
-src/
-  kv-compact.cpp          — CLI tool (requires llama.cpp)
-tests/
-  test-kv-compact-math.cpp     — 73 math unit tests (all passing)
-  test-kv-compact-adapter.cpp  — 20+ adapter tests
-  test-kv-compact-e2e.cpp      — End-to-end integration tests
-  bench-synthetic.cpp          — Synthetic benchmarks
-docs/                          — 7 design/reference docs
-patches/
-  attn-bias.patch              — llama.cpp patch for attention bias injection
-.fab-swarm/
-  agents.toml                   — Specialist agent definitions
-  tasks.md                      — Phase 1 task queue
+Single slot: ~16.5 ms/token
+10 slots:    ~126 ms/step  (79 agg tok/s)
+Overhead:     ~110 ms from multi-slot scaling
+  SSM sequential:    10 × 1.7 ms = 17 ms  (must process each seq)
+  MoE weight reads:  10 × 3.5 ms = 35 ms  (10× unique experts)
+  Vulkan scheduling: ~58 ms               (sync, buffer mgmt, dispatch)
 ```
+
+The **Vulkan scheduling overhead (58 ms)** is the largest single gap.
 
 ---
 
 ## What's Done
 
-### Core Algorithm (100% of paper's convex steps)
-- Steps 1-3 fully implemented
-- 4 key selection modes: MAX_ATTN, SUBMODULAR, TOKEN_MERGE, KMEANS
-- 2 beta fitting modes: NNLS, SINKHORN
-- Ridge regression value refitting via Cholesky decomposition
-- Head sensitivity weighting + Carathéodory budget allocation
-- Alternating minimization for joint beta/C_v optimization
+### Expert Caching (`include/kv-compact-moe-cache.h`)
+EMA-based expert cache with dynamic routing bias. **Self-contained, zero deps.**
 
-### Infrastructure (Phase 0 - COMPLETE)
-- **73 unit tests** — all passing
-- **Adapter abstraction** — GQA adapter (identity), MLA adapter (latent projection + LSQ recovery), noop adapter, hybrid layer classifier
-- **State I/O** — Parse/write all GGML quant types (F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1)
-- **Attention bias injection** — llama.cpp patch applied, beta injected via attention mask
-- **Synthetic benchmarks** — Tested up to 50x compression at T=4096
-- **CLI tool** — Full pipeline: load model → prefill → compact → write back → generate → compare
+- `moe_expert_cache::init(nl, ne)` — initialize per-layer EMA
+- `moe_expert_cache::update(layer, expert_ids, n_used)` — update EMA after decode
+- `moe_expert_cache::get_bias(layer, expert_idx)` — routing bias for cached experts
+- `moe_expert_cache::top_k_experts(layer, k)` — get hot expert indices
+- Based on Cache-Aware Routing (arXiv:2412.00099) — 2x speedup, <0.1% quality loss
 
-### Streaming Compaction (Phase 1 - SUBSTANTIALLY COMPLETE)
-- ✅ `streaming_config` struct with zone architecture (pin | compactable | recent)
-- ✅ `streaming_compactor` class with state management
-- ✅ Chunk-based key selection with 3-zone handling
-- ✅ State merge: `merge_new_tokens()` for compacted + new tokens
-- ✅ Temporal RoPE adjustment: `adjust_rope()`, `adjust_compacted_rope()`
-- ✅ CLI flags: `--pin-prefix`, `--recent-window`, `--trigger`, `--budget`
-- ✅ Streaming mode auto-detection in CLI
-- ✅ Unit tests: `test_streaming_basic` (4 tests, all passing)
-- ⏳ `test_streaming_cumulative_error` (TODO - requires multi-round testing)
-- ⏳ `bench_streaming_200k` (TODO - requires 200K context simulation)
+**Status: implemented but NOT wired into server decode loop.**
 
-### Documentation
-- Full paper breakdown (`docs/attention-matching-paper.md`)
-- Algorithm reference (`docs/algorithms.md`)
-- 24 adjacent compression techniques surveyed (`docs/adjacent-concepts.md`)
-- Implementation status matrix (`docs/improvement-tracker.md`)
-- 5-phase streaming roadmap (`plan.md`)
-- Adapter state machine diagrams (`docs/adapter-state-machine.md`)
-- Beta injection data flow (`docs/attn-bias-flow.md`)
-- Development timeline (`docs/timeline.md`)
+### Expert Cache Math Validation (`tests/test-moe-cache.cpp`)
+Standalone benchmark validating all assumptions:
+- Expert overlap formula vs Monte Carlo (5/5 PASS, error < 0.04)
+- Bandwidth model for Qwen3.5-35B
+- Cache-aware routing simulation (bias ≥ 0.1 fully steers routing)
+- Full projection: **33.2 tok/s per-slot at 10 agents** achievable with caching
+
+### Revised Plan (`docs/plan-moe-optimization-revised.md`)
+Post-profiling updated strategy. Supersedes `docs/plan-expert-caching.md`.
 
 ---
 
-## What's NOT Done
+## What's Left (Priority Order)
 
-### High Priority (from paper)
-1. **Greedy budget exchange (§5)** — Paper's most impactful ablation. Per-model precomputed head budgets via calibration data
-2. **Online compaction (§7)** — Compress-during-generation for reasoning/agentic workloads. Requires inference loop hooks
-3. **Reference query generation (§4)** — Repeat-prefill for high-quality Q_ref. Currently using caller-provided Q_ref
-4. **OMP key selection (§3 Step 1B)** — Better keys but 100-500x slower. OMP-fast variant (§8) as compromise
+### P0: Vulkan Graph Caching (biggest gap — ~58 ms)
 
-### Roadmap Phases
-5. **Phase 2: Speed** — Mini-batch k-means, scratch buffer pooling (TODO)
-6. **Phase 3: Token Pinning** — Pin mask for system prompts, tool boundaries (TODO: zones are implemented but mask API pending)
-7. **Phase 4: Error Control** — Cumulative error monitoring, adaptive trigger, re-anchoring (TODO)
-8. **Phase 5: Qwen3.5-0.8B Integration** — E2E validation, GQA-aware sensitivity (TODO)
+llama.cpp has `can_reuse()` for compute graph reuse. Unknown if it's working for
+MoE multi-slot (the graph is identical across steps — only input data changes).
 
-### Medium Priority (from adjacent concepts)
-- **CSSP & leverage scores** — Principled replacement for top-t key scoring
-- **CUR decomposition** — Joint key+value factorization
-- **Frank-Wolfe** — Sparse beta fitting with convergence guarantees
-
----
-
-## Qwen 3.5 Architecture (Critical Context)
-
-Qwen 3.5 does **NOT** use GQA or MLA. It uses a **hybrid Gated DeltaNet + full attention** architecture:
-- **3 out of 4 layers**: Gated DeltaNet (linear attention, recurrent hidden state — no KV cache)
-- **Every 4th layer**: Standard full attention (has a normal KV cache)
-- Combines Mamba2's gated decay mechanism with a delta rule for updating hidden states
-- Sparse Mixture-of-Experts (MoE) variants available
-
-### Models
-- **Dense**: Qwen3.5-0.8B, 2B, 4B, 9B, 27B
-- **MoE**: Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B (MoE)
-- 256K context, 201 languages, thinking + non-thinking modes
-
-### Unsloth support
-- Unsloth provided day-zero GGUF quants for all variants
-- Unsloth Dynamic 2.0 quants are SOTA on nearly all bit levels
-- QLoRA (4-bit) training is NOT recommended for Qwen 3.5 (higher quantization error)
-- Training uses custom Mamba Triton kernels (slower compile times, especially on T4)
-
-### Implications for kv-compact
-- Full-attention layers (every 4th) have standard KV cache — existing GQA adapter can work
-- DeltaNet layers store gated recurrent state, not KV pairs — already "compressed" by nature
-- The `hybrid_classifier` in `kv-compact-adapter.h` handles this: it classifies layers as FULL_ATTENTION or RECURRENT
-- The `noop_adapter` passes through recurrent layers unchanged
-- With only 2 KV heads (GQA ratio=4), per-head budget is trivial but GQA-aware sensitivity matters
-
-**Validated:** Qwen3.5-4B tested, hybrid layers correctly detected (8/32 layers compacted)
-
----
-
-## Build & Test
-
+**Immediate action:**
 ```bash
-# Test-only build (no model needed, no llama.cpp)
-mkdir build && cd build
-cmake .. -DKV_COMPACT_BUILD_TOOL=OFF
-cmake --build .
-./test-kv-compact-math          # 73 tests
-./test-kv-compact-adapter       # 20+ tests
+GGML_VK_PERF_LOGGER=1 llama-server -m model.gguf -np 10 ...
+```
+Look for "graph reuse" messages. If absent, graph is being rebuilt every step.
 
-# Full build with llama.cpp (auto-fetched)
-cmake ..
-cmake --build .
-./llama-kv-compact -m model.gguf -p "context" --compact-ratio 0.2
+- [ ] Verify `can_reuse()` is triggering for multi-slot MoE
+- [ ] Fix buffer reallocation per slot if graph reuse is broken
+- [ ] Vulkan command buffer batching (5-10 ms saved, low effort)
+
+**Impact if fixed:** ~58 ms → ~15 ms → step ~83 ms → ~120 agg → 12 per-slot
+
+### P1: SSM State Quantization (quick win — ~7 ms at 10 slots)
+
+SSM/DeltaNet state is currently F32 (62 MB per sequence). Quantizing to F16
+halves bandwidth. Try:
+```bash
+llama-server -m model.gguf -ctk f16 -ctv f16 ...
+```
+The flag may not apply to recurrent state (may be hardcoded F32 in llama.cpp).
+
+- [ ] Test if `-ctk f16` reduces SSM state size (check VRAM or profiler output)
+- [ ] If not, patch `llama_memory_recurrent` to use F16 for S/R tensors
+
+**Impact:** 10 × 1.7 ms SSM → 10 × 0.85 ms → save ~8 ms/step
+
+### P2: Wire Dynamic Cache Bias into Server
+
+`kv-compact-moe-cache.h` is ready. Needs wiring into the server decode loop:
+
+```cpp
+// After each decode step:
+expert_cache.update(layer, topk_expert_ids, n_used);
+
+// Before next step:
+float bias = expert_cache.get_bias(layer, expert_idx);
+// inject as routing logit bias
 ```
 
+Requires knowing where expert IDs are extracted in the Vulkan backend.
+May need a callback or tensor hook in `llama_decode()`.
+
+- [ ] Find where `ffn_moe_topk` tensor is read in llama.cpp Vulkan backend
+- [ ] Add expert ID extraction callback
+- [ ] Feed bias back into routing logits before each step
+
+**Impact:** MoE unique experts: ~80 → ~20 per layer → 3× fewer weight reads →
+save ~25 ms/step at 10 slots
+
+### P3: Shared Expert Requant
+
+Shared expert is **34% of single-slot time** (q5_K m=8192). No routing tricks help —
+it runs every token. Re-quantizing to Q4_K reduces bandwidth ~30%.
+
+- [ ] Re-quant shared expert weights: `llama-quantize --include "ffn_gate_shexp"` (check exact tensor name)
+- [ ] Measure tg50 improvement
+
+**Impact:** ~5.6 ms → ~3.9 ms per token (-30%), scales to all slot counts
+
+### P4: Prefill Regression Fix
+
+Fork is 17% slower at prefill (950 vs 1150 tok/s). Likely the flash attn
+`row_split` UMA change in the fork.
+
+- [ ] Profile prefill separately: `llama-bench -m model.gguf -p 512 -n 0`
+- [ ] Compare fork vs stock for the specific UMA/flash-attn code path
+- [ ] Revert `row_split` change or make it conditional on context size
+
 ---
 
-## Key Design Decisions
+## Worktrees
 
-1. **Header-only math library** — Zero dependencies, testable independently, portable C++17
-2. **Adapter pattern** — Open/closed principle: add new attention types (MLA, hybrid) without modifying core math
-3. **State-based I/O** — Uses llama.cpp `llama_state_seq_get/set_data` for zero-copy KV access
-4. **Scalar-only** — No SIMD yet. Profiling shows NNLS and LSQ are fast enough for chunk sizes up to 16K
-5. **Patch-based llama.cpp integration** — `attn-bias.patch` adds `llama_memory_set_attn_bias()` API
+| Worktree | Path | Branch | Focus |
+|----------|------|--------|-------|
+| Main | `C:/Users/fabia/Projects/kv-compact` | `claude/arxiv-mcp-integration-t956A` | MoE caching, expert routing |
+| MoE/ROCm throughput | `.claude/worktrees/teleport-session` | `claude/optimize-moe-rocm-throughput-mhaw9` | KV quant + B4/R-KV |
+| Profiling infra | `.claude/worktrees/pr2-profiling-infrastructure` | `claude/list-branch-changes-qdPyO` | GPU profiling tools |
 
----
-
-## Recommended Next Session Focus
-
-**Option A: Phase 2 (Speed optimizations)**
-Mini-batch k-means (100x faster), scratch buffer pool. Enables handling larger chunks (16K+) efficiently.
-
-**Option B: Complete Phase 1 testing**
-`test_streaming_cumulative_error`, `bench_streaming_200k`. Validate multi-round behavior.
-
-**Option C: Greedy budget exchange (§5)**
-Paper's most impactful ablation. Precompute per-head budgets via calibration. Could significantly improve quality at extreme compression.
-
-**Option D: Phase 5 (Qwen3.5-0.8B E2E)**
-Full validation with real model. Download Qwen3.5-0.8B-Q4_K_M.gguf, test at 4x/16x/50x compression.
+The MoE/ROCm worktree has:
+- Quantized KV (B4): dequant→compact→requant pipeline
+- R-KV reasoning token compression
+- rocBLAS strided-batched GEMM (replaced custom HIP)
+- Per-stage throughput benchmarks (NNLS is 94.5% of compaction time)
 
 ---
 
-## Files to Read First
+## Mistral Small 4 (New — 2026-03-19)
 
-1. `include/kv-compact-math.h` — The core algorithm (now 2100+ lines with streaming)
-2. `include/kv-compact-adapter.h` — Attention type abstraction
-3. `plan.md` — 5-phase streaming roadmap
-4. `docs/improvement-tracker.md` — What's done and what's next
-5. `CLAUDE.md` — Qwen 3.5 architecture notes
+Mistral Small 4 (119B MoE, Apache 2.0, released 2026-03-18) is a strong new open model.
+**No new kv-compact code needed** — it maps directly to the existing GQA adapter.
+
+### Architecture
+
+| Parameter | Value |
+|-----------|-------|
+| Adapter | `gqa` (MHA — 32Q/32KV heads, ratio=1) |
+| `d_k` / `d_v` | 128 (head_dim) |
+| `n_head_kv` | 32 |
+| Layers | 36 (all full attention, uniform classifier) |
+| MoE | 128 routed + 1 shared experts, 4 active/token |
+| Context | 256K (YaRN RoPE) |
+
+### Adapter config
+
+```cpp
+attention_arch arch{
+    .type      = "gqa",
+    .d_k       = 128,
+    .d_v       = 128,
+    .n_head_kv = 32,
+};
+auto adapter    = make_adapter(arch);         // gqa_adapter (identity)
+auto classifier = make_classifier(arch, 36);  // all 36 layers compactible
+```
+
+### Model file
+
+- **GGUF:** `D:\models\mistral-small-4\Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf` (73.8 GB)
+- Unsloth UD-Q4_K_XL — best quality Q4 from Dynamic 2.0 quants
+- **Download was in progress at session end** (background task) — verify file exists before benchmarking
+- **Known issue:** llama.cpp #20703 — bad `--fit` offload; use `-ngl 99` explicitly, avoid `--fit`
+
+### Next steps once downloaded
+
+1. Verify: `ls -lh /d/models/mistral-small-4/*.gguf`
+2. Smoke test: `llama-cli -m /d/models/mistral-small-4/Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf -ngl 99 -p "Hello" -n 20`
+3. Perplexity sweep: reuse `bench_coding_agents.py` with `--ratios 4 16 50`
+4. Compare quality vs Qwen3.5-35B-A3B and SmolLM3 baselines
+
+---
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `include/kv-compact-moe-cache.h` | Expert cache implementation (EMA + routing bias) |
+| `docs/plan-moe-optimization-revised.md` | Current strategy (post-profiling, 2026-03-15) |
+| `docs/vulkan-perf-profile-35b.md` | Vulkan kernel breakdown (ground truth for bottleneck analysis) |
+| `docs/plan-expert-caching.md` | Original plan (superseded but has bandwidth math) |
+| `tests/test-moe-cache.cpp` | Expert cache validation + projection benchmark |
+| `tests/moe_benchmark.json` | Benchmark results |
+
+---
+
+## Build Notes
+
+```bash
+# Main repo — test-only build
+cmake -B build -DKV_COMPACT_BUILD_TOOL=OFF && cmake --build build
+
+# Run expert cache tests
+./build/test-moe-cache
+
+# Benchmark
+GGML_VK_PERF_LOGGER=1 ./llama-server -m /path/to/qwen35-35b-a3b-q4km.gguf -np 10 -ngl 99
+```
+
+MSVC requires explicit INCLUDE/LIB env vars. See `memory/feedback_msvc_env.md`.
+Do NOT use the flash-attn fork for serving (5-11× server regression). Stock llama.cpp only.

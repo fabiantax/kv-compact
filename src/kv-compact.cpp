@@ -321,9 +321,8 @@ int main(int argc, char ** argv) {
 
     // Sublinear optimization parameters (Phase 2)
     bool use_optimized = false;
-    std::string compaction_method = "baseline";  // baseline, l2, hybrid
+    std::string compaction_method = "baseline";  // baseline, l2
     bool enable_early_stop = false;
-    bool enable_layer_budget = false;
 
     // Pre-parse custom args and strip them before common_params_parse
     // (common_params_parse rejects unknown flags)
@@ -359,8 +358,6 @@ int main(int argc, char ** argv) {
                 use_optimized = true; consumed = true;
             } else if (strcmp(argv[i], "--early-stop") == 0) {
                 enable_early_stop = true; consumed = true;
-            } else if (strcmp(argv[i], "--layer-budget") == 0) {
-                enable_layer_budget = true; consumed = true;
             }
         }
         if (!consumed) {
@@ -397,9 +394,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // --optimized enables l2 + early-stop
+    if (use_optimized) {
+        if (compaction_method == "baseline") compaction_method = "l2";
+        enable_early_stop = true;
+    }
+
+    if (compaction_method == "l2" && !use_original_v) {
+        LOG_WRN("L2 method with C_v fitting (no --use-original-v) not yet supported, falling back to baseline\n");
+        compaction_method = "baseline";
+    }
+
     // Validate optimization parameters
-    if (compaction_method != "baseline" && compaction_method != "l2" && compaction_method != "hybrid") {
-        LOG_ERR("Invalid method: %s (must be baseline, l2, or hybrid)\n", compaction_method.c_str());
+    if (compaction_method != "baseline" && compaction_method != "l2") {
+        LOG_ERR("Invalid method: %s (must be baseline or l2)\n", compaction_method.c_str());
         return 1;
     }
 
@@ -409,7 +417,7 @@ int main(int argc, char ** argv) {
 
     // Log optimization config if any optimization flag was used
     bool use_optimizations = (use_optimized || compaction_method != "baseline" ||
-                              enable_early_stop || enable_layer_budget);
+                              enable_early_stop);
 
     if (use_streaming) {
         LOG_INF("Streaming mode ENABLED: budget=%d, trigger=%d, pin=%d, recent=%d\n",
@@ -417,10 +425,9 @@ int main(int argc, char ** argv) {
     }
 
     if (use_optimizations) {
-        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s, layer_budget=%s\n",
+        LOG_INF("Optimization mode ENABLED: method=%s, early_stop=%s\n",
                 compaction_method.c_str(),
-                enable_early_stop ? "ON" : "OFF",
-                enable_layer_budget ? "ON" : "OFF");
+                enable_early_stop ? "ON" : "OFF");
     }
 
     // Construct streaming_config
@@ -711,54 +718,86 @@ int main(int argc, char ** argv) {
     // Per-head importance: [total_heads][T] — max attn weight per token
     std::vector<std::vector<float>> per_head_importance(total_heads);
 
-    for (uint32_t l = 0; l < sd.n_layer; l++) {
-        const auto & ld = sd.layers[l];
-        lh_cache[l].resize(n_head_kv);
+    if (compaction_method == "l2") {
+        // L2 importance scoring: skip attention computation, saves memory
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
 
-        for (int h = 0; h < n_head_kv; h++) {
-            auto & hc = lh_cache[l][h];
-            hc.scores.resize(n_ref_queries * T);
-            hc.exp_scores.resize(n_ref_queries * T);
-            hc.row_sums.resize(n_ref_queries);
-            hc.attn_weights.resize(n_ref_queries * T);
+            for (int h = 0; h < n_head_kv; h++) {
+                // Extract per-head K and Q_ref
+                std::vector<float> K_h(T * d_k), Q_h(n_ref_queries * d_k);
+                for (int i = 0; i < T; i++)
+                    memcpy(K_h.data() + i * d_k,
+                           ld.K.data() + i * n_embd_k_gqa + h * d_k,
+                           d_k * sizeof(float));
+                for (int qi = 0; qi < n_ref_queries; qi++)
+                    memcpy(Q_h.data() + qi * d_k,
+                           ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k,
+                           d_k * sizeof(float));
 
-            // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
-            for (int qi = 0; qi < n_ref_queries; qi++) {
-                const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
-                for (int ki = 0; ki < T; ki++) {
-                    const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
-                    float dot = 0.0f;
-                    for (int d = 0; d < d_k; d++) {
-                        dot += q_row[d] * k_row[d];
-                    }
-                    hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
-                }
+                auto importance = kvcompact::optimized::FastImportanceEstimator::estimate_importance_l2(
+                    K_h.data(), Q_h.data(), T, n_ref_queries, d_k);
+
+                int head_idx = l * n_head_kv + h;
+                per_head_importance[head_idx].resize(T);
+                for (int j = 0; j < T; j++)
+                    per_head_importance[head_idx][j] = (float)importance[j];
             }
 
-            // exp and softmax
-            memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  L2-scored %u / %u layers\n", l + 1, sd.n_layer);
+            }
+        }
+    } else {
+        for (uint32_t l = 0; l < sd.n_layer; l++) {
+            const auto & ld = sd.layers[l];
+            lh_cache[l].resize(n_head_kv);
 
-            memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
-            softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+            for (int h = 0; h < n_head_kv; h++) {
+                auto & hc = lh_cache[l][h];
+                hc.scores.resize(n_ref_queries * T);
+                hc.exp_scores.resize(n_ref_queries * T);
+                hc.row_sums.resize(n_ref_queries);
+                hc.attn_weights.resize(n_ref_queries * T);
 
-            // Per-key max attention weight across queries
-            int head_idx = l * n_head_kv + h;
-            per_head_importance[head_idx].resize(T);
-            for (int j = 0; j < T; j++) {
-                float max_w = 0.0f;
+                // Compute scores: Q_ref_h @ K_h^T / sqrt(d_k)
                 for (int qi = 0; qi < n_ref_queries; qi++) {
-                    float w = hc.attn_weights[qi * T + j];
-                    if (w > max_w) max_w = w;
+                    const float * q_row = ld.K.data() + (ref_start + qi) * n_embd_k_gqa + h * d_k;
+                    for (int ki = 0; ki < T; ki++) {
+                        const float * k_row = ld.K.data() + ki * n_embd_k_gqa + h * d_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < d_k; d++) {
+                            dot += q_row[d] * k_row[d];
+                        }
+                        hc.scores[qi * T + ki] = dot * inv_sqrt_dk;
+                    }
                 }
-                per_head_importance[head_idx][j] = max_w;
+
+                // exp and softmax
+                memcpy(hc.exp_scores.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                exp_rows_stable(hc.exp_scores.data(), hc.row_sums.data(), n_ref_queries, T);
+
+                memcpy(hc.attn_weights.data(), hc.scores.data(), n_ref_queries * T * sizeof(float));
+                softmax_rows(hc.attn_weights.data(), n_ref_queries, T);
+
+                // Per-key max attention weight across queries
+                int head_idx = l * n_head_kv + h;
+                per_head_importance[head_idx].resize(T);
+                for (int j = 0; j < T; j++) {
+                    float max_w = 0.0f;
+                    for (int qi = 0; qi < n_ref_queries; qi++) {
+                        float w = hc.attn_weights[qi * T + j];
+                        if (w > max_w) max_w = w;
+                    }
+                    per_head_importance[head_idx][j] = max_w;
+                }
+            }
+
+            if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
+                LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
             }
         }
-
-        if ((l + 1) % 8 == 0 || l + 1 == sd.n_layer) {
-            LOG_INF("  Scored %u / %u layers\n", l + 1, sd.n_layer);
-        }
-    }
+    } // end if (compaction_method == "l2") else
 
     {
         auto t_now = std::chrono::high_resolution_clock::now();
@@ -1049,7 +1088,8 @@ int main(int argc, char ** argv) {
             }
 
             std::vector<float> w(t);
-            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t);
+            float nnls_tol = enable_early_stop ? 1e-3f : 0.0f;
+            nnls_solve(M.data(), hc.row_sums.data(), w.data(), n_ref_queries, t, 200, nnls_tol);
 
             for (int j = 0; j < t; j++) {
                 beta[j] = logf(std::max(1e-12f, w[j]));

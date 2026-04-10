@@ -174,3 +174,313 @@ void llama_memory_set_attn_bias(\
 fi
 
 echo "Attention bias patch applied successfully!"
+
+# ============================================================================
+# ============================================================================
+#
+# PART 2: Cache-Aware MoE Expert Routing
+#
+# Adds dynamic routing bias to build_moe_ffn() that nudges the router toward
+# recently-used experts, reducing effective memory bandwidth without retraining.
+# Paper: "Cache-Aware Routing" (2412.00099)
+#
+# ============================================================================
+# ============================================================================
+
+echo ""
+echo "Applying MoE cache-aware routing patch to: $LLAMA_DIR"
+
+# ============================================================================
+# 7. include/llama.h — add moe_cache_aware bool to llama_context_params
+# ============================================================================
+
+if grep -q 'moe_cache_aware' "$LLAMA_H"; then
+    echo "  llama.h (MoE): already patched, skipping"
+else
+    echo "  Patching llama.h (MoE cache-aware routing)..."
+
+    # Add moe_cache_aware bool after kv_unified
+    sed -i '/bool kv_unified;/a\
+        bool moe_cache_aware; \/\/ enable cache-aware MoE expert routing (EMA-based bias)' "$LLAMA_H"
+
+    echo "  llama.h (MoE): done"
+fi
+
+# ============================================================================
+# 8. llama-context.cpp — add moe_cache_aware = false to default params
+# ============================================================================
+
+if grep -q 'moe_cache_aware' "$CONTEXT_CPP"; then
+    echo "  llama-context.cpp (MoE defaults): already patched, skipping"
+else
+    echo "  Patching llama-context.cpp (MoE default params)..."
+
+    # Add moe_cache_aware default after kv_unified default
+    sed -i '/\/\*\.kv_unified.*=\*\//a\
+        /*.moe_cache_aware              =*/ false,' "$CONTEXT_CPP"
+
+    echo "  llama-context.cpp (MoE defaults): done"
+fi
+
+# ============================================================================
+# 9. llama-context.h — add moe_expert_cache member struct and instance
+# ============================================================================
+CONTEXT_H="$LLAMA_DIR/src/llama-context.h"
+
+if grep -q 'moe_expert_cache' "$CONTEXT_H"; then
+    echo "  llama-context.h (MoE): already patched, skipping"
+else
+    echo "  Patching llama-context.h (MoE expert cache)..."
+
+    # Add the moe_expert_cache struct definition before struct llama_context
+    sed -i '/^struct llama_context {/i\
+// Cache-Aware MoE Expert Routing (2412.00099)\
+// Tracks per-layer expert usage via EMA and provides routing bias.\
+struct moe_expert_cache {\
+    bool  enabled        = false;\
+    int   n_layers       = 0;\
+    int   n_experts      = 0;\
+    int   cache_size     = 32;\
+    float alpha          = 0.1f;\
+    float bias_strength  = 0.3f;\
+\
+    std::vector<std::vector<float>> ema;\
+\
+    void init(int nl, int ne) {\
+        n_layers  = nl;\
+        n_experts = ne;\
+        ema.resize(nl);\
+        for (int l = 0; l < nl; l++) {\
+            ema[l].assign(ne, 0.0f);\
+        }\
+        enabled = true;\
+    }\
+\
+    void update(int layer, const int32_t * expert_ids, int n_used) {\
+        auto \& e = ema[layer];\
+        const float decay = 1.0f - alpha;\
+        for (int i = 0; i < n_experts; i++) {\
+            e[i] *= decay;\
+        }\
+        for (int i = 0; i < n_used; i++) {\
+            const int eid = expert_ids[i];\
+            if (eid >= 0 \&\& eid < n_experts) {\
+                e[eid] += alpha;\
+            }\
+        }\
+    }\
+\
+    void compute_bias(int layer, float * out_bias) const {\
+        const auto \& e = ema[layer];\
+        std::vector<float> sorted_ema(e.begin(), e.end());\
+        std::sort(sorted_ema.begin(), sorted_ema.end(), std::greater<float>());\
+        const int effective_cache = std::min(cache_size, n_experts);\
+        const float threshold = (effective_cache > 0 \&\& effective_cache <= n_experts)\
+            ? sorted_ema[effective_cache - 1] : 0.0f;\
+        for (int i = 0; i < n_experts; i++) {\
+            out_bias[i] = (e[i] >= threshold \&\& threshold > 0.0f) ? bias_strength : 0.0f;\
+        }\
+    }\
+};\
+' "$CONTEXT_H"
+
+    # Add moe_cache member to llama_context struct (after the cross member)
+    sed -i '/llama_cross cross;/a\
+\
+    moe_expert_cache moe_cache;' "$CONTEXT_H"
+
+    # Add <algorithm> include for std::sort used by moe_expert_cache
+    sed -i '/#include <vector>/a\
+#include <algorithm>' "$CONTEXT_H"
+
+    echo "  llama-context.h (MoE): done"
+fi
+
+# ============================================================================
+# 10. llama-context.cpp — init moe_cache in constructor + extract topk post-compute
+# ============================================================================
+
+if grep -q 'moe_cache\.init' "$CONTEXT_CPP"; then
+    echo "  llama-context.cpp (MoE init): already patched, skipping"
+else
+    echo "  Patching llama-context.cpp (MoE cache init + post-compute)..."
+
+    # Initialize moe_cache in the constructor, right after kv_unified log line.
+    sed -i '/kv_unified.*true.*false/a\
+\
+    // Initialize MoE expert cache if enabled\
+    if (params.moe_cache_aware \&\& hparams.n_expert > 0) {\
+        moe_cache.init(hparams.n_layer, hparams.n_expert);\
+        LLAMA_LOG_INFO("%s: MoE cache-aware routing enabled (layers=%d, experts=%d, cache=%d)\\n",\
+                       __func__, moe_cache.n_layers, moe_cache.n_experts, moe_cache.cache_size);\
+    }' "$CONTEXT_CPP"
+
+    # Add post-compute EMA update in process_ubatch, after graph_compute returns successfully.
+    # We insert after "ret = GGML_STATUS_SUCCESS;" in process_ubatch.
+    sed -i '/ret = GGML_STATUS_SUCCESS;/{
+        /return res;/!{
+            a\
+\
+    // Update MoE expert cache after graph compute\
+    if (moe_cache.enabled) {\
+        auto * gf_post = res->get_gf();\
+        for (int il = 0; il < moe_cache.n_layers; il++) {\
+            char name[64];\
+            snprintf(name, sizeof(name), "ffn_moe_topk-%d", il);\
+            ggml_tensor * topk = ggml_graph_get_tensor(gf_post, name);\
+            if (!topk) continue;\
+\
+            std::vector<int32_t> ids(ggml_nelements(topk));\
+            ggml_backend_tensor_get(topk, ids.data(), 0, ggml_nbytes(topk));\
+\
+            int n_tok  = topk->ne[1];\
+            int n_used = topk->ne[0];\
+            moe_cache.update(il, ids.data() + (n_tok - 1) * n_used, n_used);\
+        }\
+    }
+        }
+    }' "$CONTEXT_CPP"
+
+    echo "  llama-context.cpp (MoE init + post-compute): done"
+fi
+
+# ============================================================================
+# 11. llama-graph.h — add llm_graph_input_moe_bias class
+# ============================================================================
+GRAPH_H="$LLAMA_DIR/src/llama-graph.h"
+
+if grep -q 'llm_graph_input_moe_bias' "$GRAPH_H"; then
+    echo "  llama-graph.h (MoE): already patched, skipping"
+else
+    echo "  Patching llama-graph.h (MoE bias input class)..."
+
+    # Add the new input class before llm_graph_result section
+    sed -i '/^\/\/\s*llm_graph_result/i\
+class llm_graph_input_moe_bias : public llm_graph_input_i {\
+public:\
+    llm_graph_input_moe_bias(int n_layers, int n_experts, moe_expert_cache * cache)\
+        : n_layers(n_layers), n_experts(n_experts), cache(cache) {\
+        bias.resize(n_layers, nullptr);\
+    }\
+    virtual ~llm_graph_input_moe_bias() = default;\
+\
+    void set_input(const llama_ubatch * ubatch) override {\
+        GGML_UNUSED(ubatch);\
+        if (!cache || !cache->enabled) return;\
+        std::vector<float> bias_data(n_experts);\
+        for (int l = 0; l < n_layers; l++) {\
+            if (!bias[l]) continue;\
+            cache->compute_bias(l, bias_data.data());\
+            ggml_backend_tensor_set(bias[l], bias_data.data(), 0, n_experts * sizeof(float));\
+        }\
+    }\
+\
+    std::vector<ggml_tensor *> bias;\
+    int n_layers;\
+    int n_experts;\
+    moe_expert_cache * cache;\
+};\
+' "$GRAPH_H"
+
+    # Forward-declare moe_expert_cache at top of file (after existing forward declarations)
+    sed -i '/^struct llama_memory_i;/a\
+struct moe_expert_cache;' "$GRAPH_H"
+
+    echo "  llama-graph.h (MoE): done"
+fi
+
+# ============================================================================
+# 12. llama-graph.cpp — add cache-aware routing bias before argsort_top_k
+# ============================================================================
+GRAPH_CPP="$LLAMA_DIR/src/llama-graph.cpp"
+
+if grep -q 'ffn_moe_probs_cache_biased' "$GRAPH_CPP"; then
+    echo "  llama-graph.cpp (MoE): already patched, skipping"
+else
+    echo "  Patching llama-graph.cpp (MoE routing bias)..."
+
+    # Insert cache-aware bias addition right after the DeepSeek V3 exp_probs_b block,
+    # before the expert group selection. We target the line after the exp_probs_b block.
+    # The existing code has:
+    #   if (exp_probs_b != nullptr) {
+    #       selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+    #       cb(selection_probs, "ffn_moe_probs_biased", il);
+    #   }
+    #
+    #   // llama4 doesn't have exp_probs_b ...
+    #
+    # We add our cache-aware bias check right before the "// llama4" comment.
+    sed -i '/\/\/ llama4 doesn.t have exp_probs_b/i\
+    // Cache-aware routing bias (2412.00099): nudge selection toward recently-used experts\
+    if (moe_cache_bias) {\
+        selection_probs = ggml_add(ctx0, selection_probs, moe_cache_bias);\
+        cb(selection_probs, "ffn_moe_probs_cache_biased", il);\
+    }\
+' "$GRAPH_CPP"
+
+    echo "  llama-graph.cpp (MoE routing bias): done"
+fi
+
+# ============================================================================
+# 13. llama-graph.h — add moe_cache_bias param to build_moe_ffn signatures
+# ============================================================================
+
+if grep -q 'moe_cache_bias' "$GRAPH_H"; then
+    echo "  llama-graph.h (build_moe_ffn sig): already patched, skipping"
+else
+    echo "  Patching llama-graph.h (build_moe_ffn moe_cache_bias param)..."
+
+    # Add moe_cache_bias param to both overloads of build_moe_ffn.
+    # Overload 1 (without bias tensors): add after gate_up_exps = nullptr
+    sed -i '/ggml_tensor \* gate_up_exps = nullptr) const;/{
+        s/) const;/,\
+             ggml_tensor * moe_cache_bias = nullptr) const;/
+    }' "$GRAPH_H"
+
+    # Overload 2 (with bias tensors): add after gate_up_exps_b = nullptr
+    sed -i '/ggml_tensor \* gate_up_exps_b = nullptr) const;/{
+        s/) const;/,\
+             ggml_tensor * moe_cache_bias = nullptr) const;/
+    }' "$GRAPH_H"
+
+    echo "  llama-graph.h (build_moe_ffn sig): done"
+fi
+
+# ============================================================================
+# 14. llama-graph.cpp — add moe_cache_bias param to build_moe_ffn implementations
+# ============================================================================
+
+if grep -q 'ggml_tensor \* moe_cache_bias) const {' "$GRAPH_CPP"; then
+    echo "  llama-graph.cpp (build_moe_ffn impl): already patched, skipping"
+else
+    echo "  Patching llama-graph.cpp (build_moe_ffn moe_cache_bias param)..."
+
+    # Overload 1 (delegating): add param to signature and pass through
+    # Before: ggml_tensor * gate_up_exps) const {
+    #     return build_moe_ffn(
+    sed -i '/ggml_tensor \* gate_up_exps) const {/{
+        s/) const {/,\
+         ggml_tensor * moe_cache_bias) const {/
+    }' "$GRAPH_CPP"
+
+    # Pass moe_cache_bias through in the delegating overload.
+    # The passthrough call ends with "gate_up_exps\n    );" — replace with passthrough.
+    sed -i '/return build_moe_ffn/,/);/{
+        /gate_up_exps$/{
+            s|gate_up_exps$|gate_up_exps, /* gate_up_exps_b */ nullptr,|
+            n
+            s|^    );|        moe_cache_bias);|
+        }
+    }' "$GRAPH_CPP"
+
+    # Overload 2 (main impl): add param to signature
+    # Before: ggml_tensor * gate_up_exps_b) const {
+    sed -i '/ggml_tensor \* gate_up_exps_b) const {/{
+        s/) const {/,\
+         ggml_tensor * moe_cache_bias) const {/
+    }' "$GRAPH_CPP"
+
+    echo "  llama-graph.cpp (build_moe_ffn impl): done"
+fi
+
+echo "MoE cache-aware routing patch applied successfully!"

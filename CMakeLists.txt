@@ -31,6 +31,12 @@ if(KV_COMPACT_BUILD_TESTS)
 
     add_executable(bench-optimization tests/bench-optimization.cpp)
     target_link_libraries(bench-optimization PRIVATE kv-compact-math)
+
+    add_executable(test-moe-cache tests/test-moe-cache.cpp)
+    target_link_libraries(test-moe-cache PRIVATE kv-compact-math)
+
+    add_executable(test-budget-exchange tests/test-budget-exchange.cpp)
+    target_link_libraries(test-budget-exchange PRIVATE kv-compact-math)
 endif()
 
 # ---- CLI tool (needs llama.cpp) ----

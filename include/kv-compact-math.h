@@ -119,7 +119,7 @@ static void exp_rows_stable(float * data, float * row_sums, int m, int n) {
 //   min_{w >= 0} ||A*w - b||^2
 // A is (m x n), b is (m), w is (n)
 // Returns solution in w
-static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200) {
+static void nnls_solve(const float * A, const float * b, float * w, int m, int n, int max_iter = 200, float tol = 0.0f) {
     // Precompute A^T * A and A^T * b
     std::vector<float> AtA(n * n);
     std::vector<float> Atb(n);
@@ -167,6 +167,13 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
                 sum += AtA[i * n + j] * w[j];
             }
             grad[i] = sum - Atb[i];
+        }
+
+        // Early stop: check gradient norm periodically
+        if (tol > 0.0f && (iter % 10 == 9)) {
+            float grad_norm = 0.0f;
+            for (int i = 0; i < n; i++) grad_norm += grad[i] * grad[i];
+            if (grad_norm < tol * tol * n) break;
         }
 
         // w = max(0, w - step * grad)
@@ -360,6 +367,7 @@ struct compaction_config {
     beta_fit_mode   fit_mode     = BETA_FIT_NNLS;        // Step 2: beta fitting
     int             n_alt_rounds = 2;        // Sec 10: alternating minimization rounds
     const float *   head_sensitivity = nullptr; // Sec 18: per-head weights (nullptr = auto)
+    const int *   per_head_budgets = nullptr;  // §5: non-uniform per-head budgets (nullptr = uniform t)
 };
 
 // ============================================================================
@@ -862,6 +870,10 @@ struct compacted_layer {
     // Per-head sensitivity used for key selection weighting [n_head_kv]
     // Higher = more influence on which keys are kept
     std::vector<float> head_sensitivity;
+
+    // Per-head budget allocation from greedy exchange [n_head_kv]
+    // If empty, uniform budget t was used for all heads
+    std::vector<int> per_head_budgets;
 };
 
 // ============================================================================
@@ -1707,6 +1719,130 @@ static std::vector<int> compute_caratheodory_budgets(
     return budgets;
 }
 
+// ============================================================================
+// Greedy Budget Exchange (Paper §5)
+// ============================================================================
+//
+// Non-uniform per-head budget allocation that greedily exchanges budget units
+// from compression-tolerant heads to compression-sensitive heads.
+//
+// The paper's most impactful ablation: heads with broad attention patterns need
+// more keys to preserve quality, while spiky heads can be compressed more
+// aggressively. This algorithm finds the optimal allocation.
+//
+// Algorithm:
+//   1. Start with uniform allocation: t_h = total_budget / n_heads
+//   2. Iteratively:
+//      a. Find donor = head whose last key has lowest marginal value
+//      b. Find recipient = head whose next key has highest marginal value
+//      c. If gain > loss: transfer 1 budget unit, continue
+//      d. Else: converged
+//
+// Marginal value model: sensitivity[h] / t_h  (diminishing returns)
+// This is equivalent to water-filling: budget ∝ sqrt(sensitivity) at optimum.
+//
+//   sensitivity: [n_heads] per-head sensitivity scores (from compute_head_sensitivity)
+//   n_heads:     number of KV heads
+//   total_budget: total tokens to allocate across all heads
+//   min_per_head: minimum budget per head (default: 2, must be >= 1)
+//   max_per_head: maximum budget per head (0 = no limit, clamped to total_budget)
+//
+// Returns: [n_heads] per-head budget allocation, sum = total_budget
+//
+static std::vector<int> greedy_budget_exchange(
+        const float * sensitivity,
+        int n_heads,
+        int total_budget,
+        int min_per_head = 2,
+        int max_per_head = 0) {
+
+    if (n_heads <= 0 || total_budget <= 0) return {};
+    if (n_heads == 1) return {total_budget};
+
+    min_per_head = std::max(1, min_per_head);
+    if (max_per_head <= 0) max_per_head = total_budget;
+
+    // Ensure feasible: min_per_head * n_heads <= total_budget
+    if (min_per_head * n_heads > total_budget) {
+        min_per_head = total_budget / n_heads;
+        if (min_per_head < 1) min_per_head = 1;
+    }
+
+    // Start uniform
+    std::vector<int> budget(n_heads, total_budget / n_heads);
+    int remaining = total_budget - n_heads * (total_budget / n_heads);
+
+    // Distribute remainder to most sensitive heads
+    std::vector<int> order(n_heads);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+        [&](int a, int b) { return sensitivity[a] > sensitivity[b]; });
+    for (int i = 0; i < remaining; i++) {
+        budget[order[i]]++;
+    }
+
+    // Enforce minimum
+    for (int h = 0; h < n_heads; h++) {
+        budget[h] = std::max(budget[h], min_per_head);
+    }
+    // Re-balance if minimums caused overflow
+    int excess = 0;
+    for (int h = 0; h < n_heads; h++) excess += budget[h];
+    excess -= total_budget;
+    if (excess > 0) {
+        // Remove excess from least sensitive heads (those with most budget above min)
+        for (int i = n_heads - 1; i >= 0 && excess > 0; i--) {
+            int h = order[i];
+            int can_remove = budget[h] - min_per_head;
+            int remove = std::min(can_remove, excess);
+            budget[h] -= remove;
+            excess -= remove;
+        }
+    }
+
+    // Greedy exchange iterations
+    // Marginal value of the t_h-th key for head h = sensitivity[h] / t_h
+    // This models diminishing returns: each additional key helps less
+    const int max_iters = n_heads * 20;  // reasonable bound
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        // Find donor: head whose last key has lowest marginal value
+        int donor = -1;
+        float min_marginal = 1e30f;
+        for (int h = 0; h < n_heads; h++) {
+            if (budget[h] <= min_per_head) continue;
+            float marginal = sensitivity[h] / (float)budget[h];
+            if (marginal < min_marginal) {
+                min_marginal = marginal;
+                donor = h;
+            }
+        }
+
+        // Find recipient: head whose next key has highest marginal value
+        int recipient = -1;
+        float max_marginal = 0.0f;
+        for (int h = 0; h < n_heads; h++) {
+            if (h == donor) continue;
+            if (budget[h] >= max_per_head) continue;
+            float marginal = sensitivity[h] / (float)(budget[h] + 1);
+            if (marginal > max_marginal) {
+                max_marginal = marginal;
+                recipient = h;
+            }
+        }
+
+        // Exchange if beneficial (recipient's gain > donor's loss)
+        if (donor >= 0 && recipient >= 0 && max_marginal > min_marginal) {
+            budget[donor]--;
+            budget[recipient]++;
+        } else {
+            break;  // Converged
+        }
+    }
+
+    return budget;
+}
+
 // Compact all KV heads within a single layer using shared key selection
 //
 //   K_all:     [T, n_embd_k_gqa] all heads concatenated, row-major
@@ -1936,6 +2072,25 @@ static compacted_layer compact_layer_all_heads(
     result.selected_indices = selected;
     result.head_sensitivity = sensitivity;
 
+    // ---- Per-head budget allocation (§5 Greedy Budget Exchange) ----
+    // If per-head budgets are provided, each head uses a subset of the
+    // globally-selected keys. If not provided, auto-compute from sensitivity.
+    std::vector<int> head_budgets(n_head_kv, t);
+
+    if (cfg.per_head_budgets) {
+        // Use provided budgets
+        for (int h = 0; h < n_head_kv; h++) {
+            head_budgets[h] = std::min(cfg.per_head_budgets[h], t);
+        }
+    } else if (n_head_kv > 1) {
+        // Auto-compute via greedy exchange
+        // Total budget = n_head_kv * t (each head gets t on average)
+        head_budgets = greedy_budget_exchange(
+            sensitivity.data(), n_head_kv, n_head_kv * t, /*min_per_head=*/2, /*max_per_head=*/t);
+    }
+
+    result.per_head_budgets = head_budgets;
+
     // ---- Steps 2-3: Per-head NNLS (beta) and LS (C_v) ----
     // (Paper Sections 3.2-3.3, with alternating minimization from
     //  adjacent-concepts.md Sec 10)
@@ -1943,35 +2098,78 @@ static compacted_layer compact_layer_all_heads(
     // After the initial NNLS+LS pass, refine beta via gradient descent
     // on ||softmax(s+beta)·C_v - Y||^2, then re-solve LS for C_v.
     // Repeat for n_alt_rounds total.
-
-
+    //
+    // With §5 budget exchange, each head h uses only the top head_budgets[h]
+    // keys from the global selected set, ranked by that head's importance.
 
     for (int h = 0; h < n_head_kv; h++) {
         const auto & hd = hdata[h];
+        const int t_h = head_budgets[h];  // This head's budget
 
-        result.beta[h].resize(t);
-        result.C_v[h].resize(t * d_v);
-
-        // Step 2 (initial): NNLS for beta
-        std::vector<float> M(n_q * t);
-        for (int qi = 0; qi < n_q; qi++) {
+        // Select top-t_h keys from the global selected set by this head's importance
+        // (When t_h == t, this is a no-op — all keys are used)
+        std::vector<int> head_selected;
+        if (t_h < t) {
+            // Rank global selected keys by this head's importance
+            std::vector<std::pair<float, int>> key_scores(t);
             for (int j = 0; j < t; j++) {
-                M[qi * t + j] = hd.exp_scores[qi * T + selected[j]];
+                key_scores[j] = {per_head_importance[h * T + selected[j]], j};
+            }
+            std::partial_sort(key_scores.begin(), key_scores.begin() + t_h, key_scores.end(),
+                [](const auto & a, const auto & b) { return a.first > b.first; });
+
+            head_selected.resize(t_h);
+            for (int j = 0; j < t_h; j++) {
+                head_selected[j] = key_scores[j].second;
+            }
+            std::sort(head_selected.begin(), head_selected.end());
+        }
+
+        // beta and C_v are always sized to t (global selection size) so the
+        // output struct stays uniform. For keys not in this head's budget,
+        // set beta = -inf (zero attention weight) and C_v = 0.
+        result.beta[h].assign(t, -1e9f);  // -inf for unused keys
+        result.C_v[h].assign(t * d_v, 0.0f);
+
+        // Map: for each position in the global selection, what position in
+        // the head's local selection? (-1 if not used)
+        std::vector<int> global_to_local(t, -1);
+        if (t_h < t) {
+            for (int j = 0; j < t_h; j++) {
+                global_to_local[head_selected[j]] = j;
+            }
+        } else {
+            for (int j = 0; j < t; j++) {
+                global_to_local[j] = j;
             }
         }
 
-        std::vector<float> w(t);
+        // Build M matrix for NNLS using this head's active keys
+        std::vector<float> M(n_q * t_h);
+        for (int qi = 0; qi < n_q; qi++) {
+            for (int j = 0; j < t_h; j++) {
+                int gidx = (t_h < t) ? head_selected[j] : j;
+                M[qi * t_h + j] = hd.exp_scores[qi * T + selected[gidx]];
+            }
+        }
+
+        // Step 2 (initial): NNLS/Sinkhorn for beta on active keys
+        std::vector<float> w(t_h);
         if (fit_mode == BETA_FIT_SINKHORN) {
-            sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+            sinkhorn_beta_fit(M.data(), hd.row_sums.data(), w.data(), n_q, t_h);
         } else {
-            nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t);
+            nnls_solve(M.data(), hd.row_sums.data(), w.data(), n_q, t_h);
         }
 
-        for (int j = 0; j < t; j++) {
-            result.beta[h][j] = logf(std::max(1e-12f, w[j]));
+        // Write beta to global positions
+        std::vector<float> local_beta(t_h);
+        for (int j = 0; j < t_h; j++) {
+            local_beta[j] = logf(std::max(1e-12f, w[j]));
+            int gidx = (t_h < t) ? head_selected[j] : j;
+            result.beta[h][gidx] = local_beta[j];
         }
 
-        // Compute Y (original attention output) once: attn_weights @ V_head [n_q, d_v]
+        // Compute Y (original attention output): attn_weights @ V_head [n_q, d_v]
         std::vector<float> Y(n_q * d_v, 0.0f);
         for (int qi = 0; qi < n_q; qi++) {
             for (int ki = 0; ki < T; ki++) {
@@ -1983,72 +2181,76 @@ static compacted_layer compact_layer_all_heads(
             }
         }
 
-        // Alternating minimization rounds
-        std::vector<float> X(n_q * t);
+        // Alternating minimization on active keys only
+        std::vector<float> X(n_q * t_h);
+        std::vector<float> local_Cv(t_h * d_v);
 
         for (int round = 0; round < n_alt_rounds; round++) {
-            // Step 3: Build X from current beta, solve LS for C_v
+            // Build X from current beta (active keys only)
             for (int qi = 0; qi < n_q; qi++) {
-                for (int j = 0; j < t; j++) {
-                    X[qi * t + j] = hd.scores[qi * T + selected[j]] + result.beta[h][j];
+                for (int j = 0; j < t_h; j++) {
+                    int gidx = (t_h < t) ? head_selected[j] : j;
+                    X[qi * t_h + j] = hd.scores[qi * T + selected[gidx]] + local_beta[j];
                 }
             }
-            softmax_rows(X.data(), n_q, t);
+            softmax_rows(X.data(), n_q, t_h);
 
-            least_squares_solve(X.data(), Y.data(), result.C_v[h].data(), n_q, t, d_v);
+            least_squares_solve(X.data(), Y.data(), local_Cv.data(), n_q, t_h, d_v);
 
-            // Gradient refinement of beta given C_v (skip on last round)
+            // Write C_v to global positions
+            for (int j = 0; j < t_h; j++) {
+                int gidx = (t_h < t) ? head_selected[j] : j;
+                memcpy(result.C_v[h].data() + gidx * d_v,
+                       local_Cv.data() + j * d_v,
+                       d_v * sizeof(float));
+            }
+
+            // Gradient refinement of beta (skip on last round)
             if (round < n_alt_rounds - 1) {
-                // Compute output residual R = X·C_v - Y  [n_q, d_v]
                 std::vector<float> R(n_q * d_v);
                 for (int qi = 0; qi < n_q; qi++) {
                     for (int d = 0; d < d_v; d++) {
                         float o = 0.0f;
-                        for (int j = 0; j < t; j++) {
-                            o += X[qi * t + j] * result.C_v[h][j * d_v + d];
+                        for (int j = 0; j < t_h; j++) {
+                            o += X[qi * t_h + j] * local_Cv[j * d_v + d];
                         }
                         R[qi * d_v + d] = o - Y[qi * d_v + d];
                     }
                 }
 
-                // g[qi,j] = 2 * R[qi] · C_v[j]  (per-query, per-key gradient component)
-                // dL/d(beta_j) = sum_qi X[qi,j] * (g[qi,j] - g_bar[qi])
-                //   where g_bar[qi] = sum_k X[qi,k] * g[qi,k]
-                std::vector<float> grad_beta(t, 0.0f);
+                std::vector<float> grad_beta(t_h, 0.0f);
                 for (int qi = 0; qi < n_q; qi++) {
-                    // Compute g[qi,j] for all j
-                    std::vector<float> g(t);
-                    for (int j = 0; j < t; j++) {
+                    std::vector<float> g(t_h);
+                    for (int j = 0; j < t_h; j++) {
                         float dot = 0.0f;
                         for (int d = 0; d < d_v; d++) {
-                            dot += R[qi * d_v + d] * result.C_v[h][j * d_v + d];
+                            dot += R[qi * d_v + d] * local_Cv[j * d_v + d];
                         }
                         g[j] = 2.0f * dot;
                     }
 
-                    // g_bar = sum_k X[qi,k] * g[k]
                     float g_bar = 0.0f;
-                    for (int k = 0; k < t; k++) {
-                        g_bar += X[qi * t + k] * g[k];
+                    for (int k = 0; k < t_h; k++) {
+                        g_bar += X[qi * t_h + k] * g[k];
                     }
 
-                    // Accumulate gradient
-                    for (int j = 0; j < t; j++) {
-                        grad_beta[j] += X[qi * t + j] * (g[j] - g_bar);
+                    for (int j = 0; j < t_h; j++) {
+                        grad_beta[j] += X[qi * t_h + j] * (g[j] - g_bar);
                     }
                 }
 
-                // Gradient step with adaptive learning rate
                 float grad_norm = 0.0f;
-                for (int j = 0; j < t; j++) {
+                for (int j = 0; j < t_h; j++) {
                     grad_beta[j] /= n_q;
                     grad_norm += grad_beta[j] * grad_beta[j];
                 }
                 grad_norm = sqrtf(grad_norm + 1e-12f);
                 float lr = std::min(0.5f, 1.0f / (grad_norm + 1e-8f));
 
-                for (int j = 0; j < t; j++) {
-                    result.beta[h][j] -= lr * grad_beta[j];
+                for (int j = 0; j < t_h; j++) {
+                    local_beta[j] -= lr * grad_beta[j];
+                    int gidx = (t_h < t) ? head_selected[j] : j;
+                    result.beta[h][gidx] = local_beta[j];
                 }
             }
         }
@@ -2114,7 +2316,8 @@ bool streaming_compactor::compact_layer_impl(
     ccfg.select_mode = cfg.select_mode;
     ccfg.fit_mode = cfg.fit_mode;
     ccfg.n_alt_rounds = cfg.n_alt_rounds;
-    ccfg.head_sensitivity = nullptr;  // TODO: layer-adaptive budgets
+    // head_sensitivity + per_head_budgets left as nullptr -> auto-computed
+    // via compute_head_sensitivity() + greedy_budget_exchange() in compact_layer_all_heads
 
     // Call existing compaction on the compactable zone
     compacted_layer result = compact_layer_all_heads(
